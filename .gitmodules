@@ -1,0 +1,3 @@
+[submodule "wgpuFFT"]
+	path = wgpuFFT
+	url = https://github.com/MaximEremenko/wgpuFFT.git

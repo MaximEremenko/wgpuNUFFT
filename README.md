@@ -1,7 +1,42 @@
-# wgpu-nufft
+# wgpuNUFFT
 
 `wgpu-nufft` is a portable nonuniform FFT library built only on `wgpu-fft`'s
-public API. Planning is separate from execution and plans are reusable.
+public API. The repository is named `wgpuNUFFT`, the Cargo package is
+`wgpu-nufft`, and Rust code imports it as `wgpu_nufft`.
+
+This is the upper-level repository. Its `wgpuFFT/` directory is a pinned Git
+submodule rather than an internal copy of the FFT implementation. Planning is
+separate from execution and plans are reusable.
+
+## Checkout and repository layout
+
+Clone with submodules, or initialize the submodule in an existing checkout:
+
+```powershell
+git clone --recurse-submodules <wgpuNUFFT-repository-url>
+git submodule update --init --recursive
+```
+
+```text
+wgpuNUFFT/
+|-- src/, tests/, benches/  wgpu-nufft package
+|-- wgpuFFT/                pinned wgpu-fft submodule
+|-- wgpu-web/               combined browser wrapper
+|-- web/                    browser integration harness
+`-- nd_prototype/           standalone NUFFT research prototype
+```
+
+The outer Cargo workspace intentionally excludes `wgpuFFT/`. This keeps the
+submodule independently buildable and prevents parent formatting or lockfile
+operations from modifying it. Validate both repository boundaries explicitly:
+
+```powershell
+cargo test --workspace --locked
+cargo test --manifest-path wgpuFFT/Cargo.toml --locked
+```
+
+Rust 1.92 or newer is required. GPU suites remain opt-in as documented by the
+individual test targets.
 
 ## Current scope
 
@@ -165,7 +200,7 @@ type-3 plan's adjoint swaps source and target sets and reverses the sign.
 
 ## License
 
-Licensed under the Apache License, Version 2.0 ([LICENSE](../LICENSE) or
+Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or
 <http://www.apache.org/licenses/LICENSE-2.0>).
 
 ## Known limitation: clustered sources
