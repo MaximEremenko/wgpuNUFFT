@@ -5,6 +5,7 @@ exclude = ["wgpuFFT"]
 resolver = "2"
 
 [package]
+publish = false
 name = "wgpu-nufft"
 version = "0.1.0"
 edition = "2021"
