@@ -1,11 +1,14 @@
-//! Portable nonuniform FFT plans built on `wgpu-fft`.
+//! Portable type-1, type-2, and type-3 nonuniform FFT plans built on
+//! `wgpu-fft`.
 //!
-//! The crate provides reusable host-side type-1 and type-2 planning metadata,
-//! Direct `f64` reference transforms, and
-//! exponential-of-semicircle kernel tables. Reusable 1D, 2D, and 3D f32,
-//! native-f64, or portable double-float plans encode spreading or interpolation
-//! around a fine-grid C2C transform entirely on the GPU using caller-owned input
-//! and output buffers.
+//! The crate provides reusable planning metadata, direct
+//! `f64` reference transforms, and exponential-of-semicircle kernel tables for
+//! all three transform types. GPU execution supports arbitrary rank up to
+//! [`MAX_NUFFT_DIMENSIONS`]: dedicated 1D, 2D, and 3D paths are complemented by
+//! a rank-generic path for every supported dimension `d >= 4`. Plans support
+//! `f32`, native `f64`, and portable double-float precision, and encode
+//! spreading or interpolation around a fine-grid C2C transform using
+//! caller-owned input and output buffers.
 
 #![forbid(unsafe_code)]
 

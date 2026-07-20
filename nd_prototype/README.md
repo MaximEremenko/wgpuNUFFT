@@ -1,9 +1,11 @@
-# ND NUFFT prototype (stage 1: numpy reference)
+# ND NUFFT research prototype (historical)
 
-Standalone research prototype for rank-generic N-dimensional NUFFT with
+This directory preserves a standalone research prototype for rank-generic
+N-dimensional NUFFT with
 per-dimension "translation-rank placement" — NOT part of the wgpu-fft /
-wgpu-nufft crates. Design and measured foundations: the vault note
-`03 Projects/wgpuFFT/ND NUFFT Math Design.md`.
+wgpu-nufft crates. It is retained as a reproducible reference oracle and
+historical design record. This README is self-contained; no private design
+vault is required.
 
 Each dimension independently chooses how to pay its translation rank r(eps):
 
@@ -30,8 +32,9 @@ use is RT on 1-2 memory-critical dims and spreading elsewhere.
 `python validate.py` — 22/22 PASS. Relative l2 errors track eps for every
 placement mix (e.g. 4D s1.25^3+RT at eps=1e-6: t1 4.3e-6, t2 4.2e-6); adjoint
 residuals are at machine precision (<= 7e-12), confirming the type-1/type-2
-composition is exactly consistent. This empirically answers the design note's
-open question 10.1: spread and RT placements compose without error inflation.
+composition is exactly consistent. The result shows that spread and RT
+placements compose without measurable error inflation in this validation
+matrix.
 
 ## Stage-2 verdict (2026-07-17)
 
@@ -69,13 +72,15 @@ Vulkan results (`cargo run --release`, then `python check.py`):
 Correctness (d=4 exported case): rel-l2 = 1.11e-6 vs f64 numpy reference —
 pure f32 accumulation error. Throughput at d=4 matches the class of the
 hand-tuned production 2D bin-tile kernel (~6.7e10 upd/s), i.e. rank-generic
-codegen costs essentially nothing. No GPU NUFFT above d=3 exists elsewhere.
+codegen costs essentially nothing in these measurements. The experiment
+demonstrated GPU execution through d=5 on the tested configuration; it does not
+make a claim about all other GPU NUFFT implementations.
 
 ## Stage-3 milestone 3b (2026-07-17): end-to-end d=4 on GPU
 
 Full chains on the GPU, with **wgpu-fft as the ND FFT backend via its
-public API** (rank-4 plan over the 80^4 fine grid worked first try — the
-stage-4 adoption dogfood): type-1 = GPU spread -> wgpu-fft forward FFT;
+public API** (a rank-4 plan over the 80^4 fine grid worked in the adoption
+experiment): type-1 = GPU spread -> wgpu-fft forward FFT;
 type-2 = host deconvolved pad -> wgpu-fft FFT -> new rank-generic GPU
 interpolation kernel. 64^4 sigma=1.25 timings: type-1 79.5 ms, type-2 86.7 ms
 (spreading/interp dominate, as the cost model predicts). wgpu-fft's forward
@@ -86,7 +91,7 @@ Correctness (12^4 exported case, `python check2.py`): interior modes
 (type-1/type-2). The gap is a REAL, measured design finding: **sigma=1.25
 deconvolution conditioning** — 1/phi_hat amplifies f32 FFT rounding noise
 ~50x per dim at the mode-box edge (compounding toward corners). Invisible in
-f64; material in f32. Mitigations (design-note S2 caveat): f64/df64 fine grid
+f64; material in f32. Candidate mitigations are an f64/df64 fine grid
 for tight eps at sigma=1.25 (wgpu-fft has both), mode-box margin trimming, or
 sigma=2 when memory allows. NOT prototyped here: production neighbor-bin reads
 (adoption reuses wgpu-nufft's cell binning) — host duplication stays a scratch
@@ -94,11 +99,10 @@ shortcut.
 
 ## Stage-4 decision (2026-07-17)
 
-**ADOPT — hybrid strategy.** Rank-generic codegen becomes the d>=4
-implementation and the universal fallback; tuned 1D/2D/3D kernels stay as fast
-paths behind plan-time selection. Full decision record (scope, phases,
-validation gates, deferred items) in the vault note
-`03 Projects/wgpuFFT/ND NUFFT Math Design.md`, section 11. This prototype
-folder remains the reference oracle for the placement math; production
-adoption happens in wgpu-nufft proper, reusing its cell binning + scan
-(not this crate's host-duplication shortcut).
+**ADOPT — hybrid strategy.** The decision was to use rank-generic codegen for
+d>=4 and as the universal fallback, while retaining tuned 1D/2D/3D kernels as
+plan-selected fast paths. Production work belongs in `wgpu-nufft`, reusing its
+cell binning and scan rather than this prototype's host-duplication shortcut.
+This directory remains the historical reference oracle for the placement math;
+its milestone descriptions report the state measured on 2026-07-17 rather than
+the current production implementation status.

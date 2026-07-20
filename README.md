@@ -6,14 +6,16 @@ public API. The repository is named `wgpuNUFFT`, the Cargo package is
 
 This is the upper-level repository. Its `wgpuFFT/` directory is a pinned Git
 submodule rather than an internal copy of the FFT implementation. Planning is
-separate from execution and plans are reusable.
+separate from execution and plans are reusable. The Cargo packages are kept
+local (`publish = false`) and are consumed from a Git checkout rather than
+crates.io.
 
 ## Checkout and repository layout
 
-Clone with submodules, or initialize the submodule in an existing checkout:
+Any fresh Git clone must include Git's `--recurse-submodules` option. If the
+repository is already checked out, initialize its pinned FFT dependency with:
 
 ```powershell
-git clone --recurse-submodules <wgpuNUFFT-repository-url>
 git submodule update --init --recursive
 ```
 
@@ -22,6 +24,7 @@ wgpuNUFFT/
 |-- src/, tests/, benches/  wgpu-nufft package
 |-- wgpuFFT/                pinned wgpu-fft submodule
 |-- wgpu-web/               combined browser wrapper
+|-- python/                 local PyO3 + NumPy binding
 |-- web/                    browser integration harness
 `-- nd_prototype/           standalone NUFFT research prototype
 ```
@@ -31,21 +34,84 @@ submodule independently buildable and prevents parent formatting or lockfile
 operations from modifying it. Validate both repository boundaries explicitly:
 
 ```powershell
-cargo test --workspace --locked
+cargo test --locked
 cargo test --manifest-path wgpuFFT/Cargo.toml --locked
 ```
 
 Rust 1.92 or newer is required. GPU suites remain opt-in as documented by the
 individual test targets.
 
+## Local dependency and quick start
+
+Add the checkout as a path dependency, with the path resolved relative to the
+consumer's `Cargo.toml`:
+
+```toml
+[dependencies]
+wgpu-nufft = { path = '../wgpuNUFFT' }
+```
+
+The direct `f64` transform is a small CPU-only way to verify the dependency
+before creating a GPU plan:
+
+```rust
+use wgpu_nufft::{reference_type1_f64, Complex64, NufftConfig};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = NufftConfig::new([8], 1.0e-6);
+    let points = [0.0, 0.25];
+    let strengths = [Complex64::new(1.0, 0.0), Complex64::new(0.5, -0.25)];
+    let modes = reference_type1_f64(&config, &points, &strengths)?;
+
+    assert_eq!(modes.len(), 8);
+    Ok(())
+}
+```
+
+## Python binding
+
+`python/` builds a native CPython extension directly from the Rust library
+with PyO3, NumPy, and maturin. It does not add a separate C ABI and it is not
+published. The first supported Python data path is `float32` coordinates with
+`complex64` values for reusable type-1, type-2, and type-3 GPU plans.
+
+```powershell
+$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
+py -3.14 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install "maturin==1.15.0" "numpy==2.5.2" "pytest==9.1.1"
+$env:PYO3_PYTHON = (Resolve-Path .\.venv\Scripts\python.exe).Path
+cargo test -p wgpu-nufft-python --locked
+maturin develop --release --manifest-path python\Cargo.toml
+python -m pytest python\tests -q
+```
+
+```python
+import numpy as np
+import wgpu_nufft
+
+context = wgpu_nufft.Context()
+plan = wgpu_nufft.Type1Plan(context, (16,), eps=1e-5)
+points = np.linspace(-np.pi, np.pi, 32, endpoint=False, dtype=np.float32)
+strengths = np.ones(32, dtype=np.complex64)
+modes = plan.execute(points, strengths)
+```
+
+Plans retain their GPU context and serialize reuse of internal scratch
+buffers. Inputs must be C-contiguous NumPy arrays. Multidimensional Fourier
+arrays keep the logical Python shape `(*n_modes)`; the binding explicitly
+converts that C-order layout to and from the Rust core's dimension-zero-fast
+storage. See [python/README.md](python/README.md) for the complete array and
+batch contract and the command that builds a local wheel.
+
 ## Current scope
 
 The current implementation provides:
 
 - Type-1, type-2, and type-3 definitions in arbitrary
-  dimension: hand-tuned 1D, 2D, and 3D paths plus a rank-generic GPU path that
-  serves every rank `d >= 4` for all three transform types in F32, native F64,
-  and portable double-float;
+  supported dimension: hand-tuned 1D, 2D, and 3D paths plus a rank-generic GPU
+  path that serves every supported rank `d >= 4` for all three transform types
+  in F32, native F64, and portable double-float;
 - direct `f64` NDFT execution for every transform kind as the correctness oracle
   and tiny-problem fallback;
 - `sigma = 2` default exponential-of-semicircle kernel planning;
@@ -60,7 +126,10 @@ The current implementation provides:
   many-vector batching;
 - reusable 1D, 2D, and 3D type-3 plans in the same three precisions with
   caller-owned source points, strengths, target frequencies, and output
-  buffers, also with many-vector batching.
+  buffers, also with many-vector batching;
+- a local native Python extension with persistent GPU contexts, reusable
+  type-1/type-2/type-3 plans, NumPy host-array transfer, and many-vector
+  batching in F32/`complex64`.
 
 The GPU type-2 route pre-deconvolves and zero-pads on the GPU, executes a public
 `wgpu-fft` C2C plan on the oversampled grid, and gathers the ES interpolation
@@ -202,11 +271,3 @@ type-3 plan's adjoint swaps source and target sets and reverses the sign.
 
 Licensed under the Apache License, Version 2.0 ([LICENSE](LICENSE) or
 <http://www.apache.org/licenses/LICENSE-2.0>).
-
-## Known limitation: clustered sources
-
-The GPU spreader is scatter-atomic: when many sources occupy a small fraction
-of the fine grid (e.g. displacement vectors clustered around zero), atomic
-adds serialize and throughput drops by roughly an order of magnitude; on
-Windows a long dispatch can trip the TDR watchdog. Planned fix: a binned
-subproblem spreader (shared-memory accumulation per bin), which removes global atomic contention for clustered inputs.

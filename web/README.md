@@ -31,8 +31,22 @@ and Phase D runners record the outer `wgpuNUFFT` revision and the pinned
 
 ## Pipeline-cache demo and Rust/Wasm vs JavaScript comparison
 
-After building the `wgpu-web` package, run the Phase C page through the same
-Chrome/WebGPU setup:
+Phase C requires the JavaScript `WebGPU-FFT` repository as the exact sibling
+checkout `../WebGPU-FFT`. From the `wgpuNUFFT` repository root, prepare the
+pinned comparison source before running the page:
+
+```powershell
+git clone https://github.com/MaximEremenko/WebGPU-FFT.git ..\WebGPU-FFT
+git -C ..\WebGPU-FFT checkout fa45c93f524a69a96c9f55acfad865226bfccd29
+```
+
+If the sibling checkout already exists, fetch that revision if necessary and
+check it out before recording a Phase C result. The page imports
+`../WebGPU-FFT/src/index.js` relative to the repository root; a differently
+named or differently located checkout will not satisfy the harness.
+
+After preparing the sibling checkout and building the `wgpu-web` package, run
+the Phase C page through the same Chrome/WebGPU setup:
 
 ```powershell
 web\run_phase_c_browser.cmd --mode all
@@ -43,7 +57,7 @@ For an archive-ready machine record, add for example
 
 The runner builds `wgpu-web` for `wasm32-unknown-unknown`, runs `wasm-bindgen`,
 serves this repository and the sibling `WebGPU-FFT` checkout from one origin,
-and pins the JavaScript reference revision to
+and records the required JavaScript reference revision as
 `fa45c93f524a69a96c9f55acfad865226bfccd29`. It attempts headless Chrome first
 with a 30-second callback deadline, then cleans up that process tree and falls
 back to the headed app-window pattern proven by the JavaScript library's
