@@ -1,0 +1,24 @@
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[project]
+name = "wgpu-nufft"
+version = "0.1.0"
+description = "Portable GPU NUFFT plans for NumPy arrays"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = ["numpy>=1.23"]
+
+[tool.maturin]
+bindings = "pyo3"
+module-name = "wgpu_nufft._native"
+python-source = "."
+exclude = [
+    "wgpu_nufft/__pycache__/**",
+    "wgpu_nufft/**/*.pyc",
+    "wgpu_nufft/**/*.pyo",
+    "wgpu_nufft/*.pdb",
+]

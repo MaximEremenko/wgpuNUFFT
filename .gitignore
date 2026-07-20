@@ -1,5 +1,9 @@
 /target/
 /target_gpu_bridge/
 /.tmp_browser_runner/
+/.venv/
 __pycache__/
 *.pyc
+/python/wgpu_nufft/_native*.pyd
+/python/wgpu_nufft/_native*.pdb
+/AGENTS.md

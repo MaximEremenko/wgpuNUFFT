@@ -1,0 +1,21 @@
+[package]
+name = "wgpu-nufft-python"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+publish = false
+license = "Apache-2.0"
+description = "Local Python bindings for wgpu-nufft"
+
+[lib]
+name = "_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bytemuck = "1.22"
+numpy = "0.29.0"
+pollster = "0.4"
+pyo3 = "0.29.2"
+wgpu = "29.0.1"
+wgpu-fft = { path = "../wgpuFFT", version = "0.1.0" }
+wgpu-nufft = { path = "..", version = "0.1.0" }

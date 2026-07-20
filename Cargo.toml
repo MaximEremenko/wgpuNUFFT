@@ -1,5 +1,5 @@
 [workspace]
-members = ["wgpu-web"]
+members = ["wgpu-web", "python"]
 default-members = [".", "wgpu-web"]
 exclude = ["wgpuFFT"]
 resolver = "2"
