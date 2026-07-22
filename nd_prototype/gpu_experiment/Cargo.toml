@@ -8,7 +8,7 @@ publish = false
 [workspace]
 
 [dependencies]
-wgpu = "29"
+wgpu = "30"
 pollster = "0.4"
 bytemuck = { version = "1.22", features = ["derive"] }
 wgpu-fft = { path = "../../wgpuFFT" }

@@ -679,7 +679,7 @@ mod tests {
             })
             .unwrap();
         receiver.recv().unwrap().unwrap();
-        let mapped = slice.get_mapped_range();
+        let mapped = slice.get_mapped_range().expect("mapped readback range");
         let actual = bytemuck::cast_slice::<u8, u32>(&mapped).to_vec();
         drop(mapped);
         readback.unmap();

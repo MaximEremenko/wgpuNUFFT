@@ -28,7 +28,7 @@ path = "src/lib.rs"
 
 [dependencies]
 bytemuck = "1.22"
-wgpu = "29.0.1"
+wgpu = "30.0.1"
 wgpu-fft = { path = "wgpuFFT", version = "0.1.0" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
@@ -36,7 +36,7 @@ pollster = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 futures-channel = "0.3"
-wasm-bindgen-test = "=0.3.70"
+wasm-bindgen-test = "=0.3.79"
 
 [[bench]]
 name = "nufft_bench"

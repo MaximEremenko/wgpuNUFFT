@@ -650,7 +650,7 @@ fn execute_type2(
         })
         .unwrap();
     receiver.recv().unwrap().unwrap();
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().expect("mapped readback range");
     let values = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
     drop(mapped);
     readback.unmap();
@@ -709,7 +709,7 @@ fn execute_type1(
         })
         .unwrap();
     receiver.recv().unwrap().unwrap();
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().expect("mapped readback range");
     let values = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
     drop(mapped);
     readback.unmap();
@@ -741,7 +741,7 @@ fn read_f32_after_submission(
         })
         .unwrap();
     receiver.recv().unwrap().unwrap();
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().expect("mapped readback range");
     let values = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
     drop(mapped);
     buffer.unmap();

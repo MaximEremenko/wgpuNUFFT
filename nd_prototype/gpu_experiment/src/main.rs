@@ -557,7 +557,7 @@ fn run_case(
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("poll");
         rx.recv().unwrap().unwrap();
-        let grid_bytes = slice.get_mapped_range().to_vec();
+        let grid_bytes = slice.get_mapped_range().expect("mapped range").to_vec();
         staging.unmap();
 
         fs::write(dir.join("grid.bin"), &grid_bytes).unwrap();
@@ -834,7 +834,7 @@ fn run_end_to_end(
                 .poll(wgpu::PollType::wait_indefinitely())
                 .expect("poll");
             rx.recv().unwrap().unwrap();
-            let v = slice.get_mapped_range().to_vec();
+            let v = slice.get_mapped_range().expect("mapped range").to_vec();
             staging.unmap();
             v
         };

@@ -633,7 +633,7 @@ fn execute_and_read(
         })
         .unwrap();
     receiver.recv().unwrap().unwrap();
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().expect("mapped readback range");
     let values = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
     drop(mapped);
     readback.unmap();

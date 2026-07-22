@@ -838,7 +838,7 @@ fn read_f32_buffer(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Vec<f32> {
     });
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     receiver.recv().unwrap().unwrap();
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().expect("mapped readback range");
     let result = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
     drop(mapped);
     buffer.unmap();

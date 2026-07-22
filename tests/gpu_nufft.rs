@@ -564,7 +564,7 @@ fn execute_type2(
     });
     device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
     receiver.recv().unwrap().unwrap();
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().expect("mapped readback range");
     let result = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
     drop(mapped);
     readback.unmap();
@@ -646,7 +646,7 @@ fn execute_type1(
         })
         .unwrap();
     receiver.recv().unwrap().unwrap();
-    let mapped = slice.get_mapped_range();
+    let mapped = slice.get_mapped_range().expect("mapped readback range");
     let values = bytemuck::cast_slice::<u8, f32>(&mapped);
     assert!(
         values[output_float_count..]

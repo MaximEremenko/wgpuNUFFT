@@ -2965,7 +2965,7 @@ mod tests {
                 .poll(wgpu::PollType::wait_indefinitely())
                 .unwrap();
             receiver.recv().unwrap().unwrap();
-            let mapped = slice.get_mapped_range();
+            let mapped = slice.get_mapped_range().expect("mapped readback range");
             let actual = bytemuck::cast_slice::<u8, f32>(&mapped);
             let coordinates = points
                 .iter()

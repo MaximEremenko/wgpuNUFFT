@@ -175,6 +175,7 @@ impl TransformKind {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_profiled(
         self,
         plan: &NufftPlan,
@@ -812,7 +813,9 @@ async fn execute_profile_sample(
         .recv()
         .map_err(|error| contextual_error("receiving profile map result", error))?
         .map_err(|error| contextual_error("mapping profile query readback", error))?;
-    let mapped = slice.get_mapped_range();
+    let mapped = slice
+        .get_mapped_range()
+        .map_err(|error| contextual_error("reading profile query readback", error))?;
     let timestamps = bytemuck::cast_slice::<u8, u64>(&mapped).to_vec();
     drop(mapped);
     resources.readback.unmap();

@@ -135,6 +135,7 @@ async fn initialize(
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: force_fallback,
+            apply_limit_buckets: false,
             compatible_surface: None,
         })
         .await
@@ -589,7 +590,10 @@ impl WgpuFft {
             .await
             .map_err(|_| js_error("download mapping callback was dropped"))?
             .map_err(|error| js_error(format!("download mapping failed: {error}")))?;
-        let mapped = readback.slice(..).get_mapped_range();
+        let mapped = readback
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|error| js_error(format!("download mapped range failed: {error}")))?;
         let bytes = mapped.to_vec();
         drop(mapped);
         readback.unmap();

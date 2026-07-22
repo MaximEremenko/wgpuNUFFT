@@ -124,6 +124,7 @@ fn initialize_gpu(
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference,
         force_fallback_adapter: force_fallback,
+        apply_limit_buckets: false,
         compatible_surface: None,
     }))
     .map_err(|error| format!("WebGPU adapter request failed: {error}"))?;
@@ -308,7 +309,9 @@ fn submit_and_read(
         .map_err(|_| "GPU readback callback was dropped".to_owned())?
         .map_err(|error| format!("GPU readback mapping failed: {error}"))?;
 
-    let mapped = slice.get_mapped_range();
+    let mapped = slice
+        .get_mapped_range()
+        .map_err(|error| format!("GPU readback range failed: {error}"))?;
     let words = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
     drop(mapped);
     readback.unmap();

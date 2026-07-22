@@ -2356,7 +2356,10 @@ mod tests {
     }
 
     fn mapped_values<T: bytemuck::Pod>(buffer: &wgpu::Buffer) -> Vec<T> {
-        let mapped = buffer.slice(..).get_mapped_range();
+        let mapped = buffer
+            .slice(..)
+            .get_mapped_range()
+            .expect("mapped readback range");
         let values = bytemuck::cast_slice(&mapped).to_vec();
         drop(mapped);
         buffer.unmap();
