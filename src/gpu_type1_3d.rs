@@ -1028,7 +1028,15 @@ fn create_compute_pipeline(
         layout: None,
         module: &shader,
         entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            // Only the tiled gather declares workgroup memory. It writes every
+            // halo-prefix element before its first barrier and reads cached
+            // point slots only below the current batch length, so WebGPU's
+            // workgroup zero fill is redundant and only slows native shader
+            // compilation (notably DX12's FXC). Browsers always zero-fill.
+            zero_initialize_workgroup_memory: false,
+            ..Default::default()
+        },
         cache: None,
     })
 }

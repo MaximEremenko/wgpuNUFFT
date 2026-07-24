@@ -975,7 +975,16 @@ fn create_compute_pipeline(
         layout: None,
         module: &shader,
         entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            // Only the tiled gather declares workgroup memory. It writes every
+            // halo-prefix element before its first barrier and reads cached
+            // point slots only below the current batch length, so WebGPU's
+            // workgroup zero fill is redundant. Native DX12 expands that fill
+            // into thousands of groupshared stores, which made FXC spend about
+            // 27 s on the tiled gather. Browsers always zero-fill.
+            zero_initialize_workgroup_memory: false,
+            ..Default::default()
+        },
         cache: None,
     })
 }

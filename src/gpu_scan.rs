@@ -269,7 +269,15 @@ fn create_compute_pipeline(
         layout: None,
         module: &shader,
         entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            // The block shader writes every logical scratch element before
+            // its first barrier and never reads the bank-padding slots, so
+            // WebGPU's workgroup zero fill is redundant. Native DX12 expands
+            // that fill into thousands of groupshared stores, which made FXC
+            // spend about 16 s on this shader. Browsers always zero-fill.
+            zero_initialize_workgroup_memory: false,
+            ..Default::default()
+        },
         cache: None,
     })
 }
