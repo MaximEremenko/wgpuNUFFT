@@ -18,8 +18,10 @@ mod error;
 mod gpu;
 mod gpu_2d;
 mod gpu_3d;
+mod gpu_dense_spread;
 mod gpu_dispatch;
 mod gpu_nd;
+mod gpu_point_bins;
 #[cfg(feature = "gpu-profiling")]
 mod gpu_profile;
 mod gpu_scan;

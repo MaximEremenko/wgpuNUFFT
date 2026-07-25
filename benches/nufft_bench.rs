@@ -49,6 +49,7 @@ struct Options {
     run_1d: bool,
     run_3d: bool,
     run_type3: bool,
+    reuse_points: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -131,9 +132,16 @@ impl TransformKind {
         encoder: &mut wgpu::CommandEncoder,
         point_count: usize,
         buffers: &CaseBuffers,
+        reuse_points: bool,
     ) -> BenchResult<()> {
-        match self {
-            Self::Type1 => plan.encode_type1_gpu(
+        match (self, reuse_points) {
+            (Self::Type1, true) => {
+                plan.execute_type1_gpu(device, encoder, &buffers.strengths, &buffers.type1_output)?
+            }
+            (Self::Type2, true) => {
+                plan.execute_type2_gpu(device, encoder, &buffers.modes, &buffers.type2_output)?
+            }
+            (Self::Type1, false) => plan.encode_type1_gpu(
                 device,
                 encoder,
                 point_count,
@@ -141,7 +149,7 @@ impl TransformKind {
                 &buffers.strengths,
                 &buffers.type1_output,
             )?,
-            Self::Type2 => plan.encode_type2_gpu(
+            (Self::Type2, false) => plan.encode_type2_gpu(
                 device,
                 encoder,
                 point_count,
@@ -177,6 +185,7 @@ struct TransformExecution<'a> {
     point_count: usize,
     kind: TransformKind,
     wait_timeout: Duration,
+    reuse_points: bool,
 }
 
 struct Type3Execution<'a> {
@@ -524,7 +533,23 @@ async fn run_kind(
             point_count: case.point_count,
             kind,
             wait_timeout: options.wait_timeout,
+            reuse_points: options.reuse_points,
         };
+        if options.reuse_points {
+            // Point preparation runs once per plan, outside every timed span,
+            // like a one-time point setup before repeated executions.
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("wgpu_nufft.bench.set_points"),
+            });
+            plan.set_points_gpu(device, &mut encoder, case.point_count, &buffers.points)?;
+            let submission = queue.submit([encoder.finish()]);
+            wait_for_submission(
+                device,
+                submission,
+                "waiting for set_points_gpu",
+                options.wait_timeout,
+            )?;
+        }
         let (warmup_encoding_ms, warmup_submit_wait_ms) =
             execution.execute_once("warmup", 1).await?;
         println!(
@@ -595,7 +620,7 @@ async fn run_kind(
     let mode_count = case.mode_count()?;
 
     println!(
-        "RESULT kind={} N={} M={} fine_grid_length={} eps={} sigma={} sign=positive mode_order=centered precision=f32 runs={} samples_per_run={} transforms_per_sample={} total_samples={} raw_submit_wait_ms_per_transform={:?} run_avg_submit_wait_ms_per_transform={:?} avg_submit_wait_ms_per_transform={:.6} stderr_submit_wait_ms_per_transform={} stderr_basis=plan-recreated-run-means min_submit_wait_ms_per_transform={:.6} million_points_per_second={:.6} raw_encode_ms_per_transform={:?} run_avg_encode_ms_per_transform={:?} avg_encode_ms_per_transform={:.6} stderr_encode_ms_per_transform={} min_encode_ms_per_transform={:.6} raw_plan_create_ms={:?} avg_plan_create_ms={:.6} stderr_plan_create_ms={} min_plan_create_ms={:.6} timing_scope=submit-through-device-poll-divided-per-transform setup_excluded=plan,encode,upload,readback dimensions={} mode_shape={} fine_grid_shape={} fine_grid_points={}",
+        "RESULT kind={} N={} M={} fine_grid_length={} eps={} sigma={} sign=positive mode_order=centered precision=f32 runs={} samples_per_run={} transforms_per_sample={} total_samples={} raw_submit_wait_ms_per_transform={:?} run_avg_submit_wait_ms_per_transform={:?} avg_submit_wait_ms_per_transform={:.6} stderr_submit_wait_ms_per_transform={} stderr_basis=plan-recreated-run-means min_submit_wait_ms_per_transform={:.6} million_points_per_second={:.6} raw_encode_ms_per_transform={:?} run_avg_encode_ms_per_transform={:?} avg_encode_ms_per_transform={:.6} stderr_encode_ms_per_transform={} min_encode_ms_per_transform={:.6} raw_plan_create_ms={:?} avg_plan_create_ms={:.6} stderr_plan_create_ms={} min_plan_create_ms={:.6} timing_scope=submit-through-device-poll-divided-per-transform setup_excluded=plan,encode,upload,readback points={} dimensions={} mode_shape={} fine_grid_shape={} fine_grid_points={}",
         kind.name(),
         mode_count,
         case.point_count,
@@ -623,6 +648,11 @@ async fn run_kind(
             .stderr
             .map_or_else(|| "undefined".to_owned(), |value| format!("{value:.6}")),
         plan_creation_stats.minimum,
+        if options.reuse_points {
+            "set-once-reused"
+        } else {
+            "prepared-per-execution"
+        },
         case.dimensions(),
         case.shape_token(),
         shape_token(&fine_grid_shape),
@@ -836,6 +866,7 @@ impl TransformExecution<'_> {
                     &mut encoder,
                     self.point_count,
                     self.buffers,
+                    self.reuse_points,
                 )?;
             }
             Ok(encoder.finish())
@@ -1268,6 +1299,7 @@ fn parse_options() -> BenchResult<Options> {
     let mut run_1d = false;
     let mut run_3d = false;
     let mut run_type3 = false;
+    let mut reuse_points = false;
     // Cargo invokes harness-free benchmark binaries with an implicit
     // `--bench`; it is not part of this harness's CLI.
     let mut arguments = std::env::args().skip(1).filter(|arg| arg != "--bench");
@@ -1284,6 +1316,9 @@ fn parse_options() -> BenchResult<Options> {
             "--type3" => {
                 explicit_suite = true;
                 run_type3 = true;
+            }
+            "--reuse-points" => {
+                reuse_points = true;
             }
             "--all" => {
                 explicit_suite = true;
@@ -1328,6 +1363,7 @@ fn parse_options() -> BenchResult<Options> {
         run_1d,
         run_3d,
         run_type3,
+        reuse_points,
     })
 }
 
@@ -1357,6 +1393,8 @@ Options:
   --3d                       Run 3D type-1/type-2 cases at 64^3 and 128^3.
   --type3                    Run one type-3 case in each of 1D, 2D, and 3D.
   --all                      Run all suites (equivalent to --1d --3d --type3).
+  --reuse-points             Record set_points_gpu once per plan outside the
+                             timed span and time execute_* calls (type-1/type-2).
   --adapter <index-or-name>   Select a Vulkan hardware adapter.
   --runs <count>              Plan recreations per case (default: 3).
   --samples <count>           Timed submissions per plan (default: 10).

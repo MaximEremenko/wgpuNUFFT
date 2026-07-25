@@ -127,6 +127,9 @@ The current implementation provides:
 - reusable 1D, 2D, and 3D type-3 plans in the same three precisions with
   caller-owned source points, strengths, target frequencies, and output
   buffers, also with many-vector batching;
+- a `set_points_gpu` / `execute_*` split for type-1 and type-2 plans that
+  prepares a point set once for repeated executions (see
+  [Reusing a point set](#reusing-a-point-set));
 - a local native Python extension with persistent GPU contexts, reusable
   type-1/type-2/type-3 plans, NumPy host-array transfer, and many-vector
   batching in F32/`complex64`.
@@ -146,9 +149,10 @@ contract.
 `NufftConfig::with_batch(ntr)` and `NufftType3Config::with_batch(ntr)` follow
 the `ntransf` batching convention: every transform shares one point set, while
 complex inputs and outputs are transform-major (`[transform][point or mode]`).
-Type-1 binning, scan, and stable sorting run once per execution, and the spread
-and interpolation kernels reuse each computed support weight across blocks of
-up to four vectors. The oversampled-grid C2C plan uses `wgpu-fft`'s native batch
+Point binning, scanning, and sorting run once per execution (or once per point
+set, see [Reusing a point set](#reusing-a-point-set)) for all vectors together,
+and the per-cell spread and direct interpolation kernels reuse each computed
+support weight across blocks of up to four vectors. The oversampled-grid C2C plan uses `wgpu-fft`'s native batch
 dimension. The ordinary encode methods execute the configured count; the
 explicit `*_batch` methods may execute `1..=ntr` vectors on the same plan for
 grow/shrink workflows. The embedded FFT remains capacity-sized in that case,
@@ -177,6 +181,44 @@ the caller-owned mode buffer. The type-1/type-2 routes reuse plan-owned fine-gri
 scratch. Type 1 also reuses fixed bin-count, cursor, and offset buffers and grows
 its sorted-point-index buffer only when a larger point set requires it.
 Executions on a given plan must remain in queue order.
+
+F32 plans whose fine grid is large enough (at `eps = 1e-6`, at least 18 cells
+per axis in 1D and 2D, and 32/32/22 cells in 3D) use coarse-bin paths instead.
+The points are grouped into small bins once (integer-atomic counts, a prefix
+scan, and, for type 1, a per-bin sort back into input order), and every point's
+support start and df64 offset are prepared once, so the kernels evaluate every
+weight as `(j + hi) + lo` without refolding coordinates:
+
+- Type-1 spreading stays output-stationary. In 1D each invocation owns four
+  consecutive fine-grid cells and in 2D a `4x4` tile, and walks only the few
+  bins that can reach them, in a fixed order. In 3D each workgroup owns a
+  `16x16x8` block whose rows stay in registers while the block's nearby points
+  stream through workgroup memory. Every fine-grid cell is written exactly
+  once, without atomics, so results remain bitwise repeatable.
+- Type-2 interpolation evaluates the points in bin order for cache locality
+  (in 2D and 3D, eight invocations share one point and read each fine-grid row
+  as one run). Every output is still one fixed-order sum.
+- The small, densely populated outer grids of 1D and 2D type-3 plans use a
+  dense spreader that splits the sources by index into fixed groups, sums each
+  group into a partial grid, and adds the partial grids in group order. The 3D
+  type-3 outer grid uses the 3D block spreader.
+
+F64/Df64 plans, smaller grids, and devices without the required workgroup
+limits keep the per-cell gather and direct interpolation.
+
+### Reusing a point set
+
+`NufftPlan::set_points_gpu` records the point-dependent work (for the F32
+coarse-bin paths of 1D-3D type-1 and type-2 plans: binning, sorting, and
+per-point preparation) once, and
+`execute_type1_gpu[_batch]` or `execute_type2_gpu[_batch]` then transform new
+strengths or coefficients at those points, like a one-time point setup followed by
+repeated `execute` calls. The plan keeps a reference to the point buffer; its
+contents must not change while executions use it, and executions must be
+submitted after the commands recorded by `set_points_gpu`. The existing
+`encode_*` methods are equivalent to `set_points_gpu` followed by the matching
+`execute_*` call. `cargo bench -p wgpu-nufft --bench nufft_bench --
+--reuse-points` times this execute-only path.
 
 The GPU type-3 route follows the standard rescaling composition: it rescales and
 pre-phases nonuniform sources, spreads them to an outer uniform grid, evaluates

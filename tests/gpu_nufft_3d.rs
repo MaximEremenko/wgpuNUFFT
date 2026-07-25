@@ -42,6 +42,15 @@ async fn run_gpu_3d_type2_cases() {
     validate_type1_back_to_back_grow_then_shrink(&context.device, &context.queue);
     validate_type1_zero_points_overwrite_output(&context.device, &context.queue);
     validate_adjoint_consistency(&context.device, &context.queue);
+    validate_block_type1_oracle_matrix(&context.device, &context.queue);
+    validate_block_type1_dense_and_large_point_sets(&context.device, &context.queue);
+    validate_block_type1_determinism_and_set_points(&context.device, &context.queue);
+    validate_block_type1_active_batch(&context.device, &context.queue);
+    validate_block_type1_zero_points(&context.device, &context.queue);
+    validate_binned_type2_dense_and_large_point_sets(&context.device, &context.queue);
+    validate_binned_type2_set_points(&context.device, &context.queue);
+    validate_binned_type2_active_batch(&context.device, &context.queue);
+    validate_binned_type2_large_set_matches_prefix(&context.device, &context.queue);
     #[cfg(feature = "type1-3d-tile-prototype")]
     validate_tiled_type1_equivalence(&context.device, &context.queue);
     if std::env::var_os("WGPU_NUFFT_RUN_LARGE_GPU_TESTS").is_some() {
@@ -502,6 +511,529 @@ fn validate_large_256_cubed_type2(device: &wgpu::Device, queue: &wgpu::Queue) {
     assert!(error <= 2.0e-5);
 }
 
+/// Mode shapes whose fine grids are large enough for the F32 block spreader:
+/// a clean `32x40x24` grid and a `36x40x26` grid with partial blocks and bins.
+const BLOCK_SPREAD_SHAPES: [[usize; DIMENSIONS]; 2] = [[16, 20, 12], [17, 19, 13]];
+
+fn validate_block_type1_oracle_matrix(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let classes = point_classes();
+    for mode_shape in BLOCK_SPREAD_SHAPES {
+        for eps in [1.0e-2, 1.0e-4, 1.0e-6] {
+            let tolerance = FLOAT_TOLERANCE_FACTOR_3D * eps;
+            for sign in [NufftSign::Positive, NufftSign::Negative] {
+                for order in [ModeOrder::Centered, ModeOrder::Fft] {
+                    let config = NufftConfig::new(mode_shape, eps)
+                        .with_sign(sign)
+                        .with_mode_order(order);
+                    let plan = NufftPlan::type1_gpu(device, queue, config.clone()).unwrap();
+                    for class in &classes {
+                        let point_count = class.points.len() / DIMENSIONS;
+                        let strengths = test_values(point_count, sign, order);
+                        let actual = interleaved_to_complex64(&execute_type1(
+                            device,
+                            queue,
+                            &plan,
+                            &class.points,
+                            &strengths,
+                        ));
+                        let reference = reference_type1_f64(
+                            &config,
+                            &points_f64(&class.points),
+                            &interleaved_to_complex64(&strengths),
+                        )
+                        .unwrap();
+                        let error = relative_l2(&actual, &reference);
+                        eprintln!(
+                            "NUFFT_3D_BLOCK_ACCURACY shape={mode_shape:?} fine={:?} eps={eps:.0e} sign={sign:?} order={order:?} class={} relative_l2={error:.9e}",
+                            plan.fine_grid_shape(),
+                            class.label
+                        );
+                        assert!(
+                            error <= tolerance,
+                            "3D block type1 shape={mode_shape:?} eps={eps} sign={sign:?} order={order:?} class={}: relative l2 {error} exceeds {tolerance}",
+                            class.label
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_block_type1_dense_and_large_point_sets(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let dense_cluster = (0..5_000)
+        .flat_map(|index| {
+            let offset = index as f32 * 1.0e-6;
+            [0.3 + offset, -1.1 - 0.5 * offset, 2.9 - 0.25 * offset]
+        })
+        .collect::<Vec<_>>();
+    let wrapping_cluster = (0..1_500)
+        .flat_map(|index| {
+            let offset = index as f32 * 2.0e-5;
+            [
+                PI as f32 - offset,
+                -(PI as f32) + offset,
+                2.999 * PI as f32 - 4.0 * offset,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let large_random = seeded_random_points(2_000, 0x0b10_c3d5);
+    for mode_shape in BLOCK_SPREAD_SHAPES {
+        for sign in [NufftSign::Positive, NufftSign::Negative] {
+            let config = NufftConfig::new(mode_shape, 1.0e-6).with_sign(sign);
+            let plan = NufftPlan::type1_gpu(device, queue, config.clone()).unwrap();
+            for (label, points) in [
+                ("dense-single-bin", dense_cluster.as_slice()),
+                ("wrapping-cluster", wrapping_cluster.as_slice()),
+                ("random-2000", large_random.as_slice()),
+            ] {
+                let point_count = points.len() / DIMENSIONS;
+                let strengths = test_values(point_count, sign, ModeOrder::Centered);
+                let actual = interleaved_to_complex64(&execute_type1(
+                    device, queue, &plan, points, &strengths,
+                ));
+                let reference = reference_type1_f64(
+                    &config,
+                    &points_f64(points),
+                    &interleaved_to_complex64(&strengths),
+                )
+                .unwrap();
+                let error = relative_l2(&actual, &reference);
+                eprintln!(
+                    "NUFFT_3D_BLOCK_ACCURACY shape={mode_shape:?} eps=1e-6 sign={sign:?} class={label} M={point_count} relative_l2={error:.9e}"
+                );
+                assert!(
+                    error <= FLOAT_TOLERANCE_FACTOR_3D * 1.0e-6,
+                    "3D block type1 shape={mode_shape:?} sign={sign:?} class={label}: relative l2 {error}"
+                );
+            }
+        }
+    }
+}
+
+fn validate_block_type1_determinism_and_set_points(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let config = NufftConfig::new([17, 19, 13], 1.0e-6).with_mode_order(ModeOrder::Fft);
+    let plan = NufftPlan::type1_gpu(device, queue, config).unwrap();
+    let first_points = seeded_random_points(3_001, 0x5e7_9017);
+    let second_points = seeded_random_points(1_777, 0x5e7_9018);
+    let first_strengths = test_values(3_001, NufftSign::Positive, ModeOrder::Fft);
+    let other_strengths = test_values(3_001, NufftSign::Negative, ModeOrder::Centered);
+    let second_strengths = test_values(1_777, NufftSign::Positive, ModeOrder::Fft);
+
+    let encoded = execute_type1(device, queue, &plan, &first_points, &first_strengths);
+    let repeated = execute_type1(device, queue, &plan, &first_points, &first_strengths);
+    assert_f32_bits_equal(&repeated, &encoded, "3D block type1 repeated encode");
+    let encoded_other = execute_type1(device, queue, &plan, &first_points, &other_strengths);
+    let encoded_second = execute_type1(device, queue, &plan, &second_points, &second_strengths);
+
+    let first_buffer =
+        storage_buffer_init(device, "wgpu_nufft.3d.test.block.points", &first_points);
+    let executed = execute_type1_with_set_points(
+        device,
+        queue,
+        &plan,
+        &first_buffer,
+        3_001,
+        &[first_strengths.as_slice(), other_strengths.as_slice()],
+    );
+    assert_f32_bits_equal(
+        &executed[0],
+        &encoded,
+        "3D block type1 set_points + execute",
+    );
+    assert_f32_bits_equal(&executed[1], &encoded_other, "3D block type1 reused points");
+
+    let second_buffer =
+        storage_buffer_init(device, "wgpu_nufft.3d.test.block.points2", &second_points);
+    let executed_second = execute_type1_with_set_points(
+        device,
+        queue,
+        &plan,
+        &second_buffer,
+        1_777,
+        &[second_strengths.as_slice()],
+    );
+    assert_f32_bits_equal(
+        &executed_second[0],
+        &encoded_second,
+        "3D block type1 execute after replacing points",
+    );
+}
+
+fn validate_block_type1_active_batch(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let config = NufftConfig::new([16, 20, 12], 1.0e-6)
+        .with_sign(NufftSign::Negative)
+        .with_batch(3);
+    let plan = NufftPlan::type1_gpu(device, queue, config.clone()).unwrap();
+    let points = seeded_random_points(701, 0xba7c_4001);
+    let vectors = [
+        test_values(701, NufftSign::Negative, ModeOrder::Centered),
+        test_values(701, NufftSign::Positive, ModeOrder::Fft),
+    ];
+    let strengths = vectors.concat();
+    let points_buffer = storage_buffer_init(device, "wgpu_nufft.3d.test.batch.points", &points);
+    let strengths_buffer =
+        storage_buffer_init(device, "wgpu_nufft.3d.test.batch.strengths", &strengths);
+    let output_bytes = plan
+        .required_type1_output_buffer_size_bytes_for_batch(2)
+        .unwrap();
+    let output = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_nufft.3d.test.batch.output"),
+        size: output_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_nufft.3d.test.batch.readback"),
+        size: output_bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_nufft.3d.test.batch.encoder"),
+    });
+    plan.encode_type1_gpu_batch(
+        device,
+        &mut encoder,
+        701,
+        2,
+        &points_buffer,
+        &strengths_buffer,
+        &output,
+    )
+    .unwrap();
+    encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output_bytes);
+    let submission = queue.submit([encoder.finish()]);
+    let actual = read_f32_after_submission(device, &readback, submission);
+    let modes = config.mode_count().unwrap();
+    let single_vector = config.clone().with_batch(1);
+    for (vector, values) in vectors.iter().enumerate() {
+        let reference = reference_type1_f64(
+            &single_vector,
+            &points_f64(&points),
+            &interleaved_to_complex64(values),
+        )
+        .unwrap();
+        let actual_vector =
+            interleaved_to_complex64(&actual[2 * modes * vector..2 * modes * (vector + 1)]);
+        let error = relative_l2(&actual_vector, &reference);
+        eprintln!("NUFFT_3D_BLOCK_BATCH vector={vector} relative_l2={error:.9e}");
+        assert!(error <= FLOAT_TOLERANCE_FACTOR_3D * 1.0e-6);
+    }
+}
+
+fn validate_block_type1_zero_points(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let config = NufftConfig::new([16, 20, 12], 1.0e-6);
+    let plan = NufftPlan::type1_gpu(device, queue, config.clone()).unwrap();
+    // Populate the plan-owned fine grid first so a stale grid would show.
+    let points = seeded_random_points(97, 0x2e20_0001);
+    let strengths = test_values(97, NufftSign::Positive, ModeOrder::Centered);
+    let _ = execute_type1(device, queue, &plan, &points, &strengths);
+    let dummy = storage_buffer_init(device, "wgpu_nufft.3d.test.block.zero.dummy", &[0.0f32]);
+    let output_bytes = plan.required_type1_output_buffer_size_bytes().unwrap();
+    let output = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("wgpu_nufft.3d.test.block.zero.output"),
+        contents: bytemuck::cast_slice(&vec![1.0f32; 2 * config.mode_count().unwrap()]),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_nufft.3d.test.block.zero.readback"),
+        size: output_bytes,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_nufft.3d.test.block.zero.encoder"),
+    });
+    plan.encode_type1_gpu(device, &mut encoder, 0, &dummy, &dummy, &output)
+        .unwrap();
+    encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output_bytes);
+    let submission = queue.submit([encoder.finish()]);
+    let actual = read_f32_after_submission(device, &readback, submission);
+    assert!(
+        actual.iter().all(|&value| value == 0.0),
+        "zero-point 3D block type1 execution must overwrite every output word with zero"
+    );
+}
+
+fn execute_type1_with_set_points(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    plan: &NufftPlan,
+    points: &wgpu::Buffer,
+    point_count: usize,
+    strength_vectors: &[&[f32]],
+) -> Vec<Vec<f32>> {
+    let output_bytes = plan.required_type1_output_buffer_size_bytes().unwrap();
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_nufft.3d.test.set_points.encoder"),
+    });
+    plan.set_points_gpu(device, &mut encoder, point_count, points)
+        .unwrap();
+    let mut readbacks = Vec::new();
+    for strengths in strength_vectors {
+        let strengths_buffer =
+            storage_buffer_init(device, "wgpu_nufft.3d.test.set_points.strengths", strengths);
+        let output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu_nufft.3d.test.set_points.output"),
+            size: output_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu_nufft.3d.test.set_points.readback"),
+            size: output_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        plan.execute_type1_gpu(device, &mut encoder, &strengths_buffer, &output)
+            .unwrap();
+        encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output_bytes);
+        readbacks.push(readback);
+    }
+    let submission = queue.submit([encoder.finish()]);
+    let mut results = Vec::new();
+    for readback in &readbacks {
+        results.push(read_f32_after_submission(
+            device,
+            readback,
+            submission.clone(),
+        ));
+    }
+    results
+}
+
+fn validate_binned_type2_dense_and_large_point_sets(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let dense_cluster = (0..5_000)
+        .flat_map(|index| {
+            let offset = index as f32 * 1.0e-6;
+            [0.3 + offset, -1.1 - 0.5 * offset, 2.9 - 0.25 * offset]
+        })
+        .collect::<Vec<_>>();
+    let wrapping_cluster = (0..1_500)
+        .flat_map(|index| {
+            let offset = index as f32 * 2.0e-5;
+            [
+                PI as f32 - offset,
+                -(PI as f32) + offset,
+                2.999 * PI as f32 - 4.0 * offset,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let large_random = seeded_random_points(2_000, 0x0b1e_d002);
+    for mode_shape in BLOCK_SPREAD_SHAPES {
+        for sign in [NufftSign::Positive, NufftSign::Negative] {
+            let config = NufftConfig::new(mode_shape, 1.0e-6).with_sign(sign);
+            let plan = NufftPlan::type2_gpu(device, queue, config.clone()).unwrap();
+            let coefficients = test_values(config.mode_count().unwrap(), sign, ModeOrder::Centered);
+            for (label, points) in [
+                ("dense-single-bin", dense_cluster.as_slice()),
+                ("wrapping-cluster", wrapping_cluster.as_slice()),
+                ("random-2000", large_random.as_slice()),
+            ] {
+                let actual = interleaved_to_complex64(&execute_type2(
+                    device,
+                    queue,
+                    &plan,
+                    points,
+                    &coefficients,
+                ));
+                let reference = reference_type2_f64(
+                    &config,
+                    &points_f64(points),
+                    &interleaved_to_complex64(&coefficients),
+                )
+                .unwrap();
+                let error = relative_l2(&actual, &reference);
+                eprintln!(
+                    "NUFFT_3D_BINNED_TYPE2_ACCURACY shape={mode_shape:?} eps=1e-6 sign={sign:?} class={label} M={} relative_l2={error:.9e}",
+                    points.len() / DIMENSIONS
+                );
+                assert!(
+                    error <= FLOAT_TOLERANCE_FACTOR_3D * 1.0e-6,
+                    "3D binned type2 shape={mode_shape:?} sign={sign:?} class={label}: relative l2 {error}"
+                );
+            }
+        }
+    }
+}
+
+fn validate_binned_type2_set_points(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let config = NufftConfig::new([17, 19, 13], 1.0e-6).with_mode_order(ModeOrder::Fft);
+    let plan = NufftPlan::type2_gpu(device, queue, config.clone()).unwrap();
+    let modes = config.mode_count().unwrap();
+    let first_points = seeded_random_points(3_001, 0x2e7_9017);
+    let second_points = seeded_random_points(1_777, 0x2e7_9018);
+    let first_coefficients = test_values(modes, NufftSign::Positive, ModeOrder::Fft);
+    let other_coefficients = test_values(modes, NufftSign::Negative, ModeOrder::Centered);
+
+    let encoded = execute_type2(device, queue, &plan, &first_points, &first_coefficients);
+    let repeated = execute_type2(device, queue, &plan, &first_points, &first_coefficients);
+    assert_f32_bits_equal(&repeated, &encoded, "3D binned type2 repeated encode");
+    let encoded_other = execute_type2(device, queue, &plan, &first_points, &other_coefficients);
+    let encoded_second = execute_type2(device, queue, &plan, &second_points, &first_coefficients);
+
+    let first_buffer =
+        storage_buffer_init(device, "wgpu_nufft.3d.test.binned.points", &first_points);
+    let executed = execute_type2_with_set_points(
+        device,
+        queue,
+        &plan,
+        &first_buffer,
+        3_001,
+        &[first_coefficients.as_slice(), other_coefficients.as_slice()],
+    );
+    assert_f32_bits_equal(
+        &executed[0],
+        &encoded,
+        "3D binned type2 set_points + execute",
+    );
+    assert_f32_bits_equal(
+        &executed[1],
+        &encoded_other,
+        "3D binned type2 reused points",
+    );
+
+    let second_buffer =
+        storage_buffer_init(device, "wgpu_nufft.3d.test.binned.points2", &second_points);
+    let executed_second = execute_type2_with_set_points(
+        device,
+        queue,
+        &plan,
+        &second_buffer,
+        1_777,
+        &[first_coefficients.as_slice()],
+    );
+    assert_f32_bits_equal(
+        &executed_second[0],
+        &encoded_second,
+        "3D binned type2 execute after replacing points",
+    );
+}
+
+fn validate_binned_type2_active_batch(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let config = NufftConfig::new([16, 20, 12], 1.0e-6)
+        .with_sign(NufftSign::Negative)
+        .with_batch(3);
+    let plan = NufftPlan::type2_gpu(device, queue, config.clone()).unwrap();
+    let modes = config.mode_count().unwrap();
+    let point_count = 701;
+    let points = seeded_random_points(point_count, 0xba7c_4002);
+    let vectors = [
+        test_values(modes, NufftSign::Negative, ModeOrder::Centered),
+        test_values(modes, NufftSign::Positive, ModeOrder::Fft),
+    ];
+    let coefficients = vectors.concat();
+    let points_buffer =
+        storage_buffer_init(device, "wgpu_nufft.3d.test.binned.batch.points", &points);
+    let coefficients_buffer = storage_buffer_init(
+        device,
+        "wgpu_nufft.3d.test.binned.batch.coefficients",
+        &coefficients,
+    );
+    let output_bytes = plan
+        .required_type2_output_buffer_size_bytes_for_batch(point_count, 2)
+        .unwrap();
+    let outputs = [0, 1].map(|index| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("wgpu_nufft.3d.test.binned.batch.output{index}")),
+            size: output_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })
+    });
+    let readbacks = [0, 1].map(|index| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(&format!("wgpu_nufft.3d.test.binned.batch.readback{index}")),
+            size: output_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        })
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_nufft.3d.test.binned.batch.encoder"),
+    });
+    plan.encode_type2_gpu_batch(
+        device,
+        &mut encoder,
+        point_count,
+        2,
+        &points_buffer,
+        &coefficients_buffer,
+        &outputs[0],
+    )
+    .unwrap();
+    plan.execute_type2_gpu_batch(device, &mut encoder, 2, &coefficients_buffer, &outputs[1])
+        .unwrap();
+    for (output, readback) in outputs.iter().zip(&readbacks) {
+        encoder.copy_buffer_to_buffer(output, 0, readback, 0, output_bytes);
+    }
+    let submission = queue.submit([encoder.finish()]);
+    let encoded = read_f32_after_submission(device, &readbacks[0], submission.clone());
+    let executed = read_f32_after_submission(device, &readbacks[1], submission);
+    assert_f32_bits_equal(&executed, &encoded, "3D binned type2 batched execute");
+    let single_vector = config.clone().with_batch(1);
+    for (vector, values) in vectors.iter().enumerate() {
+        let reference = reference_type2_f64(
+            &single_vector,
+            &points_f64(&points),
+            &interleaved_to_complex64(values),
+        )
+        .unwrap();
+        let actual = interleaved_to_complex64(
+            &encoded[2 * point_count * vector..2 * point_count * (vector + 1)],
+        );
+        let error = relative_l2(&actual, &reference);
+        eprintln!("NUFFT_3D_BINNED_TYPE2_BATCH vector={vector} relative_l2={error:.9e}");
+        assert!(error <= FLOAT_TOLERANCE_FACTOR_3D * 1.0e-6);
+    }
+}
+
+fn execute_type2_with_set_points(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    plan: &NufftPlan,
+    points: &wgpu::Buffer,
+    point_count: usize,
+    coefficient_vectors: &[&[f32]],
+) -> Vec<Vec<f32>> {
+    let output_bytes = NufftPlan::required_type2_output_buffer_size_bytes(point_count).unwrap();
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_nufft.3d.test.type2_set_points.encoder"),
+    });
+    plan.set_points_gpu(device, &mut encoder, point_count, points)
+        .unwrap();
+    let mut readbacks = Vec::new();
+    for coefficients in coefficient_vectors {
+        let coefficients_buffer = storage_buffer_init(
+            device,
+            "wgpu_nufft.3d.test.type2_set_points.coefficients",
+            coefficients,
+        );
+        let output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu_nufft.3d.test.type2_set_points.output"),
+            size: output_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu_nufft.3d.test.type2_set_points.readback"),
+            size: output_bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        plan.execute_type2_gpu(device, &mut encoder, &coefficients_buffer, &output)
+            .unwrap();
+        encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output_bytes);
+        readbacks.push(readback);
+    }
+    let submission = queue.submit([encoder.finish()]);
+    readbacks
+        .iter()
+        .map(|readback| read_f32_after_submission(device, readback, submission.clone()))
+        .collect()
+}
+
 struct PointClass {
     label: &'static str,
     points: Vec<f32>,
@@ -565,6 +1097,35 @@ fn point_classes() -> Vec<PointClass> {
             ],
         },
     ]
+}
+
+/// Past 32 MiB of prepared data the binned type-2 path prepares points in a
+/// separate indexed pass; each output still depends only on its own point, so
+/// a large set must reproduce the outputs of its small, fused-path prefix.
+fn validate_binned_type2_large_set_matches_prefix(device: &wgpu::Device, queue: &wgpu::Queue) {
+    const LARGE_POINTS: usize = 900_000;
+    const PREFIX_POINTS: usize = 997;
+    let config = NufftConfig::new([16, 20, 12], 1.0e-6).with_sign(NufftSign::Negative);
+    let plan = NufftPlan::type2_gpu(device, queue, config.clone()).unwrap();
+    let coefficients = test_values(
+        config.mode_count().unwrap(),
+        NufftSign::Negative,
+        ModeOrder::Centered,
+    );
+    let points = seeded_random_points(LARGE_POINTS, 0x1a26_e5e7);
+    let large = execute_type2(device, queue, &plan, &points, &coefficients);
+    let prefix = execute_type2(
+        device,
+        queue,
+        &plan,
+        &points[..DIMENSIONS * PREFIX_POINTS],
+        &coefficients,
+    );
+    assert_f32_bits_equal(
+        &large[..2 * PREFIX_POINTS],
+        &prefix,
+        "binned type2 indexed preparation versus fused prefix",
+    );
 }
 
 fn seeded_random_points(point_count: usize, mut state: u32) -> Vec<f32> {

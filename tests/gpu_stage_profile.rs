@@ -16,6 +16,9 @@ const POINT_COUNT: usize = 1_024;
 const MODE_SHAPE_2D: [usize; 2] = [32, 48];
 const MODE_COUNT_2D: usize = MODE_SHAPE_2D[0] * MODE_SHAPE_2D[1];
 const POINT_COUNT_2D: usize = 1_021;
+const MODE_SHAPE_3D: [usize; 3] = [16, 20, 12];
+const MODE_COUNT_3D: usize = MODE_SHAPE_3D[0] * MODE_SHAPE_3D[1] * MODE_SHAPE_3D[2];
+const POINT_COUNT_3D: usize = 997;
 
 const TYPE1_STAGES: &[NufftGpuStage] = &[
     NufftGpuStage::BinClearCount,
@@ -35,12 +38,18 @@ const TYPE1_LABELS: &[&str] = &[
     "fine-grid-fft",
     "deconvolution",
 ];
-const TYPE2_STAGES: &[NufftGpuStage] = &[
+const BINNED_TYPE2_STAGES: &[NufftGpuStage] = &[
+    NufftGpuStage::PointBinning,
     NufftGpuStage::Predeconvolution,
     NufftGpuStage::FineGridFft,
     NufftGpuStage::Interpolation,
 ];
-const TYPE2_LABELS: &[&str] = &["predeconvolution", "fine-grid-fft", "interpolation"];
+const BINNED_TYPE2_LABELS: &[&str] = &[
+    "point-binning",
+    "predeconvolution",
+    "fine-grid-fft",
+    "interpolation",
+];
 
 #[test]
 fn profiled_gpu_paths_match_ordinary_execution_and_write_timestamps() {
@@ -117,6 +126,7 @@ async fn run_gpu_stage_profile_test() {
     let points_2d = test_points_2d();
     run_type1_case_2d(&device, &queue, &points_2d, period_ns);
     run_type2_case_2d(&device, &queue, &points_2d, period_ns);
+    run_binned_type2_case_3d(&device, &queue, &test_points_3d(), period_ns);
     if let Some(error) = validation_scope.pop().await {
         panic!("GPU stage-profile validation scope captured an unexpected error: {error}");
     }
@@ -183,7 +193,7 @@ fn run_type1_case(device: &wgpu::Device, queue: &wgpu::Queue, points: &[f32], pe
 fn run_type2_case(device: &wgpu::Device, queue: &wgpu::Queue, points: &[f32], period_ns: f64) {
     let config = test_config();
     let plan = NufftPlan::type2_gpu(device, queue, config).unwrap();
-    assert_eq!(plan.gpu_profile_query_count(), 4);
+    assert_eq!(plan.gpu_profile_query_count(), 5);
     let coefficients = test_complex_values(MODE_COUNT, 0.23, 0.37);
     let point_buffer = create_storage_buffer(device, "type2.points", points);
     let coefficient_buffer = create_storage_buffer(device, "type2.coefficients", &coefficients);
@@ -228,8 +238,8 @@ fn run_type2_case(device: &wgpu::Device, queue: &wgpu::Queue, points: &[f32], pe
         output_bytes,
         &query_set,
         &layout,
-        TYPE2_STAGES,
-        TYPE2_LABELS,
+        BINNED_TYPE2_STAGES,
+        BINNED_TYPE2_LABELS,
         period_ns,
     );
 }
@@ -306,7 +316,7 @@ fn run_type2_case_2d(device: &wgpu::Device, queue: &wgpu::Queue, points: &[f32],
     assert_eq!(points.len(), POINT_COUNT_2D * MODE_SHAPE_2D.len());
     let config = test_config_2d();
     let plan = NufftPlan::type2_gpu(device, queue, config).unwrap();
-    assert_eq!(plan.gpu_profile_query_count(), 4);
+    assert_eq!(plan.gpu_profile_query_count(), 5);
     let coefficients = test_complex_values(MODE_COUNT_2D, 0.21, 0.35);
     let point_buffer = create_storage_buffer(device, "type2_2d.points", points);
     let coefficient_buffer = create_storage_buffer(device, "type2_2d.coefficients", &coefficients);
@@ -356,8 +366,77 @@ fn run_type2_case_2d(device: &wgpu::Device, queue: &wgpu::Queue, points: &[f32],
         output_bytes,
         &query_set,
         &layout,
-        TYPE2_STAGES,
-        TYPE2_LABELS,
+        BINNED_TYPE2_STAGES,
+        BINNED_TYPE2_LABELS,
+        period_ns,
+    );
+}
+
+fn run_binned_type2_case_3d(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    points: &[f32],
+    period_ns: f64,
+) {
+    const FIRST_QUERY: u32 = 2;
+
+    assert_eq!(points.len(), POINT_COUNT_3D * MODE_SHAPE_3D.len());
+    let config = NufftConfig::new(MODE_SHAPE_3D, 1.0e-6)
+        .with_sign(NufftSign::Positive)
+        .with_mode_order(ModeOrder::Centered);
+    let plan = NufftPlan::type2_gpu(device, queue, config).unwrap();
+    assert_eq!(plan.gpu_profile_query_count(), 5);
+    let coefficients = test_complex_values(MODE_COUNT_3D, 0.19, 0.31);
+    let point_buffer = create_storage_buffer(device, "type2_3d.points", points);
+    let coefficient_buffer = create_storage_buffer(device, "type2_3d.coefficients", &coefficients);
+    let output_bytes = NufftPlan::required_type2_output_buffer_size_bytes(POINT_COUNT_3D).unwrap();
+    let ordinary_output = create_output_buffer(device, "type2_3d.ordinary_output", output_bytes);
+    let profiled_output = create_output_buffer(device, "type2_3d.profiled_output", output_bytes);
+    let query_count = plan.gpu_profile_query_count();
+    let query_set = create_timestamp_query_set(
+        device,
+        "type2_3d",
+        FIRST_QUERY.checked_add(query_count).unwrap(),
+    );
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_nufft.stage_profile.type2_3d.encoder"),
+    });
+    plan.encode_type2_gpu(
+        device,
+        &mut encoder,
+        POINT_COUNT_3D,
+        &point_buffer,
+        &coefficient_buffer,
+        &ordinary_output,
+    )
+    .unwrap();
+    let layout = plan
+        .encode_type2_gpu_profiled(
+            device,
+            &mut encoder,
+            POINT_COUNT_3D,
+            &point_buffer,
+            &coefficient_buffer,
+            &profiled_output,
+            &query_set,
+            FIRST_QUERY,
+        )
+        .unwrap();
+    assert_eq!(layout.query_count(), query_count);
+    assert_eq!(layout.query_range(), FIRST_QUERY..FIRST_QUERY + query_count);
+    finish_case(
+        device,
+        queue,
+        encoder,
+        "type-2-3d",
+        &ordinary_output,
+        &profiled_output,
+        output_bytes,
+        &query_set,
+        &layout,
+        BINNED_TYPE2_STAGES,
+        BINNED_TYPE2_LABELS,
         period_ns,
     );
 }
@@ -508,6 +587,19 @@ fn test_points_2d() -> Vec<f32> {
         let y_fraction = ((index * 53 + 7) % 1_021) as f32 / 1_021.0;
         points.push(x_fraction * TAU - PI);
         points.push(y_fraction * TAU - PI);
+    }
+    points
+}
+
+fn test_points_3d() -> Vec<f32> {
+    let mut points = Vec::with_capacity(POINT_COUNT_3D * MODE_SHAPE_3D.len());
+    for index in 0..POINT_COUNT_3D {
+        let x_fraction = ((index * 37) % 1_019) as f32 / 1_019.0;
+        let y_fraction = ((index * 53 + 7) % 1_021) as f32 / 1_021.0;
+        let z_fraction = ((index * 71 + 13) % 1_031) as f32 / 1_031.0;
+        points.push(x_fraction * TAU - PI);
+        points.push(y_fraction * TAU - PI);
+        points.push(z_fraction * TAU - PI);
     }
     points
 }

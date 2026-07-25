@@ -3,6 +3,7 @@ use std::ops::Range;
 
 const TYPE1_QUERY_COUNT: u32 = 8;
 const TYPE2_QUERY_COUNT: u32 = 4;
+const TYPE2_BINNED_QUERY_COUNT: u32 = 5;
 
 /// A measured stage in a GPU-resident NUFFT execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -17,6 +18,8 @@ pub enum NufftGpuStage {
     Deconvolution,
     Predeconvolution,
     Interpolation,
+    /// Coarse-bin grouping of type-2 points ahead of a binned interpolation.
+    PointBinning,
 }
 
 impl NufftGpuStage {
@@ -32,6 +35,7 @@ impl NufftGpuStage {
             Self::Deconvolution => "deconvolution",
             Self::Predeconvolution => "predeconvolution",
             Self::Interpolation => "interpolation",
+            Self::PointBinning => "point-binning",
         }
     }
 }
@@ -117,6 +121,21 @@ impl NufftGpuProfileLayout {
                 (NufftGpuStage::Predeconvolution, 0, 1),
                 (NufftGpuStage::FineGridFft, 1, 2),
                 (NufftGpuStage::Interpolation, 2, 3),
+            ],
+        )
+    }
+
+    /// Builds the five-query layout for a type-2 execution that first groups
+    /// its points into coarse bins.
+    pub(crate) fn type2_binned(first_query: u32) -> Result<Self, NufftGpuProfileLayoutError> {
+        Self::new(
+            first_query,
+            TYPE2_BINNED_QUERY_COUNT,
+            &[
+                (NufftGpuStage::PointBinning, 0, 1),
+                (NufftGpuStage::Predeconvolution, 1, 2),
+                (NufftGpuStage::FineGridFft, 2, 3),
+                (NufftGpuStage::Interpolation, 3, 4),
             ],
         )
     }
@@ -220,19 +239,24 @@ impl<'a> GpuProfileQueryWriter<'a> {
         })
     }
 
-    /// Encodes an empty pass whose end timestamp precedes type-1 buffer clears.
-    pub(crate) fn encode_type1_start_marker(&self, encoder: &mut wgpu::CommandEncoder) {
+    /// Encodes an empty pass whose end timestamp precedes the buffer clears
+    /// that open the first stage.
+    pub(crate) fn encode_start_marker(&self, encoder: &mut wgpu::CommandEncoder) {
         let Some(timestamp_writes) = self.timestamp_writes(None, Some(0)) else {
             return;
         };
         if let Self::Enabled { layout, .. } = self {
-            debug_assert_eq!(
+            debug_assert!(matches!(
                 layout.stages.first().map(NufftGpuStageQuery::stage),
-                Some(NufftGpuStage::BinClearCount)
-            );
+                Some(
+                    NufftGpuStage::BinClearCount
+                        | NufftGpuStage::PointBinning
+                        | NufftGpuStage::Predeconvolution
+                )
+            ));
         }
         let _pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("wgpu_nufft.profile.type1.start_marker"),
+            label: Some("wgpu_nufft.profile.start_marker"),
             timestamp_writes: Some(timestamp_writes),
         });
     }
@@ -288,6 +312,25 @@ mod tests {
                 end_query: 22,
             })
         );
+    }
+
+    #[test]
+    fn binned_type2_layout_measures_point_binning_first() {
+        let layout = NufftGpuProfileLayout::type2_binned(30).unwrap();
+        assert_eq!(layout.query_range(), 30..35);
+        let expected = [
+            (NufftGpuStage::PointBinning, 30, 31),
+            (NufftGpuStage::Predeconvolution, 31, 32),
+            (NufftGpuStage::FineGridFft, 32, 33),
+            (NufftGpuStage::Interpolation, 33, 34),
+        ];
+        let actual = layout
+            .stages()
+            .iter()
+            .map(|query| (query.stage(), query.start_query(), query.end_query()))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(NufftGpuStage::PointBinning.label(), "point-binning");
     }
 
     #[test]

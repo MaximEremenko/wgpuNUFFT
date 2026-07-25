@@ -33,6 +33,7 @@ struct Options {
     samples: usize,
     wait_timeout: Duration,
     type1_gather: Type1Gather,
+    reuse_points: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -130,9 +131,16 @@ impl TransformKind {
         encoder: &mut wgpu::CommandEncoder,
         point_count: usize,
         buffers: &CaseBuffers,
+        reuse_points: bool,
     ) -> BenchResult<()> {
-        match self {
-            Self::Type1 => plan.encode_type1_gpu(
+        match (self, reuse_points) {
+            (Self::Type1, true) => {
+                plan.execute_type1_gpu(device, encoder, &buffers.strengths, &buffers.type1_output)?
+            }
+            (Self::Type2, true) => {
+                plan.execute_type2_gpu(device, encoder, &buffers.modes, &buffers.type2_output)?
+            }
+            (Self::Type1, false) => plan.encode_type1_gpu(
                 device,
                 encoder,
                 point_count,
@@ -140,7 +148,7 @@ impl TransformKind {
                 &buffers.strengths,
                 &buffers.type1_output,
             )?,
-            Self::Type2 => plan.encode_type2_gpu(
+            (Self::Type2, false) => plan.encode_type2_gpu(
                 device,
                 encoder,
                 point_count,
@@ -169,6 +177,7 @@ struct TransformExecution<'a> {
     point_count: usize,
     kind: TransformKind,
     wait_timeout: Duration,
+    reuse_points: bool,
 }
 
 #[derive(Debug)]
@@ -439,7 +448,23 @@ async fn run_kind(
             point_count,
             kind,
             wait_timeout: options.wait_timeout,
+            reuse_points: options.reuse_points,
         };
+        if options.reuse_points {
+            // Point preparation runs once per plan, outside every timed span,
+            // like a one-time point setup before repeated executions.
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("wgpu_nufft.2d_bench.set_points"),
+            });
+            plan.set_points_gpu(device, &mut encoder, point_count, &buffers.points)?;
+            let submission = queue.submit([encoder.finish()]);
+            wait_for_submission(
+                device,
+                submission,
+                "waiting for set_points_gpu",
+                options.wait_timeout,
+            )?;
+        }
         let (warmup_encode_ms, warmup_submit_wait_ms) =
             execution.execute_once("2D warmup", 1).await?;
         println!(
@@ -502,7 +527,7 @@ async fn run_kind(
     let fine_shape = fine_shape.expect("at least one validated run");
     let million_points_per_second = point_count as f64 / (submit_wait_stats.mean * 1_000.0);
     println!(
-        "RESULT kind={} type1_gather={} dimensions=2 N0={} N1={} N_total={} M={} fine_grid_shape={}x{} eps={} sigma={} sign=positive mode_order=centered precision=f32 runs={} samples_per_run={} transforms_per_sample={} total_samples={} raw_submit_wait_ms_per_transform={:?} run_avg_submit_wait_ms_per_transform={:?} avg_submit_wait_ms_per_transform={:.6} stderr_submit_wait_ms_per_transform={} stderr_basis=plan-recreated-run-means min_submit_wait_ms_per_transform={:.6} million_points_per_second={:.6} raw_encode_ms_per_transform={:?} run_avg_encode_ms_per_transform={:?} avg_encode_ms_per_transform={:.6} stderr_encode_ms_per_transform={} min_encode_ms_per_transform={:.6} raw_plan_create_ms={:?} avg_plan_create_ms={:.6} stderr_plan_create_ms={} min_plan_create_ms={:.6} timing_scope=submit-through-device-poll-divided-per-transform setup_excluded=plan,encode,upload,readback",
+        "RESULT kind={} type1_gather={} dimensions=2 N0={} N1={} N_total={} M={} fine_grid_shape={}x{} eps={} sigma={} sign=positive mode_order=centered precision=f32 runs={} samples_per_run={} transforms_per_sample={} total_samples={} raw_submit_wait_ms_per_transform={:?} run_avg_submit_wait_ms_per_transform={:?} avg_submit_wait_ms_per_transform={:.6} stderr_submit_wait_ms_per_transform={} stderr_basis=plan-recreated-run-means min_submit_wait_ms_per_transform={:.6} million_points_per_second={:.6} raw_encode_ms_per_transform={:?} run_avg_encode_ms_per_transform={:?} avg_encode_ms_per_transform={:.6} stderr_encode_ms_per_transform={} min_encode_ms_per_transform={:.6} raw_plan_create_ms={:?} avg_plan_create_ms={:.6} stderr_plan_create_ms={} min_plan_create_ms={:.6} timing_scope=submit-through-device-poll-divided-per-transform setup_excluded=plan,encode,upload,readback points={}",
         kind.name(),
         options.type1_gather.name(),
         shape[0],
@@ -532,6 +557,11 @@ async fn run_kind(
         plan_creation_stats.mean,
         format_optional(plan_creation_stats.stderr),
         plan_creation_stats.minimum,
+        if options.reuse_points {
+            "set-once-reused"
+        } else {
+            "prepared-per-execution"
+        },
     );
     Ok(())
 }
@@ -556,6 +586,7 @@ impl TransformExecution<'_> {
                     &mut encoder,
                     self.point_count,
                     self.buffers,
+                    self.reuse_points,
                 )?;
             }
             Ok(encoder.finish())
@@ -724,6 +755,7 @@ fn parse_options() -> BenchResult<Options> {
     let mut samples = DEFAULT_SAMPLES;
     let mut wait_timeout = DEFAULT_WAIT_TIMEOUT;
     let mut type1_gather = Type1Gather::Tiled16;
+    let mut reuse_points = false;
     let mut arguments = std::env::args().skip(1).filter(|arg| arg != "--bench");
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -744,6 +776,7 @@ fn parse_options() -> BenchResult<Options> {
                 }
                 wait_timeout = Duration::from_secs(seconds);
             }
+            "--reuse-points" => reuse_points = true,
             "--type1-gather" => {
                 type1_gather = match next_value(&mut arguments, "--type1-gather")?.as_str() {
                     "global" => Type1Gather::Global,
@@ -768,6 +801,7 @@ fn parse_options() -> BenchResult<Options> {
         samples,
         wait_timeout,
         type1_gather,
+        reuse_points,
     })
 }
 
@@ -798,6 +832,8 @@ Options:
   --samples <count>           Timed submissions per plan (default: 10).
   --wait-timeout-secs <secs>  Per-submission timeout (default: 120).
   --type1-gather <route>      Select global or tiled16 (default: tiled16).
+  --reuse-points              Record set_points_gpu once per plan outside the
+                              timed span and time execute_* calls.
   --help                      Show this help.
 
 Fixed cases are 512x512 and 1024x1024 with M=N0*N1, f32, eps=1e-6,

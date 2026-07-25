@@ -35,23 +35,52 @@ const F32_BYTES: u64 = 4;
 const F64_BYTES: u64 = 8;
 const U32_BYTES: u64 = 4;
 
+mod block;
+
+use block::{BlockLayout, BlockSpread3d};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Type1Gather3d {
     #[cfg_attr(not(feature = "type1-3d-tile-prototype"), allow(dead_code))]
     Global,
     Tiled8x8x4,
+    /// Output-stationary blocks over coarse bins; falls back to
+    /// [`Self::Tiled8x8x4`] where the precision, grid, or device cannot run it.
+    Block,
 }
 
 /// Device-specific resources for deterministic, atomics-free 3D spreading.
 ///
-/// Points are point-major `x, y, z` triples. Integer atomics construct one bin
-/// per fine-grid cell, indices within each flattened axis-0-fast bin are sorted
-/// into original point order, and one invocation owns each fine-grid output.
+/// Points are point-major `x, y, z` triples. The block spreader (F32) sorts
+/// points into coarse bins once per point set and lets each workgroup own a
+/// block of fine-grid cells; the per-cell gather builds one bin per fine-grid
+/// cell on every execution. Both sum each cell's contributions in original
+/// point order within a bin, so repeated executions are bitwise identical.
 pub(crate) struct Type1GpuPlan3d {
     fft: FftPlan,
     amplitudes: wgpu::Buffer,
     fine_input: wgpu::Buffer,
     fine_output: wgpu::Buffer,
+    spread: Spread3d,
+    deconvolution_pipeline: wgpu::ComputePipeline,
+    deconvolution_layout: wgpu::BindGroupLayout,
+    max_workgroups_per_dimension: u32,
+    mode_count: usize,
+    fine_count: usize,
+    batch_capacity: usize,
+    precision: FftPrecision,
+    max_storage_binding_bytes: u64,
+    max_buffer_bytes: u64,
+}
+
+enum Spread3d {
+    Block(Box<BlockSpread3d>),
+    PerCell(Box<PerCellSpread3d>),
+}
+
+/// One bin per fine-grid cell, rebuilt by every spread, gathered by one
+/// invocation (or one tiled workgroup) per fine-grid cell.
+struct PerCellSpread3d {
     scratch: Type1ScratchBuffers,
     count_pipeline: wgpu::ComputePipeline,
     count_layout: wgpu::BindGroupLayout,
@@ -64,17 +93,9 @@ pub(crate) struct Type1GpuPlan3d {
     sort_layout: wgpu::BindGroupLayout,
     gather_pipeline: wgpu::ComputePipeline,
     gather_layout: wgpu::BindGroupLayout,
-    deconvolution_pipeline: wgpu::ComputePipeline,
-    deconvolution_layout: wgpu::BindGroupLayout,
     sort_dispatch: (u32, u32, u32),
     gather_workgroups_per_vector_block: u32,
-    max_workgroups_per_dimension: u32,
-    mode_count: usize,
     fine_count: usize,
-    batch_capacity: usize,
-    precision: FftPrecision,
-    max_storage_binding_bytes: u64,
-    max_buffer_bytes: u64,
 }
 
 impl Type1GpuPlan3d {
@@ -175,21 +196,9 @@ impl Type1GpuPlan3d {
             mode_count,
             scalar_size_bytes(precision),
         )?;
-        let count_bytes = checked_buffer_size("type-1 3D bin counts", fine_count, U32_BYTES)?;
-        let offset_count = fine_count
-            .checked_add(1)
-            .ok_or(NufftError::LengthOverflow {
-                context: "type-1 3D bin offset count",
-            })?;
-        u32::try_from(offset_count).map_err(|_| NufftError::LengthOverflow {
-            context: "type-1 3D bin-offset shader index space",
-        })?;
-        let offset_bytes = checked_buffer_size("type-1 3D bin offsets", offset_count, U32_BYTES)?;
         for (label, bytes) in [
             ("type-1 3D fine grid", fine_bytes),
             ("type-1 3D deconvolution amplitudes", amplitude_bytes),
-            ("type-1 3D bin counts", count_bytes),
-            ("type-1 3D bin offsets", offset_bytes),
         ] {
             validate_binding_limit(label, bytes, limits.max_storage_buffer_binding_size)?;
             validate_buffer_limit(label, bytes, limits.max_buffer_size)?;
@@ -216,8 +225,6 @@ impl Type1GpuPlan3d {
             usage: fine_usage,
             mapped_at_creation: false,
         });
-        let scratch =
-            Type1ScratchBuffers::new(device, "wgpu_nufft.type1_3d", count_bytes, offset_bytes);
         let fft = FftPlan::c2c(device, queue, fft_config).map_err(|source| {
             NufftError::FftShapeUnsupported {
                 stage: "type-1 3D oversampled-grid C2C plan",
@@ -225,83 +232,27 @@ impl Type1GpuPlan3d {
             }
         })?;
 
-        let count_pipeline = create_compute_pipeline(
-            device,
-            "wgpu_nufft.type1_3d.bin_count",
-            &generate_count_wgsl_for_precision(fine_shape, precision),
-        );
-        let count_layout = count_pipeline.get_bind_group_layout(0);
-        let prefix_scan = GpuExclusiveScanU32::new(device, fine_count)?;
-        let terminal_pipeline = create_compute_pipeline(
-            device,
-            "wgpu_nufft.type1_3d.bin_terminal",
-            &generate_terminal_wgsl(),
-        );
-        let terminal_layout = terminal_pipeline.get_bind_group_layout(0);
-        let scatter_pipeline = create_compute_pipeline(
-            device,
-            "wgpu_nufft.type1_3d.bin_scatter",
-            &generate_scatter_wgsl_for_precision(fine_shape, precision),
-        );
-        let scatter_layout = scatter_pipeline.get_bind_group_layout(0);
-        let sort_pipeline = create_compute_pipeline(
-            device,
-            "wgpu_nufft.type1_3d.bin_sort",
-            &generate_sort_wgsl(),
-        );
-        let sort_layout = sort_pipeline.get_bind_group_layout(0);
-        let max_workgroups_per_dimension = limits.max_compute_workgroups_per_dimension;
-        let (gather_label, gather_source, gather_workgroups_per_vector_block) = match precision {
-            FftPrecision::F64 => (
-                "wgpu_nufft.type1_3d.spread_gather_f64",
-                generate_gather_wgsl_f64(kernel, fine_shape),
-                workgroups_for_elements(fine_count)?,
-            ),
-            FftPrecision::Df64 => (
-                "wgpu_nufft.type1_3d.spread_gather_df64",
-                generate_gather_wgsl_df64(kernel, fine_shape),
-                workgroups_for_elements(fine_count)?,
-            ),
-            FftPrecision::F32 => match gather {
-                Type1Gather3d::Global => (
-                    "wgpu_nufft.type1_3d.spread_gather",
-                    generate_gather_wgsl(kernel, fine_shape),
-                    workgroups_for_elements(fine_count)?,
-                ),
-                Type1Gather3d::Tiled8x8x4 => {
-                    let configuration =
-                        tiled_gather_halo_shape(kernel.width()).and_then(|halo_shape| {
-                            let cache_capacity = tiled_gather_cache_capacity(kernel.width())?;
-                            let storage_bytes =
-                                tiled_gather_storage_bytes(kernel.width(), cache_capacity)?;
-                            Ok((halo_shape, cache_capacity, storage_bytes))
-                        });
-                    match configuration {
-                        Ok((halo_shape, cache_capacity, storage_bytes))
-                            if maximum_workgroup_size >= TILED_GATHER_WORKGROUP_SIZE
-                                && fine_shape
-                                    .iter()
-                                    .zip(halo_shape)
-                                    .all(|(&length, halo)| length >= halo)
-                                && storage_bytes <= limits.max_compute_workgroup_storage_size =>
-                        {
-                            (
-                                "wgpu_nufft.type1_3d.spread_gather_tiled8x8x4",
-                                generate_tiled_gather_wgsl(kernel, fine_shape, cache_capacity)?,
-                                tiled_gather_workgroups(fine_shape)?,
-                            )
-                        }
-                        _ => (
-                            "wgpu_nufft.type1_3d.spread_gather",
-                            generate_gather_wgsl(kernel, fine_shape),
-                            workgroups_for_elements(fine_count)?,
-                        ),
-                    }
-                }
-            },
+        let block_layout = match (precision, gather) {
+            (FftPrecision::F32, Type1Gather3d::Block) => {
+                BlockLayout::for_grid(kernel, fine_shape, &limits)
+            }
+            _ => None,
         };
-        let gather_pipeline = create_compute_pipeline(device, gather_label, &gather_source);
-        let gather_layout = gather_pipeline.get_bind_group_layout(0);
+        let spread = match block_layout {
+            Some(layout) => Spread3d::Block(Box::new(BlockSpread3d::new(
+                device, kernel, fine_shape, layout,
+            )?)),
+            None => {
+                let gather = match gather {
+                    Type1Gather3d::Block => Type1Gather3d::Tiled8x8x4,
+                    other => other,
+                };
+                Spread3d::PerCell(Box::new(PerCellSpread3d::new(
+                    device, kernel, fine_shape, fine_count, precision, gather,
+                )?))
+            }
+        };
+        let max_workgroups_per_dimension = limits.max_compute_workgroups_per_dimension;
         let deconvolution_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.type1_3d.deconvolution",
@@ -309,28 +260,14 @@ impl Type1GpuPlan3d {
         );
         let deconvolution_layout = deconvolution_pipeline.get_bind_group_layout(0);
 
-        let sort_dispatch = dispatch_for_elements(fine_count, max_workgroups_per_dimension)?;
         Ok(Self {
             fft,
             amplitudes,
             fine_input,
             fine_output,
-            scratch,
-            count_pipeline,
-            count_layout,
-            prefix_scan,
-            terminal_pipeline,
-            terminal_layout,
-            scatter_pipeline,
-            scatter_layout,
-            sort_pipeline,
-            sort_layout,
-            gather_pipeline,
-            gather_layout,
+            spread,
             deconvolution_pipeline,
             deconvolution_layout,
-            sort_dispatch,
-            gather_workgroups_per_vector_block,
             max_workgroups_per_dimension,
             mode_count,
             fine_count,
@@ -403,6 +340,7 @@ impl Type1GpuPlan3d {
             point_count,
             points,
             strengths,
+            true,
             #[cfg(feature = "gpu-profiling")]
             GpuProfileQueryWriter::disabled(),
         )
@@ -458,9 +396,82 @@ impl Type1GpuPlan3d {
             points,
             strengths,
             output,
+            true,
             #[cfg(feature = "gpu-profiling")]
             GpuProfileQueryWriter::disabled(),
         )
+    }
+
+    /// Records the point-dependent preparation (the stable coarse-bin order of
+    /// the block spreader) for later [`Self::encode_batch_with_recorded_points`]
+    /// calls with the same `points` contents. The per-cell gather prepares
+    /// nothing here and rebuilds its bins on every execution.
+    pub(crate) fn set_points(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+    ) -> Result<()> {
+        let point_bytes = self.validate_points(point_count, points)?;
+        if let (Spread3d::Block(block), true) = (&self.spread, point_count > 0) {
+            block.encode_bins(
+                device,
+                encoder,
+                point_count,
+                points,
+                point_bytes,
+                #[cfg(feature = "gpu-profiling")]
+                GpuProfileQueryWriter::disabled(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Self::encode_batch`], but reuses the preparation recorded by the
+    /// most recent [`Self::set_points`] for these `points`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_batch_with_recorded_points(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        self.validate_active_batch(active_batch)?;
+        self.encode_impl(
+            device,
+            encoder,
+            active_batch,
+            point_count,
+            points,
+            strengths,
+            output,
+            false,
+            #[cfg(feature = "gpu-profiling")]
+            GpuProfileQueryWriter::disabled(),
+        )
+    }
+
+    fn validate_points(&self, point_count: usize, points: &wgpu::Buffer) -> Result<u64> {
+        if point_count == 0 {
+            return Ok(0);
+        }
+        u32::try_from(point_count).map_err(|_| NufftError::LengthOverflow {
+            context: "type-1 3D GPU point count",
+        })?;
+        validate_point_coordinate_shader_index(point_count)?;
+        let point_bytes = Self::point_buffer_size_bytes_for_precision(point_count, self.precision)?;
+        validate_external_storage_buffer(
+            "type-1 3D point",
+            points,
+            point_bytes,
+            self.max_storage_binding_bytes,
+        )?;
+        Ok(point_bytes)
     }
 
     #[cfg(feature = "gpu-profiling")]
@@ -494,6 +505,7 @@ impl Type1GpuPlan3d {
             points,
             strengths,
             output,
+            true,
             GpuProfileQueryWriter::enabled(query_set, &layout),
         )?;
         Ok(layout)
@@ -509,6 +521,7 @@ impl Type1GpuPlan3d {
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
         output: &wgpu::Buffer,
+        record_points: bool,
         #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
         let output_elements =
@@ -545,39 +558,17 @@ impl Type1GpuPlan3d {
             ],
         });
 
-        #[cfg(not(feature = "gpu-profiling"))]
-        self.encode_spread_batch(
+        self.encode_spread_impl(
             device,
             encoder,
             active_batch,
             point_count,
             points,
             strengths,
+            record_points,
+            #[cfg(feature = "gpu-profiling")]
+            profile,
         )?;
-        #[cfg(feature = "gpu-profiling")]
-        match profile {
-            GpuProfileQueryWriter::Disabled => {
-                self.encode_spread_batch(
-                    device,
-                    encoder,
-                    active_batch,
-                    point_count,
-                    points,
-                    strengths,
-                )?;
-            }
-            GpuProfileQueryWriter::Enabled { .. } => {
-                self.encode_spread_impl(
-                    device,
-                    encoder,
-                    active_batch,
-                    point_count,
-                    points,
-                    strengths,
-                    profile,
-                )?;
-            }
-        }
         self.encode_fft(device, encoder)?;
         let deconvolution_dispatch =
             dispatch_for_elements(output_elements, self.max_workgroups_per_dimension)?;
@@ -600,6 +591,7 @@ impl Type1GpuPlan3d {
         point_count: usize,
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
+        record_points: bool,
         #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
         if point_count == 0 {
@@ -607,12 +599,7 @@ impl Type1GpuPlan3d {
             return Ok(());
         }
 
-        let point_count_u32 =
-            u32::try_from(point_count).map_err(|_| NufftError::LengthOverflow {
-                context: "type-1 3D GPU point count",
-            })?;
-        validate_point_coordinate_shader_index(point_count)?;
-        let point_bytes = Self::point_buffer_size_bytes_for_precision(point_count, self.precision)?;
+        let point_bytes = self.validate_points(point_count, points)?;
         let strength_elements =
             point_count
                 .checked_mul(active_batch)
@@ -622,181 +609,67 @@ impl Type1GpuPlan3d {
         let strength_bytes =
             Self::strength_buffer_size_bytes_for_precision(strength_elements, self.precision)?;
         validate_external_storage_buffer(
-            "type-1 3D point",
-            points,
-            point_bytes,
-            self.max_storage_binding_bytes,
-        )?;
-        validate_external_storage_buffer(
             "type-1 3D strength",
             strengths,
             strength_bytes,
             self.max_storage_binding_bytes,
         )?;
-
-        let fine_grid_element_count = self.fine_grid_element_count();
-        let count_bytes =
-            checked_buffer_size("type-1 3D bin counts", fine_grid_element_count, U32_BYTES)?;
-        let offset_count =
-            self.fine_grid_element_count()
-                .checked_add(1)
-                .ok_or(NufftError::LengthOverflow {
-                    context: "type-1 3D bin offset count",
-                })?;
-        let offset_bytes = checked_buffer_size("type-1 3D bin offsets", offset_count, U32_BYTES)?;
-        let index_bytes =
-            checked_buffer_size("type-1 3D sorted point indices", point_count, U32_BYTES)?;
-        for (label, bytes) in [
-            ("type-1 3D bin counts", count_bytes),
-            ("type-1 3D bin cursors", count_bytes),
-            ("type-1 3D bin offsets", offset_bytes),
-            ("type-1 3D sorted point indices", index_bytes),
-        ] {
-            validate_binding_limit(label, bytes, self.max_storage_binding_bytes)?;
-            validate_buffer_limit(label, bytes, self.max_buffer_bytes)?;
-        }
-        let point_dispatch = split_workgroups(
-            point_count_u32.div_ceil(WORKGROUP_SIZE),
-            self.max_workgroups_per_dimension,
-        )?;
-
-        let bin_counts = &self.scratch.bin_counts;
-        let bin_cursors = &self.scratch.bin_cursors;
-        let bin_offsets = &self.scratch.bin_offsets;
-        let sorted_indices = self.scratch.sorted_indices(index_bytes);
-
-        let count_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wgpu_nufft.type1_3d.bin_count.bind_group"),
-            layout: &self.count_layout,
-            entries: &[
-                binding_entry(0, points, point_bytes),
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: bin_counts.as_entire_binding(),
-                },
-            ],
-        });
-        let terminal_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wgpu_nufft.type1_3d.bin_terminal.bind_group"),
-            layout: &self.terminal_layout,
-            entries: &[
-                binding_entry(0, bin_counts, count_bytes),
-                binding_entry(1, bin_offsets, offset_bytes),
-            ],
-        });
-        let scatter_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wgpu_nufft.type1_3d.bin_scatter.bind_group"),
-            layout: &self.scatter_layout,
-            entries: &[
-                binding_entry(0, points, point_bytes),
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: bin_offsets.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: bin_cursors.as_entire_binding(),
-                },
-                binding_entry(3, &sorted_indices, index_bytes),
-            ],
-        });
-        let sort_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wgpu_nufft.type1_3d.bin_sort.bind_group"),
-            layout: &self.sort_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: bin_offsets.as_entire_binding(),
-                },
-                binding_entry(1, &sorted_indices, index_bytes),
-            ],
-        });
-        let active_fine_elements = fine_grid_element_count.checked_mul(active_batch).ok_or(
-            NufftError::LengthOverflow {
+        let active_fine_elements = self
+            .fine_grid_element_count()
+            .checked_mul(active_batch)
+            .ok_or(NufftError::LengthOverflow {
                 context: "active batched type-1 3D fine-grid element count",
-            },
-        )?;
+            })?;
         let active_fine_bytes = Self::complex_buffer_size_bytes_for_precision(
             "active batched type-1 3D fine grid",
             active_fine_elements,
             self.precision,
         )?;
-        let gather_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wgpu_nufft.type1_3d.spread_gather.bind_group"),
-            layout: &self.gather_layout,
-            entries: &[
-                binding_entry(0, points, point_bytes),
-                binding_entry(1, strengths, strength_bytes),
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: bin_offsets.as_entire_binding(),
-                },
-                binding_entry(3, &sorted_indices, index_bytes),
-                binding_entry(4, &self.fine_input, active_fine_bytes),
-            ],
-        });
-        let vector_blocks = active_batch.div_ceil(VECTOR_BLOCK_SIZE);
-        let gather_workgroups = usize::try_from(self.gather_workgroups_per_vector_block)
-            .ok()
-            .and_then(|count| count.checked_mul(vector_blocks))
-            .and_then(|count| u32::try_from(count).ok())
-            .ok_or(NufftError::LengthOverflow {
-                context: "batched type-1 3D gather workgroup count",
-            })?;
-        let gather_dispatch =
-            split_workgroups(gather_workgroups, self.max_workgroups_per_dimension)?;
 
-        #[cfg(feature = "gpu-profiling")]
-        profile.encode_type1_start_marker(encoder);
-        encoder.clear_buffer(bin_counts, 0, None);
-        encoder.clear_buffer(bin_cursors, 0, None);
-        encode_pass(
-            encoder,
-            "wgpu_nufft.type1_3d.bin_count.pass",
-            &self.count_pipeline,
-            &count_bind_group,
-            point_dispatch,
-            #[cfg(feature = "gpu-profiling")]
-            profile.timestamp_writes(None, Some(1)),
-        );
-        self.prefix_scan
-            .encode(device, encoder, bin_counts, bin_offsets)?;
-        encode_pass(
-            encoder,
-            "wgpu_nufft.type1_3d.bin_terminal.pass",
-            &self.terminal_pipeline,
-            &terminal_bind_group,
-            (1, 1, 1),
-            #[cfg(feature = "gpu-profiling")]
-            profile.timestamp_writes(None, Some(2)),
-        );
-        encode_pass(
-            encoder,
-            "wgpu_nufft.type1_3d.bin_scatter.pass",
-            &self.scatter_pipeline,
-            &scatter_bind_group,
-            point_dispatch,
-            #[cfg(feature = "gpu-profiling")]
-            profile.timestamp_writes(None, Some(3)),
-        );
-        encode_pass(
-            encoder,
-            "wgpu_nufft.type1_3d.bin_sort.pass",
-            &self.sort_pipeline,
-            &sort_bind_group,
-            self.sort_dispatch,
-            #[cfg(feature = "gpu-profiling")]
-            profile.timestamp_writes(None, Some(4)),
-        );
-        encode_pass(
-            encoder,
-            "wgpu_nufft.type1_3d.spread_gather.pass",
-            &self.gather_pipeline,
-            &gather_bind_group,
-            gather_dispatch,
-            #[cfg(feature = "gpu-profiling")]
-            profile.timestamp_writes(None, Some(5)),
-        );
+        match &self.spread {
+            Spread3d::Block(block) => {
+                if record_points {
+                    block.encode_bins(
+                        device,
+                        encoder,
+                        point_count,
+                        points,
+                        point_bytes,
+                        #[cfg(feature = "gpu-profiling")]
+                        profile,
+                    )?;
+                }
+                block.encode_spread(
+                    device,
+                    encoder,
+                    active_batch,
+                    point_count,
+                    strengths,
+                    strength_bytes,
+                    &self.fine_input,
+                    active_fine_bytes,
+                    #[cfg(feature = "gpu-profiling")]
+                    profile,
+                )?;
+            }
+            Spread3d::PerCell(per_cell) => per_cell.encode(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                point_bytes,
+                strengths,
+                strength_bytes,
+                &self.fine_input,
+                active_fine_bytes,
+                self.max_workgroups_per_dimension,
+                self.max_storage_binding_bytes,
+                self.max_buffer_bytes,
+                #[cfg(feature = "gpu-profiling")]
+                profile,
+            )?,
+        }
         if active_batch < self.batch_capacity {
             encoder.clear_buffer(
                 &self.fine_input,
@@ -853,6 +726,313 @@ impl Type1GpuPlan3d {
         } else {
             Ok(())
         }
+    }
+}
+
+impl PerCellSpread3d {
+    fn new(
+        device: &wgpu::Device,
+        kernel: EsKernel,
+        fine_shape: [usize; DIMENSIONS],
+        fine_count: usize,
+        precision: FftPrecision,
+        gather: Type1Gather3d,
+    ) -> Result<Self> {
+        let limits = device.limits();
+        let maximum_workgroup_size = max_supported_workgroup_size(&limits);
+        let count_bytes = checked_buffer_size("type-1 3D bin counts", fine_count, U32_BYTES)?;
+        let offset_count = fine_count
+            .checked_add(1)
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-1 3D bin offset count",
+            })?;
+        u32::try_from(offset_count).map_err(|_| NufftError::LengthOverflow {
+            context: "type-1 3D bin-offset shader index space",
+        })?;
+        let offset_bytes = checked_buffer_size("type-1 3D bin offsets", offset_count, U32_BYTES)?;
+        for (label, bytes) in [
+            ("type-1 3D bin counts", count_bytes),
+            ("type-1 3D bin offsets", offset_bytes),
+        ] {
+            validate_binding_limit(label, bytes, limits.max_storage_buffer_binding_size)?;
+            validate_buffer_limit(label, bytes, limits.max_buffer_size)?;
+        }
+        let scratch =
+            Type1ScratchBuffers::new(device, "wgpu_nufft.type1_3d", count_bytes, offset_bytes);
+        let count_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1_3d.bin_count",
+            &generate_count_wgsl_for_precision(fine_shape, precision),
+        );
+        let count_layout = count_pipeline.get_bind_group_layout(0);
+        let prefix_scan = GpuExclusiveScanU32::new(device, fine_count)?;
+        let terminal_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1_3d.bin_terminal",
+            &generate_terminal_wgsl(),
+        );
+        let terminal_layout = terminal_pipeline.get_bind_group_layout(0);
+        let scatter_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1_3d.bin_scatter",
+            &generate_scatter_wgsl_for_precision(fine_shape, precision),
+        );
+        let scatter_layout = scatter_pipeline.get_bind_group_layout(0);
+        let sort_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1_3d.bin_sort",
+            &generate_sort_wgsl(),
+        );
+        let sort_layout = sort_pipeline.get_bind_group_layout(0);
+        let (gather_label, gather_source, gather_workgroups_per_vector_block) = match precision {
+            FftPrecision::F64 => (
+                "wgpu_nufft.type1_3d.spread_gather_f64",
+                generate_gather_wgsl_f64(kernel, fine_shape),
+                workgroups_for_elements(fine_count)?,
+            ),
+            FftPrecision::Df64 => (
+                "wgpu_nufft.type1_3d.spread_gather_df64",
+                generate_gather_wgsl_df64(kernel, fine_shape),
+                workgroups_for_elements(fine_count)?,
+            ),
+            FftPrecision::F32 => match gather {
+                Type1Gather3d::Global => (
+                    "wgpu_nufft.type1_3d.spread_gather",
+                    generate_gather_wgsl(kernel, fine_shape),
+                    workgroups_for_elements(fine_count)?,
+                ),
+                Type1Gather3d::Tiled8x8x4 | Type1Gather3d::Block => {
+                    let configuration =
+                        tiled_gather_halo_shape(kernel.width()).and_then(|halo_shape| {
+                            let cache_capacity = tiled_gather_cache_capacity(kernel.width())?;
+                            let storage_bytes =
+                                tiled_gather_storage_bytes(kernel.width(), cache_capacity)?;
+                            Ok((halo_shape, cache_capacity, storage_bytes))
+                        });
+                    match configuration {
+                        Ok((halo_shape, cache_capacity, storage_bytes))
+                            if maximum_workgroup_size >= TILED_GATHER_WORKGROUP_SIZE
+                                && fine_shape
+                                    .iter()
+                                    .zip(halo_shape)
+                                    .all(|(&length, halo)| length >= halo)
+                                && storage_bytes <= limits.max_compute_workgroup_storage_size =>
+                        {
+                            (
+                                "wgpu_nufft.type1_3d.spread_gather_tiled8x8x4",
+                                generate_tiled_gather_wgsl(kernel, fine_shape, cache_capacity)?,
+                                tiled_gather_workgroups(fine_shape)?,
+                            )
+                        }
+                        _ => (
+                            "wgpu_nufft.type1_3d.spread_gather",
+                            generate_gather_wgsl(kernel, fine_shape),
+                            workgroups_for_elements(fine_count)?,
+                        ),
+                    }
+                }
+            },
+        };
+        let gather_pipeline = create_compute_pipeline(device, gather_label, &gather_source);
+        let gather_layout = gather_pipeline.get_bind_group_layout(0);
+        let sort_dispatch =
+            dispatch_for_elements(fine_count, limits.max_compute_workgroups_per_dimension)?;
+        Ok(Self {
+            scratch,
+            count_pipeline,
+            count_layout,
+            prefix_scan,
+            terminal_pipeline,
+            terminal_layout,
+            scatter_pipeline,
+            scatter_layout,
+            sort_pipeline,
+            sort_layout,
+            gather_pipeline,
+            gather_layout,
+            sort_dispatch,
+            gather_workgroups_per_vector_block,
+            fine_count,
+        })
+    }
+}
+
+impl PerCellSpread3d {
+    #[allow(clippy::too_many_arguments)]
+    fn encode(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        point_bytes: u64,
+        strengths: &wgpu::Buffer,
+        strength_bytes: u64,
+        fine_input: &wgpu::Buffer,
+        active_fine_bytes: u64,
+        max_workgroups_per_dimension: u32,
+        max_storage_binding_bytes: u64,
+        max_buffer_bytes: u64,
+        #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
+    ) -> Result<()> {
+        let point_count_u32 =
+            u32::try_from(point_count).map_err(|_| NufftError::LengthOverflow {
+                context: "type-1 3D GPU point count",
+            })?;
+        let fine_grid_element_count = self.fine_count;
+        let count_bytes =
+            checked_buffer_size("type-1 3D bin counts", fine_grid_element_count, U32_BYTES)?;
+        let offset_count = self
+            .fine_count
+            .checked_add(1)
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-1 3D bin offset count",
+            })?;
+        let offset_bytes = checked_buffer_size("type-1 3D bin offsets", offset_count, U32_BYTES)?;
+        let index_bytes =
+            checked_buffer_size("type-1 3D sorted point indices", point_count, U32_BYTES)?;
+        for (label, bytes) in [
+            ("type-1 3D bin counts", count_bytes),
+            ("type-1 3D bin cursors", count_bytes),
+            ("type-1 3D bin offsets", offset_bytes),
+            ("type-1 3D sorted point indices", index_bytes),
+        ] {
+            validate_binding_limit(label, bytes, max_storage_binding_bytes)?;
+            validate_buffer_limit(label, bytes, max_buffer_bytes)?;
+        }
+        let point_dispatch = split_workgroups(
+            point_count_u32.div_ceil(WORKGROUP_SIZE),
+            max_workgroups_per_dimension,
+        )?;
+
+        let bin_counts = &self.scratch.bin_counts;
+        let bin_cursors = &self.scratch.bin_cursors;
+        let bin_offsets = &self.scratch.bin_offsets;
+        let sorted_indices = self.scratch.sorted_indices(index_bytes);
+
+        let count_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1_3d.bin_count.bind_group"),
+            layout: &self.count_layout,
+            entries: &[
+                binding_entry(0, points, point_bytes),
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bin_counts.as_entire_binding(),
+                },
+            ],
+        });
+        let terminal_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1_3d.bin_terminal.bind_group"),
+            layout: &self.terminal_layout,
+            entries: &[
+                binding_entry(0, bin_counts, count_bytes),
+                binding_entry(1, bin_offsets, offset_bytes),
+            ],
+        });
+        let scatter_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1_3d.bin_scatter.bind_group"),
+            layout: &self.scatter_layout,
+            entries: &[
+                binding_entry(0, points, point_bytes),
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bin_offsets.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bin_cursors.as_entire_binding(),
+                },
+                binding_entry(3, &sorted_indices, index_bytes),
+            ],
+        });
+        let sort_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1_3d.bin_sort.bind_group"),
+            layout: &self.sort_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: bin_offsets.as_entire_binding(),
+                },
+                binding_entry(1, &sorted_indices, index_bytes),
+            ],
+        });
+        let gather_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1_3d.spread_gather.bind_group"),
+            layout: &self.gather_layout,
+            entries: &[
+                binding_entry(0, points, point_bytes),
+                binding_entry(1, strengths, strength_bytes),
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bin_offsets.as_entire_binding(),
+                },
+                binding_entry(3, &sorted_indices, index_bytes),
+                binding_entry(4, fine_input, active_fine_bytes),
+            ],
+        });
+        let vector_blocks = active_batch.div_ceil(VECTOR_BLOCK_SIZE);
+        let gather_workgroups = usize::try_from(self.gather_workgroups_per_vector_block)
+            .ok()
+            .and_then(|count| count.checked_mul(vector_blocks))
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or(NufftError::LengthOverflow {
+                context: "batched type-1 3D gather workgroup count",
+            })?;
+        let gather_dispatch = split_workgroups(gather_workgroups, max_workgroups_per_dimension)?;
+
+        #[cfg(feature = "gpu-profiling")]
+        profile.encode_start_marker(encoder);
+        encoder.clear_buffer(bin_counts, 0, None);
+        encoder.clear_buffer(bin_cursors, 0, None);
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1_3d.bin_count.pass",
+            &self.count_pipeline,
+            &count_bind_group,
+            point_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(1)),
+        );
+        self.prefix_scan
+            .encode(device, encoder, bin_counts, bin_offsets)?;
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1_3d.bin_terminal.pass",
+            &self.terminal_pipeline,
+            &terminal_bind_group,
+            (1, 1, 1),
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(2)),
+        );
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1_3d.bin_scatter.pass",
+            &self.scatter_pipeline,
+            &scatter_bind_group,
+            point_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(3)),
+        );
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1_3d.bin_sort.pass",
+            &self.sort_pipeline,
+            &sort_bind_group,
+            self.sort_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(4)),
+        );
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1_3d.spread_gather.pass",
+            &self.gather_pipeline,
+            &gather_bind_group,
+            gather_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(5)),
+        );
+        Ok(())
     }
 }
 
@@ -1014,7 +1194,7 @@ fn coefficient_axis_label(axis: usize) -> &'static str {
     }
 }
 
-fn create_compute_pipeline(
+pub(crate) fn create_compute_pipeline(
     device: &wgpu::Device,
     label: &str,
     source: &str,
@@ -1041,7 +1221,7 @@ fn create_compute_pipeline(
     })
 }
 
-fn encode_pass(
+pub(crate) fn encode_pass(
     encoder: &mut wgpu::CommandEncoder,
     label: &str,
     pipeline: &wgpu::ComputePipeline,
@@ -1069,7 +1249,7 @@ fn encode_pass(
     pass.dispatch_workgroups(dispatch.0, dispatch.1, dispatch.2);
 }
 
-fn generate_position_wgsl(fine_shape: [usize; DIMENSIONS]) -> String {
+pub(crate) fn generate_position_wgsl(fine_shape: [usize; DIMENSIONS]) -> String {
     let scales = [
         fine_shape[0] as f64 / std::f64::consts::TAU,
         fine_shape[1] as f64 / std::f64::consts::TAU,
@@ -1491,7 +1671,7 @@ fn main(
     format!("{position}\n{entry}")
 }
 
-fn generate_sort_wgsl() -> String {
+pub(crate) fn generate_sort_wgsl() -> String {
     format!(
         r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
 
@@ -2677,7 +2857,7 @@ fn workgroups_for_elements(element_count: usize) -> Result<u32> {
     Ok(elements.div_ceil(WORKGROUP_SIZE))
 }
 
-fn format_wgsl_f32(value: f32) -> String {
+pub(crate) fn format_wgsl_f32(value: f32) -> String {
     debug_assert!(value.is_finite());
     let mut formatted = value.to_string();
     if !formatted.contains('.') && !formatted.contains('e') && !formatted.contains('E') {
@@ -2709,7 +2889,7 @@ fn dispatch_for_elements(
     )
 }
 
-fn checked_buffer_size(
+pub(crate) fn checked_buffer_size(
     context: &'static str,
     elements: usize,
     bytes_per_element: u64,
@@ -2730,7 +2910,7 @@ fn validate_point_coordinate_shader_index(point_count: usize) -> Result<()> {
     Ok(())
 }
 
-fn validate_binding_limit(buffer: &'static str, bytes: u64, limit: u64) -> Result<()> {
+pub(crate) fn validate_binding_limit(buffer: &'static str, bytes: u64, limit: u64) -> Result<()> {
     if bytes > limit {
         Err(NufftError::GpuBufferBindingTooLarge {
             buffer,
@@ -2742,7 +2922,7 @@ fn validate_binding_limit(buffer: &'static str, bytes: u64, limit: u64) -> Resul
     }
 }
 
-fn validate_buffer_limit(buffer: &'static str, bytes: u64, limit: u64) -> Result<()> {
+pub(crate) fn validate_buffer_limit(buffer: &'static str, bytes: u64, limit: u64) -> Result<()> {
     if bytes > limit {
         Err(NufftError::GpuBufferTooSmall {
             buffer,
@@ -2776,7 +2956,11 @@ fn validate_external_storage_buffer(
     validate_binding_limit(label, required_bytes, max_storage_binding_bytes)
 }
 
-fn binding_entry(binding: u32, buffer: &wgpu::Buffer, size: u64) -> wgpu::BindGroupEntry<'_> {
+pub(crate) fn binding_entry(
+    binding: u32,
+    buffer: &wgpu::Buffer,
+    size: u64,
+) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {

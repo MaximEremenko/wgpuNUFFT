@@ -40,6 +40,12 @@ async fn run_gpu_2d_cases() {
     validate_type1_scratch_grow_then_shrink(&context.device, &context.queue);
     validate_adjoint_consistency(&context.device, &context.queue);
     validate_non_square_case(&context.device, &context.queue);
+    validate_block_type1_oracle_matrix(&context.device, &context.queue);
+    validate_block_type1_dense_and_large_point_sets(&context.device, &context.queue);
+    validate_block_type1_determinism_and_set_points(&context.device, &context.queue);
+    validate_block_type1_active_batch(&context.device, &context.queue);
+    validate_block_type1_zero_points(&context.device, &context.queue);
+    validate_binned_type2_large_set_matches_prefix(&context.device, &context.queue);
     #[cfg(feature = "type1-2d-tile-prototype")]
     {
         validate_tiled_equivalence_and_oracle(&context.device, &context.queue);
@@ -689,6 +695,326 @@ fn adversarial_point_classes() -> Vec<PointClass> {
     ]
 }
 
+/// Past 32 MiB of prepared data the binned type-2 path prepares points in a
+/// separate indexed pass; each output still depends only on its own point, so
+/// a large set must reproduce the outputs of its small, fused-path prefix.
+fn validate_binned_type2_large_set_matches_prefix(device: &wgpu::Device, queue: &wgpu::Queue) {
+    const LARGE_POINTS: usize = 1_100_000;
+    const PREFIX_POINTS: usize = 997;
+    let config = NufftConfig::new([64, 48], 1.0e-6).with_sign(NufftSign::Negative);
+    let plan = NufftPlan::type2_gpu(device, queue, config.clone()).unwrap();
+    let coefficients = test_values(
+        config.mode_count().unwrap(),
+        NufftSign::Negative,
+        ModeOrder::Centered,
+    );
+    let points = seeded_random_points(LARGE_POINTS, 0x1a26_e5e7);
+    let large = execute_type2(device, queue, &plan, &points, &coefficients);
+    let prefix = execute_type2(
+        device,
+        queue,
+        &plan,
+        &points[..DIMENSIONS * PREFIX_POINTS],
+        &coefficients,
+    );
+    assert_f32_bits_equal(
+        &large[..2 * PREFIX_POINTS],
+        &prefix,
+        "binned type2 indexed preparation versus fused prefix",
+    );
+}
+
+/// Mode shapes whose fine grids (at least 64 cells per axis) take the 2D
+/// block spreader; the second is odd on both axes.
+const BLOCK_SPREAD_SHAPES: [[usize; DIMENSIONS]; 2] = [[32, 40], [33, 37]];
+
+fn validate_block_type1_oracle_matrix(device: &wgpu::Device, queue: &wgpu::Queue) {
+    for mode_shape in BLOCK_SPREAD_SHAPES {
+        for eps in [1.0e-3, 1.0e-6] {
+            let tolerance = FLOAT_TOLERANCE_FACTOR * eps;
+            for sign in [NufftSign::Positive, NufftSign::Negative] {
+                for order in [ModeOrder::Centered, ModeOrder::Fft] {
+                    let config = NufftConfig::new(mode_shape, eps)
+                        .with_sign(sign)
+                        .with_mode_order(order);
+                    let plan = NufftPlan::type1_gpu(device, queue, config.clone()).unwrap();
+                    for class in adversarial_point_classes() {
+                        let point_count = class.points.len() / DIMENSIONS;
+                        let strengths = test_values(point_count, sign, order);
+                        let actual = interleaved_to_complex64(&execute_type1(
+                            device,
+                            queue,
+                            &plan,
+                            &class.points,
+                            &strengths,
+                        ));
+                        let reference = reference_type1_f64(
+                            &config,
+                            &points_f64(&class.points),
+                            &interleaved_to_complex64(&strengths),
+                        )
+                        .unwrap();
+                        let error = relative_l2(&actual, &reference);
+                        eprintln!(
+                            "NUFFT_2D_BLOCK_ACCURACY shape={mode_shape:?} eps={eps:.0e} sign={sign:?} order={order:?} class={} relative_l2={error:.9e}",
+                            class.label
+                        );
+                        assert!(
+                            error <= tolerance,
+                            "2D block type1 shape={mode_shape:?} eps={eps} class={}: {error}",
+                            class.label
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn validate_block_type1_dense_and_large_point_sets(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let dense_cluster = (0..5_000)
+        .flat_map(|index| {
+            let offset = index as f32 * 1.0e-6;
+            [0.3 + offset, -1.1 - 0.5 * offset]
+        })
+        .collect::<Vec<_>>();
+    let wrapping_cluster = (0..1_500)
+        .flat_map(|index| {
+            let offset = index as f32 * 2.0e-5;
+            [PI as f32 - offset, 2.999 * PI as f32 - 4.0 * offset]
+        })
+        .collect::<Vec<_>>();
+    let large_random = seeded_random_points(20_000, 0x0b10_c2d5);
+    for mode_shape in BLOCK_SPREAD_SHAPES {
+        for sign in [NufftSign::Positive, NufftSign::Negative] {
+            let config = NufftConfig::new(mode_shape, 1.0e-6).with_sign(sign);
+            let plan = NufftPlan::type1_gpu(device, queue, config.clone()).unwrap();
+            for (label, points) in [
+                ("dense-single-bin", dense_cluster.as_slice()),
+                ("wrapping-cluster", wrapping_cluster.as_slice()),
+                ("random-20000", large_random.as_slice()),
+            ] {
+                let point_count = points.len() / DIMENSIONS;
+                let strengths = test_values(point_count, sign, ModeOrder::Centered);
+                let actual = interleaved_to_complex64(&execute_type1(
+                    device, queue, &plan, points, &strengths,
+                ));
+                let reference = reference_type1_f64(
+                    &config,
+                    &points_f64(points),
+                    &interleaved_to_complex64(&strengths),
+                )
+                .unwrap();
+                let error = relative_l2(&actual, &reference);
+                eprintln!(
+                    "NUFFT_2D_BLOCK_ACCURACY shape={mode_shape:?} eps=1e-6 sign={sign:?} class={label} M={point_count} relative_l2={error:.9e}"
+                );
+                assert!(
+                    error <= FLOAT_TOLERANCE_FACTOR * 1.0e-6,
+                    "2D block type1 shape={mode_shape:?} sign={sign:?} class={label}: {error}"
+                );
+            }
+        }
+    }
+}
+
+fn validate_block_type1_determinism_and_set_points(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let config = NufftConfig::new([33, 37], 1.0e-6).with_mode_order(ModeOrder::Fft);
+    let plan = NufftPlan::type1_gpu(device, queue, config).unwrap();
+    let first_points = seeded_random_points(3_001, 0x5e7_2017);
+    let second_points = seeded_random_points(1_777, 0x5e7_2018);
+    let first_strengths = test_values(3_001, NufftSign::Positive, ModeOrder::Fft);
+    let other_strengths = test_values(3_001, NufftSign::Negative, ModeOrder::Centered);
+    let second_strengths = test_values(1_777, NufftSign::Positive, ModeOrder::Fft);
+
+    let encoded = execute_type1(device, queue, &plan, &first_points, &first_strengths);
+    let repeated = execute_type1(device, queue, &plan, &first_points, &first_strengths);
+    assert_f32_bits_equal(&repeated, &encoded, "2D block type1 repeated encode");
+    let encoded_other = execute_type1(device, queue, &plan, &first_points, &other_strengths);
+    let encoded_second = execute_type1(device, queue, &plan, &second_points, &second_strengths);
+
+    let executed = execute_type1_with_set_points(
+        device,
+        queue,
+        &plan,
+        &first_points,
+        &[first_strengths.as_slice(), other_strengths.as_slice()],
+    );
+    assert_f32_bits_equal(
+        &executed[0],
+        &encoded,
+        "2D block type1 set_points + execute",
+    );
+    assert_f32_bits_equal(&executed[1], &encoded_other, "2D block type1 reused points");
+    let executed_second = execute_type1_with_set_points(
+        device,
+        queue,
+        &plan,
+        &second_points,
+        &[second_strengths.as_slice()],
+    );
+    assert_f32_bits_equal(
+        &executed_second[0],
+        &encoded_second,
+        "2D block type1 execute after replacing points",
+    );
+}
+
+fn validate_block_type1_active_batch(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let config = NufftConfig::new([32, 40], 1.0e-6)
+        .with_sign(NufftSign::Negative)
+        .with_batch(3);
+    let plan = NufftPlan::type1_gpu(device, queue, config.clone()).unwrap();
+    let point_count = 701;
+    let points = seeded_random_points(point_count, 0xba7c_2001);
+    let vectors = [
+        test_values(point_count, NufftSign::Negative, ModeOrder::Centered),
+        test_values(point_count, NufftSign::Positive, ModeOrder::Fft),
+    ];
+    let strengths = vectors.concat();
+    let point_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("wgpu_nufft.test2d.block.batch.points"),
+        contents: bytemuck::cast_slice(&points),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let strength_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("wgpu_nufft.test2d.block.batch.strengths"),
+        contents: bytemuck::cast_slice(&strengths),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let output_bytes = plan
+        .required_type1_output_buffer_size_bytes_for_batch(2)
+        .unwrap();
+    let output = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_nufft.test2d.block.batch.output"),
+        size: output_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let readback = readback_buffer(
+        device,
+        output_bytes,
+        "wgpu_nufft.test2d.block.batch.readback",
+    );
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_nufft.test2d.block.batch.encoder"),
+    });
+    plan.encode_type1_gpu_batch(
+        device,
+        &mut encoder,
+        point_count,
+        2,
+        &point_buffer,
+        &strength_buffer,
+        &output,
+    )
+    .unwrap();
+    encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output_bytes);
+    queue.submit([encoder.finish()]);
+    let actual = read_f32_buffer(device, &readback);
+    let modes = config.mode_count().unwrap();
+    let single_vector = config.clone().with_batch(1);
+    for (vector, values) in vectors.iter().enumerate() {
+        let reference = reference_type1_f64(
+            &single_vector,
+            &points_f64(&points),
+            &interleaved_to_complex64(values),
+        )
+        .unwrap();
+        let actual_vector =
+            interleaved_to_complex64(&actual[2 * modes * vector..2 * modes * (vector + 1)]);
+        let error = relative_l2(&actual_vector, &reference);
+        eprintln!("NUFFT_2D_BLOCK_BATCH vector={vector} relative_l2={error:.9e}");
+        assert!(error <= FLOAT_TOLERANCE_FACTOR * 1.0e-6);
+    }
+}
+
+fn validate_block_type1_zero_points(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let config = NufftConfig::new([32, 40], 1.0e-6);
+    let plan = NufftPlan::type1_gpu(device, queue, config.clone()).unwrap();
+    // Populate the plan-owned fine grid first so a stale grid would show.
+    let points = seeded_random_points(97, 0x2e20_2001);
+    let strengths = test_values(97, NufftSign::Positive, ModeOrder::Centered);
+    let _ = execute_type1(device, queue, &plan, &points, &strengths);
+    let dummy = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("wgpu_nufft.test2d.block.zero.dummy"),
+        contents: bytemuck::cast_slice(&[0.0f32; 2]),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let output_bytes = plan.required_type1_output_buffer_size_bytes().unwrap();
+    let output = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("wgpu_nufft.test2d.block.zero.output"),
+        contents: bytemuck::cast_slice(&vec![1.0f32; 2 * config.mode_count().unwrap()]),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    });
+    let readback = readback_buffer(
+        device,
+        output_bytes,
+        "wgpu_nufft.test2d.block.zero.readback",
+    );
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_nufft.test2d.block.zero.encoder"),
+    });
+    plan.encode_type1_gpu(device, &mut encoder, 0, &dummy, &dummy, &output)
+        .unwrap();
+    encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output_bytes);
+    queue.submit([encoder.finish()]);
+    let actual = read_f32_buffer(device, &readback);
+    assert!(
+        actual.iter().all(|&value| value == 0.0),
+        "zero-point 2D block type1 execution must overwrite every output word with zero"
+    );
+}
+
+fn execute_type1_with_set_points(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    plan: &NufftPlan,
+    points: &[f32],
+    strength_vectors: &[&[f32]],
+) -> Vec<Vec<f32>> {
+    let point_count = points.len() / DIMENSIONS;
+    let output_bytes = plan.required_type1_output_buffer_size_bytes().unwrap();
+    let point_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("wgpu_nufft.test2d.set_points.points"),
+        contents: bytemuck::cast_slice(points),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_nufft.test2d.set_points.encoder"),
+    });
+    plan.set_points_gpu(device, &mut encoder, point_count, &point_buffer)
+        .unwrap();
+    let mut readbacks = Vec::new();
+    for strengths in strength_vectors {
+        let strength_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("wgpu_nufft.test2d.set_points.strengths"),
+            contents: bytemuck::cast_slice(strengths),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu_nufft.test2d.set_points.output"),
+            size: output_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = readback_buffer(
+            device,
+            output_bytes,
+            "wgpu_nufft.test2d.set_points.readback",
+        );
+        plan.execute_type1_gpu(device, &mut encoder, &strength_buffer, &output)
+            .unwrap();
+        encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output_bytes);
+        readbacks.push(readback);
+    }
+    queue.submit([encoder.finish()]);
+    readbacks
+        .iter()
+        .map(|readback| read_f32_buffer(device, readback))
+        .collect()
+}
+
 fn seeded_random_points(point_count: usize, mut state: u32) -> Vec<f32> {
     let maximum = f32::from_bits(((3.0 * PI) as f32).to_bits() - 1);
     (0..point_count * DIMENSIONS)
@@ -909,7 +1235,6 @@ fn assert_complex_bits_equal(values: &[f32], first: usize, second: usize, contex
     assert_eq!(first[1].to_bits(), second[1].to_bits(), "{context} imag");
 }
 
-#[cfg(feature = "type1-2d-tile-prototype")]
 fn assert_f32_bits_equal(actual: &[f32], expected: &[f32], context: &str) {
     assert_eq!(actual.len(), expected.len(), "{context} length");
     for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {

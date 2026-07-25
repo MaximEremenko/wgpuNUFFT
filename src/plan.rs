@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use crate::config::NufftConfig;
 use crate::direct::{reference_type1_f64, reference_type2_f64};
 use crate::error::{NufftError, Result};
@@ -21,6 +23,8 @@ pub enum NufftKind {
     Type2,
 }
 
+// One boxed execution per plan; every variant embeds an FFT plan.
+#[allow(clippy::large_enum_variant)]
 enum Type1GpuExecution {
     OneD(Type1GpuPlan),
     TwoD(Type1GpuPlan2d),
@@ -69,6 +73,72 @@ impl Type1GpuExecution {
                 output,
             ),
             Self::Nd(plan) => plan.encode_batch(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                strengths,
+                output,
+            ),
+        }
+    }
+
+    fn set_points(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+    ) -> Result<()> {
+        match self {
+            Self::OneD(plan) => plan.set_points(device, encoder, point_count, points),
+            Self::TwoD(plan) => plan.set_points(device, encoder, point_count, points),
+            Self::ThreeD(plan) => plan.set_points(device, encoder, point_count, points),
+            Self::Nd(_) => Ok(()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_batch_with_recorded_points(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        match self {
+            Self::OneD(plan) => plan.encode_batch_with_recorded_points(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                strengths,
+                output,
+            ),
+            Self::TwoD(plan) => plan.encode_batch_with_recorded_points(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                strengths,
+                output,
+            ),
+            Self::ThreeD(plan) => plan.encode_batch_with_recorded_points(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                strengths,
+                output,
+            ),
+            Self::Nd(_) => self.encode_batch(
                 device,
                 encoder,
                 active_batch,
@@ -207,6 +277,86 @@ impl Type2GpuExecution {
         }
     }
 
+    fn set_points(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+    ) -> Result<()> {
+        match self {
+            Self::OneD(plan) => plan.set_points(device, encoder, point_count, points),
+            Self::TwoD(plan) => plan.set_points(device, encoder, point_count, points),
+            Self::ThreeD(plan) => plan.set_points(device, encoder, point_count, points),
+            Self::Nd(_) => Ok(()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_batch_with_recorded_points(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        coefficients: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        match self {
+            Self::OneD(plan) => plan.encode_batch_with_recorded_points(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                coefficients,
+                output,
+            ),
+            Self::TwoD(plan) => plan.encode_batch_with_recorded_points(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                coefficients,
+                output,
+            ),
+            Self::ThreeD(plan) => plan.encode_batch_with_recorded_points(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                coefficients,
+                output,
+            ),
+            Self::Nd(_) => self.encode_batch(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                coefficients,
+                output,
+            ),
+        }
+    }
+
+    #[cfg(feature = "gpu-profiling")]
+    fn profile_layout(&self, first_query: u32) -> Result<NufftGpuProfileLayout> {
+        match self {
+            Self::OneD(plan) => plan.profile_layout(first_query),
+            Self::TwoD(plan) => plan.profile_layout(first_query),
+            Self::ThreeD(plan) => plan.profile_layout(first_query),
+            Self::Nd(_) => {
+                NufftGpuProfileLayout::type2(first_query).map_err(|_| NufftError::LengthOverflow {
+                    context: "type-2 stage-profile query range",
+                })
+            }
+        }
+    }
+
     #[cfg(feature = "gpu-profiling")]
     #[allow(clippy::too_many_arguments)]
     fn encode_profiled(
@@ -287,6 +437,14 @@ pub struct NufftPlan {
     centered_kernel_fourier_coefficients: Vec<Vec<f64>>,
     gpu_type1: Option<Box<Type1GpuExecution>>,
     gpu_type2: Option<Box<Type2GpuExecution>>,
+    recorded_points: Mutex<Option<RecordedPoints>>,
+}
+
+/// Points remembered by [`NufftPlan::set_points_gpu`] for later executions.
+#[derive(Clone)]
+struct RecordedPoints {
+    buffer: wgpu::Buffer,
+    count: usize,
 }
 
 impl std::fmt::Debug for NufftPlan {
@@ -331,8 +489,8 @@ impl NufftPlan {
             device,
             queue,
             config,
-            Type1Gather2d::Tiled16,
-            Type1Gather3d::Tiled8x8x4,
+            Type1Gather2d::Block,
+            Type1Gather3d::Block,
         )
     }
 
@@ -582,6 +740,7 @@ impl NufftPlan {
             centered_kernel_fourier_coefficients,
             gpu_type1: None,
             gpu_type2: None,
+            recorded_points: Mutex::new(None),
         })
     }
 
@@ -763,6 +922,110 @@ impl NufftPlan {
             points,
             strengths,
             output,
+        )?;
+        self.remember_points(point_count, points);
+        Ok(())
+    }
+
+    /// Prepares a point set for repeated executions with
+    /// [`Self::execute_type1_gpu`] or [`Self::execute_type2_gpu`].
+    ///
+    /// Records any point-dependent GPU work into `encoder` (for example, the
+    /// 3D single-precision plans sort the points into coarse bins once here
+    /// instead of on every execution) and remembers `points` and `point_count` for
+    /// later `execute_*` calls. `points` uses the same layout and contract as
+    /// in [`Self::encode_type1_gpu`] or [`Self::encode_type2_gpu`].
+    ///
+    /// The contents of `points` must not change while executions use them;
+    /// call this method again after writing new coordinates. Executions must
+    /// be submitted after the commands recorded here (recording both into one
+    /// encoder, or submitting this encoder first, satisfies that). The plan
+    /// keeps a reference to `points` until the next call. The `encode_*`
+    /// methods behave like this call followed by the matching `execute_*`
+    /// call and also replace the remembered points.
+    pub fn set_points_gpu(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+    ) -> Result<()> {
+        match self.kind {
+            NufftKind::Type1 => {
+                let gpu = self
+                    .gpu_type1
+                    .as_deref()
+                    .ok_or(NufftError::GpuExecutionUnavailable {
+                        kind: "type-1",
+                        reason: "construct the plan with NufftPlan::type1_gpu",
+                    })?;
+                self.validate_point_buffer("type-1 point", point_count, points)?;
+                gpu.set_points(device, encoder, point_count, points)?;
+            }
+            NufftKind::Type2 => {
+                let gpu = self
+                    .gpu_type2
+                    .as_deref()
+                    .ok_or(NufftError::GpuExecutionUnavailable {
+                        kind: "type-2",
+                        reason: "construct the plan with NufftPlan::type2_gpu",
+                    })?;
+                self.validate_point_buffer("type-2 point", point_count, points)?;
+                gpu.set_points(device, encoder, point_count, points)?;
+            }
+        }
+        self.remember_points(point_count, points);
+        Ok(())
+    }
+
+    /// Records the configured number of type-1 transforms of the points last
+    /// passed to [`Self::set_points_gpu`] (or to an `encode_type1_*` call).
+    ///
+    /// `strengths` and `output` follow [`Self::encode_type1_gpu`].
+    pub fn execute_type1_gpu(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        strengths: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        self.execute_type1_gpu_batch(device, encoder, self.config.batch(), strengths, output)
+    }
+
+    /// Records `active_batch` type-1 transforms of the remembered points.
+    ///
+    /// See [`Self::execute_type1_gpu`] and [`Self::encode_type1_gpu_batch`].
+    pub fn execute_type1_gpu_batch(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        strengths: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        if self.kind != NufftKind::Type1 {
+            return Err(NufftError::GpuExecutionUnavailable {
+                kind: "type-1",
+                reason: "the plan was built for type-2 execution",
+            });
+        }
+        self.validate_active_batch(active_batch)?;
+        let gpu = self
+            .gpu_type1
+            .as_deref()
+            .ok_or(NufftError::GpuExecutionUnavailable {
+                kind: "type-1",
+                reason: "construct the plan with NufftPlan::type1_gpu",
+            })?;
+        let points = self.recorded_points("type-1")?;
+        gpu.encode_batch_with_recorded_points(
+            device,
+            encoder,
+            active_batch,
+            points.count,
+            &points.buffer,
+            strengths,
+            output,
         )
     }
 
@@ -802,7 +1065,7 @@ impl NufftPlan {
                 kind: "type-1",
                 reason: "construct the plan with NufftPlan::type1_gpu",
             })?;
-        gpu.encode_profiled(
+        let layout = gpu.encode_profiled(
             device,
             encoder,
             point_count,
@@ -811,7 +1074,9 @@ impl NufftPlan {
             output,
             query_set,
             first_query,
-        )
+        )?;
+        self.remember_points(point_count, points);
+        Ok(layout)
     }
 
     /// Required bytes for `point_count` scalar `f32` coordinates in the
@@ -939,6 +1204,59 @@ impl NufftPlan {
             points,
             coefficients,
             output,
+        )?;
+        self.remember_points(point_count, points);
+        Ok(())
+    }
+
+    /// Records the configured number of type-2 transforms at the points last
+    /// passed to [`Self::set_points_gpu`] (or to an `encode_type2_*` call).
+    ///
+    /// `coefficients` and `output` follow [`Self::encode_type2_gpu`].
+    pub fn execute_type2_gpu(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        coefficients: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        self.execute_type2_gpu_batch(device, encoder, self.config.batch(), coefficients, output)
+    }
+
+    /// Records `active_batch` type-2 transforms at the remembered points.
+    ///
+    /// See [`Self::execute_type2_gpu`] and [`Self::encode_type2_gpu_batch`].
+    pub fn execute_type2_gpu_batch(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        coefficients: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        if self.kind != NufftKind::Type2 {
+            return Err(NufftError::GpuExecutionUnavailable {
+                kind: "type-2",
+                reason: "the plan was built for type-1 execution",
+            });
+        }
+        self.validate_active_batch(active_batch)?;
+        let gpu = self
+            .gpu_type2
+            .as_deref()
+            .ok_or(NufftError::GpuExecutionUnavailable {
+                kind: "type-2",
+                reason: "construct the plan with NufftPlan::type2_gpu",
+            })?;
+        let points = self.recorded_points("type-2")?;
+        gpu.encode_batch_with_recorded_points(
+            device,
+            encoder,
+            active_batch,
+            points.count,
+            &points.buffer,
+            coefficients,
+            output,
         )
     }
 
@@ -972,7 +1290,7 @@ impl NufftPlan {
                 kind: "type-2",
                 reason: "construct the plan with NufftPlan::type2_gpu",
             })?;
-        gpu.encode_profiled(
+        let layout = gpu.encode_profiled(
             device,
             encoder,
             point_count,
@@ -981,7 +1299,9 @@ impl NufftPlan {
             output,
             query_set,
             first_query,
-        )
+        )?;
+        self.remember_points(point_count, points);
+        Ok(layout)
     }
 
     /// Number of timestamp-query slots used by one profiled execution.
@@ -991,9 +1311,14 @@ impl NufftPlan {
             NufftKind::Type1 => NufftGpuProfileLayout::type1(0)
                 .expect("the fixed type-1 profile layout must be valid")
                 .query_count(),
-            NufftKind::Type2 => NufftGpuProfileLayout::type2(0)
-                .expect("the fixed type-2 profile layout must be valid")
-                .query_count(),
+            NufftKind::Type2 => match self.gpu_type2.as_deref() {
+                Some(gpu) => gpu.profile_layout(0),
+                None => NufftGpuProfileLayout::type2(0).map_err(|_| NufftError::LengthOverflow {
+                    context: "type-2 stage-profile query range",
+                }),
+            }
+            .expect("the type-2 profile layout starting at query zero must be valid")
+            .query_count(),
         }
     }
 
@@ -1022,6 +1347,53 @@ impl NufftPlan {
                 reason: "request the device with wgpu::Features::TIMESTAMP_QUERY",
             })
         }
+    }
+
+    fn remember_points(&self, point_count: usize, points: &wgpu::Buffer) {
+        *self
+            .recorded_points
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RecordedPoints {
+            buffer: points.clone(),
+            count: point_count,
+        });
+    }
+
+    fn recorded_points(&self, kind: &'static str) -> Result<RecordedPoints> {
+        self.recorded_points
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or(NufftError::GpuExecutionUnavailable {
+                kind,
+                reason: "call set_points_gpu (or an encode method) before executing",
+            })
+    }
+
+    fn validate_point_buffer(
+        &self,
+        label: &'static str,
+        point_count: usize,
+        points: &wgpu::Buffer,
+    ) -> Result<()> {
+        if point_count == 0 {
+            return Ok(());
+        }
+        let required_bytes = self.required_point_buffer_size_bytes(point_count)?;
+        if !points.usage().contains(wgpu::BufferUsages::STORAGE) {
+            return Err(NufftError::GpuBufferMissingUsage {
+                buffer: label,
+                required_usage: "STORAGE",
+            });
+        }
+        if points.size() < required_bytes {
+            return Err(NufftError::GpuBufferTooSmall {
+                buffer: label,
+                required_bytes,
+                actual_bytes: points.size(),
+            });
+        }
+        Ok(())
     }
 
     fn validate_active_batch(&self, active_batch: usize) -> Result<()> {

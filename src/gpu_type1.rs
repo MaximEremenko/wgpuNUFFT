@@ -24,30 +24,24 @@ const F32_BYTES: u64 = 4;
 const F64_BYTES: u64 = 8;
 const U32_BYTES: u64 = 4;
 
+mod segment;
+
+use segment::{SegmentGather1d, SegmentLayout1d};
+
 /// Device-specific resources for deterministic, atomics-free complex spreading.
 ///
-/// Integer atomics are used only to construct bins. Each bin is then sorted by
-/// original point index, and one invocation owns each fine-grid output cell.
+/// Integer atomics are used only to construct bins. F32 plans on large enough
+/// grids use the segment gather (see [`segment`]); the others build one bin per
+/// fine-grid cell, sort each bin by original point index, and let one
+/// invocation own each fine-grid output cell.
 pub(crate) struct Type1GpuPlan {
     fft: FftPlan,
     amplitudes: wgpu::Buffer,
     fine_input: wgpu::Buffer,
     fine_output: wgpu::Buffer,
-    scratch: Type1ScratchBuffers,
-    count_pipeline: wgpu::ComputePipeline,
-    count_layout: wgpu::BindGroupLayout,
-    prefix_scan: GpuExclusiveScanU32,
-    terminal_pipeline: wgpu::ComputePipeline,
-    terminal_layout: wgpu::BindGroupLayout,
-    scatter_pipeline: wgpu::ComputePipeline,
-    scatter_layout: wgpu::BindGroupLayout,
-    sort_pipeline: wgpu::ComputePipeline,
-    sort_layout: wgpu::BindGroupLayout,
-    gather_pipeline: wgpu::ComputePipeline,
-    gather_layout: wgpu::BindGroupLayout,
+    spread: Spread1d,
     deconvolution_pipeline: wgpu::ComputePipeline,
     deconvolution_layout: wgpu::BindGroupLayout,
-    sort_dispatch: (u32, u32, u32),
     max_workgroups_per_dimension: u32,
     mode_count: usize,
     fine_length: usize,
@@ -120,18 +114,9 @@ impl Type1GpuPlan {
             mode_count,
             scalar_size_bytes(precision),
         )?;
-        let count_bytes = checked_buffer_size("type-1 bin counts", fine_length, U32_BYTES)?;
-        let offset_count = fine_length
-            .checked_add(1)
-            .ok_or(NufftError::LengthOverflow {
-                context: "type-1 bin offset count",
-            })?;
-        let offset_bytes = checked_buffer_size("type-1 bin offsets", offset_count, U32_BYTES)?;
         for (label, bytes) in [
             ("type-1 fine grid", fine_bytes),
             ("type-1 deconvolution amplitudes", amplitude_bytes),
-            ("type-1 bin counts", count_bytes),
-            ("type-1 bin offsets", offset_bytes),
         ] {
             validate_binding_limit(label, bytes, limits.max_storage_buffer_binding_size)?;
             validate_buffer_limit(label, bytes, limits.max_buffer_size)?;
@@ -158,8 +143,6 @@ impl Type1GpuPlan {
             usage: fine_usage,
             mapped_at_creation: false,
         });
-        let scratch =
-            Type1ScratchBuffers::new(device, "wgpu_nufft.type1", count_bytes, offset_bytes);
 
         let fft_direction = match config.sign() {
             NufftSign::Positive => FftDirection::Inverse,
@@ -179,64 +162,37 @@ impl Type1GpuPlan {
             source,
         })?;
 
-        let count_pipeline = create_compute_pipeline(
-            device,
-            "wgpu_nufft.type1.bin_count",
-            &generate_count_wgsl_for_precision(fine_length, precision),
-        );
-        let count_layout = count_pipeline.get_bind_group_layout(0);
-        let prefix_scan = GpuExclusiveScanU32::new(device, fine_length)?;
-        let terminal_pipeline = create_compute_pipeline(
-            device,
-            "wgpu_nufft.type1.bin_terminal",
-            &generate_terminal_wgsl(),
-        );
-        let terminal_layout = terminal_pipeline.get_bind_group_layout(0);
-        let scatter_pipeline = create_compute_pipeline(
-            device,
-            "wgpu_nufft.type1.bin_scatter",
-            &generate_scatter_wgsl_for_precision(fine_length, precision),
-        );
-        let scatter_layout = scatter_pipeline.get_bind_group_layout(0);
-        let sort_pipeline =
-            create_compute_pipeline(device, "wgpu_nufft.type1.bin_sort", &generate_sort_wgsl());
-        let sort_layout = sort_pipeline.get_bind_group_layout(0);
-        let gather_pipeline = create_compute_pipeline(
-            device,
-            "wgpu_nufft.type1.spread_gather",
-            &generate_gather_wgsl_for_precision(kernel, fine_length, precision),
-        );
-        let gather_layout = gather_pipeline.get_bind_group_layout(0);
         let deconvolution_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.type1.deconvolution",
             &generate_deconvolution_wgsl_for_precision(config, fine_length, precision),
         );
         let deconvolution_layout = deconvolution_pipeline.get_bind_group_layout(0);
-
+        let segment_layout = match precision {
+            FftPrecision::F32 => SegmentLayout1d::for_grid(kernel, fine_length),
+            FftPrecision::F64 | FftPrecision::Df64 => None,
+        };
+        let spread = match segment_layout {
+            Some(layout) => {
+                Spread1d::Segment(Box::new(SegmentGather1d::new(device, kernel, layout)?))
+            }
+            None => Spread1d::PerCell(Box::new(PerCellSpread1d::new(
+                device,
+                kernel,
+                fine_length,
+                precision,
+            )?)),
+        };
         let max_workgroups_per_dimension = limits.max_compute_workgroups_per_dimension;
-        let sort_dispatch = dispatch_for_elements(fine_length, max_workgroups_per_dimension)?;
 
         Ok(Self {
             fft,
             amplitudes,
             fine_input,
             fine_output,
-            scratch,
-            count_pipeline,
-            count_layout,
-            prefix_scan,
-            terminal_pipeline,
-            terminal_layout,
-            scatter_pipeline,
-            scatter_layout,
-            sort_pipeline,
-            sort_layout,
-            gather_pipeline,
-            gather_layout,
+            spread,
             deconvolution_pipeline,
             deconvolution_layout,
-            sort_dispatch,
             max_workgroups_per_dimension,
             mode_count,
             fine_length,
@@ -324,9 +280,81 @@ impl Type1GpuPlan {
             point_count,
             points,
             strengths,
+            true,
             #[cfg(feature = "gpu-profiling")]
             GpuProfileQueryWriter::disabled(),
         )
+    }
+
+    /// Records the point-dependent preparation (the stable coarse-bin order of
+    /// the segment gather) for later [`Self::encode_batch_with_recorded_points`]
+    /// calls with the same `points` contents. The per-cell gather prepares
+    /// nothing here and rebuilds its bins on every execution.
+    pub(crate) fn set_points(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+    ) -> Result<()> {
+        let point_bytes = self.validate_points(point_count, points)?;
+        if let (Spread1d::Segment(segment), true) = (&self.spread, point_count > 0) {
+            segment.encode_bins(
+                device,
+                encoder,
+                point_count,
+                points,
+                point_bytes,
+                #[cfg(feature = "gpu-profiling")]
+                GpuProfileQueryWriter::disabled(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Self::encode_batch`], but reuses the preparation recorded by the
+    /// most recent [`Self::set_points`] for these `points`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_batch_with_recorded_points(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        self.validate_active_batch(active_batch)?;
+        self.encode_impl(
+            device,
+            encoder,
+            active_batch,
+            point_count,
+            points,
+            strengths,
+            output,
+            false,
+            #[cfg(feature = "gpu-profiling")]
+            GpuProfileQueryWriter::disabled(),
+        )
+    }
+
+    fn validate_points(&self, point_count: usize, points: &wgpu::Buffer) -> Result<u64> {
+        if point_count == 0 {
+            return Ok(0);
+        }
+        u32::try_from(point_count).map_err(|_| NufftError::LengthOverflow {
+            context: "type-1 GPU point count",
+        })?;
+        let point_bytes = Self::point_buffer_size_bytes_for_precision(point_count, self.precision)?;
+        validate_external_storage_buffer(
+            "type-1 point",
+            points,
+            point_bytes,
+            self.max_storage_binding_bytes,
+        )?;
+        Ok(point_bytes)
     }
 
     /// Returns the plan-owned fine grid populated by [`Self::encode_spread`].
@@ -379,6 +407,7 @@ impl Type1GpuPlan {
             points,
             strengths,
             output,
+            true,
             #[cfg(feature = "gpu-profiling")]
             GpuProfileQueryWriter::disabled(),
         )
@@ -415,6 +444,7 @@ impl Type1GpuPlan {
             points,
             strengths,
             output,
+            true,
             GpuProfileQueryWriter::enabled(query_set, &layout),
         )?;
         Ok(layout)
@@ -430,6 +460,7 @@ impl Type1GpuPlan {
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
         output: &wgpu::Buffer,
+        record_points: bool,
         #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
         let output_elements =
@@ -466,39 +497,17 @@ impl Type1GpuPlan {
             ],
         });
 
-        #[cfg(not(feature = "gpu-profiling"))]
-        self.encode_spread_batch(
+        self.encode_spread_impl(
             device,
             encoder,
             active_batch,
             point_count,
             points,
             strengths,
+            record_points,
+            #[cfg(feature = "gpu-profiling")]
+            profile,
         )?;
-        #[cfg(feature = "gpu-profiling")]
-        match profile {
-            GpuProfileQueryWriter::Disabled => {
-                self.encode_spread_batch(
-                    device,
-                    encoder,
-                    active_batch,
-                    point_count,
-                    points,
-                    strengths,
-                )?;
-            }
-            GpuProfileQueryWriter::Enabled { .. } => {
-                self.encode_spread_impl(
-                    device,
-                    encoder,
-                    active_batch,
-                    point_count,
-                    points,
-                    strengths,
-                    profile,
-                )?;
-            }
-        }
         self.encode_fft(device, encoder)?;
         let deconvolution_dispatch =
             dispatch_for_elements(output_elements, self.max_workgroups_per_dimension)?;
@@ -521,6 +530,7 @@ impl Type1GpuPlan {
         point_count: usize,
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
+        record_points: bool,
         #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
         if point_count == 0 {
@@ -530,10 +540,9 @@ impl Type1GpuPlan {
             return Ok(());
         }
 
-        let point_count_u32 =
-            u32::try_from(point_count).map_err(|_| NufftError::LengthOverflow {
-                context: "type-1 GPU point count",
-            })?;
+        u32::try_from(point_count).map_err(|_| NufftError::LengthOverflow {
+            context: "type-1 GPU point count",
+        })?;
         let point_bytes = Self::point_buffer_size_bytes_for_precision(point_count, self.precision)?;
         let strength_elements =
             point_count
@@ -556,167 +565,61 @@ impl Type1GpuPlan {
             self.max_storage_binding_bytes,
         )?;
 
-        let fine_grid_element_count = self.fine_grid_element_count();
-        let count_bytes =
-            checked_buffer_size("type-1 bin counts", fine_grid_element_count, U32_BYTES)?;
-        let offset_count =
-            self.fine_grid_element_count()
-                .checked_add(1)
-                .ok_or(NufftError::LengthOverflow {
-                    context: "type-1 bin offset count",
-                })?;
-        let offset_bytes = checked_buffer_size("type-1 bin offsets", offset_count, U32_BYTES)?;
-        let index_bytes =
-            checked_buffer_size("type-1 sorted point indices", point_count, U32_BYTES)?;
-        for (label, bytes) in [
-            ("type-1 bin counts", count_bytes),
-            ("type-1 bin cursors", count_bytes),
-            ("type-1 bin offsets", offset_bytes),
-            ("type-1 sorted point indices", index_bytes),
-        ] {
-            validate_binding_limit(label, bytes, self.max_storage_binding_bytes)?;
-            validate_buffer_limit(label, bytes, self.max_buffer_bytes)?;
-        }
-        let point_dispatch = split_workgroups(
-            point_count_u32.div_ceil(WORKGROUP_SIZE),
-            self.max_workgroups_per_dimension,
-        )?;
-
-        let bin_counts = &self.scratch.bin_counts;
-        let bin_cursors = &self.scratch.bin_cursors;
-        let bin_offsets = &self.scratch.bin_offsets;
-        let sorted_indices = self.scratch.sorted_indices(index_bytes);
-
-        let count_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wgpu_nufft.type1.bin_count.bind_group"),
-            layout: &self.count_layout,
-            entries: &[
-                binding_entry(0, points, point_bytes),
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: bin_counts.as_entire_binding(),
-                },
-            ],
-        });
-        let terminal_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wgpu_nufft.type1.bin_terminal.bind_group"),
-            layout: &self.terminal_layout,
-            entries: &[
-                binding_entry(0, bin_counts, count_bytes),
-                binding_entry(1, bin_offsets, offset_bytes),
-            ],
-        });
-        let scatter_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wgpu_nufft.type1.bin_scatter.bind_group"),
-            layout: &self.scatter_layout,
-            entries: &[
-                binding_entry(0, points, point_bytes),
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: bin_offsets.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: bin_cursors.as_entire_binding(),
-                },
-                binding_entry(3, &sorted_indices, index_bytes),
-            ],
-        });
-        let sort_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wgpu_nufft.type1.bin_sort.bind_group"),
-            layout: &self.sort_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: bin_offsets.as_entire_binding(),
-                },
-                binding_entry(1, &sorted_indices, index_bytes),
-            ],
-        });
-        let active_fine_elements = fine_grid_element_count.checked_mul(active_batch).ok_or(
-            NufftError::LengthOverflow {
+        let active_fine_elements = self
+            .fine_grid_element_count()
+            .checked_mul(active_batch)
+            .ok_or(NufftError::LengthOverflow {
                 context: "active batched type-1 fine-grid element count",
-            },
-        )?;
+            })?;
         let active_fine_bytes = Self::complex_buffer_size_bytes_for_precision(
             "active batched type-1 fine grid",
             active_fine_elements,
             self.precision,
         )?;
-        let gather_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wgpu_nufft.type1.spread_gather.bind_group"),
-            layout: &self.gather_layout,
-            entries: &[
-                binding_entry(0, points, point_bytes),
-                binding_entry(1, strengths, strength_bytes),
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: bin_offsets.as_entire_binding(),
-                },
-                binding_entry(3, &sorted_indices, index_bytes),
-                binding_entry(4, &self.fine_input, active_fine_bytes),
-            ],
-        });
-        let vector_blocks = active_batch.div_ceil(VECTOR_BLOCK_SIZE);
-        let gather_elements = fine_grid_element_count.checked_mul(vector_blocks).ok_or(
-            NufftError::LengthOverflow {
-                context: "batched type-1 gather element count",
-            },
-        )?;
-        let gather_dispatch =
-            dispatch_for_elements(gather_elements, self.max_workgroups_per_dimension)?;
-
-        #[cfg(feature = "gpu-profiling")]
-        profile.encode_type1_start_marker(encoder);
-        encoder.clear_buffer(bin_counts, 0, None);
-        encoder.clear_buffer(bin_cursors, 0, None);
-        encode_pass(
-            encoder,
-            "wgpu_nufft.type1.bin_count.pass",
-            &self.count_pipeline,
-            &count_bind_group,
-            point_dispatch,
-            #[cfg(feature = "gpu-profiling")]
-            profile.timestamp_writes(None, Some(1)),
-        );
-        self.prefix_scan
-            .encode(device, encoder, bin_counts, bin_offsets)?;
-        encode_pass(
-            encoder,
-            "wgpu_nufft.type1.bin_terminal.pass",
-            &self.terminal_pipeline,
-            &terminal_bind_group,
-            (1, 1, 1),
-            #[cfg(feature = "gpu-profiling")]
-            profile.timestamp_writes(None, Some(2)),
-        );
-        encode_pass(
-            encoder,
-            "wgpu_nufft.type1.bin_scatter.pass",
-            &self.scatter_pipeline,
-            &scatter_bind_group,
-            point_dispatch,
-            #[cfg(feature = "gpu-profiling")]
-            profile.timestamp_writes(None, Some(3)),
-        );
-        encode_pass(
-            encoder,
-            "wgpu_nufft.type1.bin_sort.pass",
-            &self.sort_pipeline,
-            &sort_bind_group,
-            self.sort_dispatch,
-            #[cfg(feature = "gpu-profiling")]
-            profile.timestamp_writes(None, Some(4)),
-        );
-        encode_pass(
-            encoder,
-            "wgpu_nufft.type1.spread_gather.pass",
-            &self.gather_pipeline,
-            &gather_bind_group,
-            gather_dispatch,
-            #[cfg(feature = "gpu-profiling")]
-            profile.timestamp_writes(None, Some(5)),
-        );
+        match &self.spread {
+            Spread1d::Segment(segment) => {
+                if record_points {
+                    segment.encode_bins(
+                        device,
+                        encoder,
+                        point_count,
+                        points,
+                        point_bytes,
+                        #[cfg(feature = "gpu-profiling")]
+                        profile,
+                    )?;
+                }
+                segment.encode_spread(
+                    device,
+                    encoder,
+                    active_batch,
+                    point_count,
+                    strengths,
+                    strength_bytes,
+                    &self.fine_input,
+                    active_fine_bytes,
+                    #[cfg(feature = "gpu-profiling")]
+                    profile,
+                )?;
+            }
+            Spread1d::PerCell(per_cell) => per_cell.encode(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                point_bytes,
+                strengths,
+                strength_bytes,
+                &self.fine_input,
+                active_fine_bytes,
+                self.max_workgroups_per_dimension,
+                self.max_storage_binding_bytes,
+                self.max_buffer_bytes,
+                #[cfg(feature = "gpu-profiling")]
+                profile,
+            )?,
+        }
         if active_batch < self.batch_capacity {
             encoder.clear_buffer(
                 &self.fine_input,
@@ -773,6 +676,278 @@ impl Type1GpuPlan {
         } else {
             Ok(())
         }
+    }
+}
+
+/// How a plan spreads points onto its fine grid.
+enum Spread1d {
+    Segment(Box<SegmentGather1d>),
+    PerCell(Box<PerCellSpread1d>),
+}
+
+/// One bin per fine-grid cell and one gathering invocation per cell.
+struct PerCellSpread1d {
+    scratch: Type1ScratchBuffers,
+    count_pipeline: wgpu::ComputePipeline,
+    count_layout: wgpu::BindGroupLayout,
+    prefix_scan: GpuExclusiveScanU32,
+    terminal_pipeline: wgpu::ComputePipeline,
+    terminal_layout: wgpu::BindGroupLayout,
+    scatter_pipeline: wgpu::ComputePipeline,
+    scatter_layout: wgpu::BindGroupLayout,
+    sort_pipeline: wgpu::ComputePipeline,
+    sort_layout: wgpu::BindGroupLayout,
+    gather_pipeline: wgpu::ComputePipeline,
+    gather_layout: wgpu::BindGroupLayout,
+    sort_dispatch: (u32, u32, u32),
+    fine_length: usize,
+}
+
+impl PerCellSpread1d {
+    fn new(
+        device: &wgpu::Device,
+        kernel: EsKernel,
+        fine_length: usize,
+        precision: FftPrecision,
+    ) -> Result<Self> {
+        let limits = device.limits();
+        let count_bytes = checked_buffer_size("type-1 bin counts", fine_length, U32_BYTES)?;
+        let offset_count = fine_length
+            .checked_add(1)
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-1 bin offset count",
+            })?;
+        let offset_bytes = checked_buffer_size("type-1 bin offsets", offset_count, U32_BYTES)?;
+        for (label, bytes) in [
+            ("type-1 bin counts", count_bytes),
+            ("type-1 bin offsets", offset_bytes),
+        ] {
+            validate_binding_limit(label, bytes, limits.max_storage_buffer_binding_size)?;
+            validate_buffer_limit(label, bytes, limits.max_buffer_size)?;
+        }
+        let scratch =
+            Type1ScratchBuffers::new(device, "wgpu_nufft.type1", count_bytes, offset_bytes);
+        let count_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1.bin_count",
+            &generate_count_wgsl_for_precision(fine_length, precision),
+        );
+        let count_layout = count_pipeline.get_bind_group_layout(0);
+        let prefix_scan = GpuExclusiveScanU32::new(device, fine_length)?;
+        let terminal_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1.bin_terminal",
+            &generate_terminal_wgsl(),
+        );
+        let terminal_layout = terminal_pipeline.get_bind_group_layout(0);
+        let scatter_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1.bin_scatter",
+            &generate_scatter_wgsl_for_precision(fine_length, precision),
+        );
+        let scatter_layout = scatter_pipeline.get_bind_group_layout(0);
+        let sort_pipeline =
+            create_compute_pipeline(device, "wgpu_nufft.type1.bin_sort", &generate_sort_wgsl());
+        let sort_layout = sort_pipeline.get_bind_group_layout(0);
+        let gather_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1.spread_gather",
+            &generate_gather_wgsl_for_precision(kernel, fine_length, precision),
+        );
+        let gather_layout = gather_pipeline.get_bind_group_layout(0);
+        let sort_dispatch =
+            dispatch_for_elements(fine_length, limits.max_compute_workgroups_per_dimension)?;
+        Ok(Self {
+            scratch,
+            count_pipeline,
+            count_layout,
+            prefix_scan,
+            terminal_pipeline,
+            terminal_layout,
+            scatter_pipeline,
+            scatter_layout,
+            sort_pipeline,
+            sort_layout,
+            gather_pipeline,
+            gather_layout,
+            sort_dispatch,
+            fine_length,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        point_bytes: u64,
+        strengths: &wgpu::Buffer,
+        strength_bytes: u64,
+        fine_input: &wgpu::Buffer,
+        active_fine_bytes: u64,
+        max_workgroups_per_dimension: u32,
+        max_storage_binding_bytes: u64,
+        max_buffer_bytes: u64,
+        #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
+    ) -> Result<()> {
+        let point_count_u32 =
+            u32::try_from(point_count).map_err(|_| NufftError::LengthOverflow {
+                context: "type-1 GPU point count",
+            })?;
+        let fine_grid_element_count = self.fine_length;
+        let count_bytes =
+            checked_buffer_size("type-1 bin counts", fine_grid_element_count, U32_BYTES)?;
+        let offset_count = self
+            .fine_length
+            .checked_add(1)
+            .ok_or(NufftError::LengthOverflow {
+                context: "type-1 bin offset count",
+            })?;
+        let offset_bytes = checked_buffer_size("type-1 bin offsets", offset_count, U32_BYTES)?;
+        let index_bytes =
+            checked_buffer_size("type-1 sorted point indices", point_count, U32_BYTES)?;
+        for (label, bytes) in [
+            ("type-1 bin counts", count_bytes),
+            ("type-1 bin cursors", count_bytes),
+            ("type-1 bin offsets", offset_bytes),
+            ("type-1 sorted point indices", index_bytes),
+        ] {
+            validate_binding_limit(label, bytes, max_storage_binding_bytes)?;
+            validate_buffer_limit(label, bytes, max_buffer_bytes)?;
+        }
+        let point_dispatch = split_workgroups(
+            point_count_u32.div_ceil(WORKGROUP_SIZE),
+            max_workgroups_per_dimension,
+        )?;
+
+        let bin_counts = &self.scratch.bin_counts;
+        let bin_cursors = &self.scratch.bin_cursors;
+        let bin_offsets = &self.scratch.bin_offsets;
+        let sorted_indices = self.scratch.sorted_indices(index_bytes);
+
+        let count_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1.bin_count.bind_group"),
+            layout: &self.count_layout,
+            entries: &[
+                binding_entry(0, points, point_bytes),
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bin_counts.as_entire_binding(),
+                },
+            ],
+        });
+        let terminal_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1.bin_terminal.bind_group"),
+            layout: &self.terminal_layout,
+            entries: &[
+                binding_entry(0, bin_counts, count_bytes),
+                binding_entry(1, bin_offsets, offset_bytes),
+            ],
+        });
+        let scatter_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1.bin_scatter.bind_group"),
+            layout: &self.scatter_layout,
+            entries: &[
+                binding_entry(0, points, point_bytes),
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bin_offsets.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bin_cursors.as_entire_binding(),
+                },
+                binding_entry(3, &sorted_indices, index_bytes),
+            ],
+        });
+        let sort_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1.bin_sort.bind_group"),
+            layout: &self.sort_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: bin_offsets.as_entire_binding(),
+                },
+                binding_entry(1, &sorted_indices, index_bytes),
+            ],
+        });
+        let gather_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1.spread_gather.bind_group"),
+            layout: &self.gather_layout,
+            entries: &[
+                binding_entry(0, points, point_bytes),
+                binding_entry(1, strengths, strength_bytes),
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: bin_offsets.as_entire_binding(),
+                },
+                binding_entry(3, &sorted_indices, index_bytes),
+                binding_entry(4, fine_input, active_fine_bytes),
+            ],
+        });
+        let vector_blocks = active_batch.div_ceil(VECTOR_BLOCK_SIZE);
+        let gather_elements = fine_grid_element_count.checked_mul(vector_blocks).ok_or(
+            NufftError::LengthOverflow {
+                context: "batched type-1 gather element count",
+            },
+        )?;
+        let gather_dispatch = dispatch_for_elements(gather_elements, max_workgroups_per_dimension)?;
+
+        #[cfg(feature = "gpu-profiling")]
+        profile.encode_start_marker(encoder);
+        encoder.clear_buffer(bin_counts, 0, None);
+        encoder.clear_buffer(bin_cursors, 0, None);
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1.bin_count.pass",
+            &self.count_pipeline,
+            &count_bind_group,
+            point_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(1)),
+        );
+        self.prefix_scan
+            .encode(device, encoder, bin_counts, bin_offsets)?;
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1.bin_terminal.pass",
+            &self.terminal_pipeline,
+            &terminal_bind_group,
+            (1, 1, 1),
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(2)),
+        );
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1.bin_scatter.pass",
+            &self.scatter_pipeline,
+            &scatter_bind_group,
+            point_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(3)),
+        );
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1.bin_sort.pass",
+            &self.sort_pipeline,
+            &sort_bind_group,
+            self.sort_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(4)),
+        );
+        encode_pass(
+            encoder,
+            "wgpu_nufft.type1.spread_gather.pass",
+            &self.gather_pipeline,
+            &gather_bind_group,
+            gather_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(5)),
+        );
+        Ok(())
     }
 }
 
@@ -961,6 +1136,24 @@ fn floor_df64_to_i32(value: Df64) -> i32 {{
         position_scale_hi = format_wgsl_f32(position_scale_hi),
         position_scale_lo = format_wgsl_f32(position_scale_lo),
         grid_origin = format_wgsl_f32((fine_length / 2) as f32),
+    )
+}
+
+/// Position WGSL with the axis-0 names that
+/// [`PointBins`](crate::gpu_point_bins::PointBins) expects of a one-axis grid.
+pub(crate) fn generate_binned_position_wgsl(fine_length: usize) -> String {
+    format!(
+        "{}
+const FINE_0: u32 = FINE_LENGTH;
+const FINE_0_F32: f32 = FINE_LENGTH_F32;
+const POSITION_SCALE_0_HI: f32 = POSITION_SCALE_HI;
+const GRID_ORIGIN_0: f32 = GRID_ORIGIN;
+
+fn fold_position_0(point: f32) -> Df64 {{
+    return fold_position(point);
+}}
+",
+        generate_position_wgsl(fine_length)
     )
 }
 

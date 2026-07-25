@@ -4,6 +4,7 @@ use std::sync::{Mutex, MutexGuard};
 use crate::config::{ModeOrder, NufftConfig};
 use crate::error::{NufftError, Result};
 use crate::gpu::max_supported_workgroup_size;
+use crate::gpu_dense_spread::DenseSpread;
 use crate::gpu_dispatch::split_workgroups;
 use crate::gpu_type1::Type1GpuPlan;
 use crate::gpu_type1_2d::{Type1Gather2d, Type1GpuPlan2d};
@@ -97,7 +98,17 @@ impl GpuType3Plan {
                 .map(|&length| kernel.centered_fourier_coefficients(length))
                 .collect::<Result<Vec<_>>>()?
         };
+        // Small F32 outer grids hold many sources per cell; the dense
+        // spreader parallelizes over point groups instead of cells.
         let raw_spread = match dimensions {
+            _ if precision == FftPrecision::F32 && DenseSpread::supports(kernel, &outer_shape) => {
+                RawSpreadPlan::Dense(DenseSpread::new(
+                    device,
+                    kernel,
+                    &outer_shape,
+                    metadata.config().batch(),
+                )?)
+            }
             1 => RawSpreadPlan::OneD(Type1GpuPlan::new(
                 device,
                 queue,
@@ -116,7 +127,7 @@ impl GpuType3Plan {
                     outer_coefficients[0].as_slice(),
                     outer_coefficients[1].as_slice(),
                 ],
-                Type1Gather2d::Tiled16,
+                Type1Gather2d::Block,
             )?),
             3 => RawSpreadPlan::ThreeD(Type1GpuPlan3d::new(
                 device,
@@ -129,7 +140,7 @@ impl GpuType3Plan {
                     outer_coefficients[1].as_slice(),
                     outer_coefficients[2].as_slice(),
                 ],
-                Type1Gather3d::Tiled8x8x4,
+                Type1Gather3d::Block,
             )?),
             _ => RawSpreadPlan::Nd(Type1GpuPlanNd::new(
                 device,
@@ -482,7 +493,10 @@ impl GpuType3Plan {
     }
 }
 
+// One raw-spread plan per type-3 plan; the type-1 variants embed FFT plans.
+#[allow(clippy::large_enum_variant)]
 enum RawSpreadPlan {
+    Dense(DenseSpread),
     OneD(Type1GpuPlan),
     TwoD(Type1GpuPlan2d),
     ThreeD(Type1GpuPlan3d),
@@ -512,6 +526,14 @@ impl RawSpreadPlan {
         strengths: &wgpu::Buffer,
     ) -> Result<()> {
         match self {
+            Self::Dense(plan) => plan.encode_spread_batch(
+                device,
+                encoder,
+                active_batch,
+                point_count,
+                points,
+                strengths,
+            ),
             Self::OneD(plan) => plan.encode_spread_batch(
                 device,
                 encoder,
@@ -549,6 +571,7 @@ impl RawSpreadPlan {
 
     fn fine_grid_buffer(&self) -> &wgpu::Buffer {
         match self {
+            Self::Dense(plan) => plan.fine_grid_buffer(),
             Self::OneD(plan) => plan.fine_grid_buffer(),
             Self::TwoD(plan) => plan.fine_grid_buffer(),
             Self::ThreeD(plan) => plan.fine_grid_buffer(),
@@ -558,6 +581,7 @@ impl RawSpreadPlan {
 
     fn fine_grid_element_count(&self) -> usize {
         match self {
+            Self::Dense(plan) => plan.fine_grid_element_count(),
             Self::OneD(plan) => plan.fine_grid_element_count(),
             Self::TwoD(plan) => plan.fine_grid_element_count(),
             Self::ThreeD(plan) => plan.fine_grid_element_count(),

@@ -8,11 +8,14 @@ use crate::config::{ModeOrder, NufftConfig, NufftSign};
 use crate::direct::mode_for_storage_index;
 use crate::error::{NufftError, Result};
 use crate::gpu_dispatch::split_workgroups;
+use crate::gpu_point_bins::{PointBinOrder, PointBins};
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::{GpuProfileQueryWriter, NufftGpuProfileLayout};
 use crate::kernel::EsKernel;
 
 const WORKGROUP_SIZE: u32 = 64;
+/// Cells per coarse point bin of the binned interpolation.
+const BINNED_INTERPOLATION_BIN_SIDE: usize = 8;
 const VECTOR_TILE: usize = 4;
 const COMPLEX_F32_BYTES: u64 = 8;
 const F32_BYTES: u64 = 4;
@@ -30,14 +33,30 @@ pub(crate) struct Type2GpuPlan {
     fine_output: wgpu::Buffer,
     predeconvolution_pipeline: wgpu::ComputePipeline,
     predeconvolution_layout: wgpu::BindGroupLayout,
-    interpolation_pipeline: wgpu::ComputePipeline,
-    interpolation_layout: wgpu::BindGroupLayout,
+    interpolation: Interpolation1d,
     predeconvolution_dispatch: (u32, u32, u32),
     max_workgroups_per_dimension: u32,
     batch_capacity: usize,
     mode_count: usize,
     precision: FftPrecision,
     max_storage_binding_bytes: u64,
+}
+
+/// How the plan evaluates the fine grid at the points.
+enum Interpolation1d {
+    /// One invocation per point and vector tile, in caller point order.
+    Direct {
+        pipeline: wgpu::ComputePipeline,
+        layout: wgpu::BindGroupLayout,
+    },
+    /// F32 points grouped into coarse bins and prepared first, so that
+    /// neighbouring invocations read overlapping fine-grid cells. Every output
+    /// is still one fixed-order sum.
+    Binned {
+        bins: Box<PointBins>,
+        pipeline: wgpu::ComputePipeline,
+        layout: wgpu::BindGroupLayout,
+    },
 }
 
 impl Type2GpuPlan {
@@ -181,13 +200,39 @@ impl Type2GpuPlan {
             &generate_predeconvolution_wgsl(config, fine_length),
         );
         let predeconvolution_layout = predeconvolution_pipeline.get_bind_group_layout(0);
-        let interpolation_pipeline = create_compute_pipeline(
-            device,
-            "wgpu_nufft.type2.interpolation",
-            &generate_interpolation_wgsl_for_precision(precision, kernel, fine_length),
-        );
-        let interpolation_layout = interpolation_pipeline.get_bind_group_layout(0);
-
+        let interpolation = match precision {
+            FftPrecision::F32 if fine_length >= 2 * kernel.width() => {
+                let bins = PointBins::new(
+                    device,
+                    kernel,
+                    &[fine_length],
+                    &[BINNED_INTERPOLATION_BIN_SIDE],
+                    PointBinOrder::Grouped,
+                    &crate::gpu_type1::generate_binned_position_wgsl(fine_length),
+                )?;
+                let pipeline = create_compute_pipeline(
+                    device,
+                    "wgpu_nufft.type2.binned_interpolation",
+                    &generate_binned_interpolation_wgsl(kernel, fine_length),
+                );
+                Interpolation1d::Binned {
+                    bins: Box::new(bins),
+                    layout: pipeline.get_bind_group_layout(0),
+                    pipeline,
+                }
+            }
+            FftPrecision::F32 | FftPrecision::F64 | FftPrecision::Df64 => {
+                let pipeline = create_compute_pipeline(
+                    device,
+                    "wgpu_nufft.type2.interpolation",
+                    &generate_interpolation_wgsl_for_precision(precision, kernel, fine_length),
+                );
+                Interpolation1d::Direct {
+                    layout: pipeline.get_bind_group_layout(0),
+                    pipeline,
+                }
+            }
+        };
         let workgroups = fine_element_count_u32.div_ceil(WORKGROUP_SIZE);
         let max_workgroups_per_dimension = limits.max_compute_workgroups_per_dimension;
         let predeconvolution_dispatch = split_workgroups(workgroups, max_workgroups_per_dimension)?;
@@ -199,8 +244,7 @@ impl Type2GpuPlan {
             fine_output,
             predeconvolution_pipeline,
             predeconvolution_layout,
-            interpolation_pipeline,
-            interpolation_layout,
+            interpolation,
             predeconvolution_dispatch,
             max_workgroups_per_dimension,
             batch_capacity,
@@ -280,9 +324,92 @@ impl Type2GpuPlan {
             points,
             coefficients,
             output,
+            true,
             #[cfg(feature = "gpu-profiling")]
             GpuProfileQueryWriter::disabled(),
         )
+    }
+
+    /// Records the point-dependent preparation (the coarse-bin grouping of
+    /// the binned interpolation) for later
+    /// [`Self::encode_batch_with_recorded_points`] calls with the same
+    /// `points` contents. Direct interpolation prepares nothing.
+    pub(crate) fn set_points(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        point_count: usize,
+        points: &wgpu::Buffer,
+    ) -> Result<()> {
+        if point_count == 0 {
+            return Ok(());
+        }
+        let point_bytes = self.validate_points(point_count, points)?;
+        if let Interpolation1d::Binned { bins, .. } = &self.interpolation {
+            bins.encode(
+                device,
+                encoder,
+                point_count,
+                points,
+                point_bytes,
+                #[cfg(feature = "gpu-profiling")]
+                GpuProfileQueryWriter::disabled(),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Like [`Self::encode_batch`], but reuses the preparation recorded by the
+    /// most recent [`Self::set_points`] for these `points`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_batch_with_recorded_points(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        active_batch: usize,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        coefficients: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
+        self.encode_impl(
+            device,
+            encoder,
+            active_batch,
+            point_count,
+            points,
+            coefficients,
+            output,
+            false,
+            #[cfg(feature = "gpu-profiling")]
+            GpuProfileQueryWriter::disabled(),
+        )
+    }
+
+    fn validate_points(&self, point_count: usize, points: &wgpu::Buffer) -> Result<u64> {
+        u32::try_from(point_count).map_err(|_| NufftError::LengthOverflow {
+            context: "type-2 GPU point count",
+        })?;
+        let point_bytes = Self::point_buffer_size_bytes_for_precision(point_count, self.precision)?;
+        validate_external_storage_buffer(
+            "type-2 point",
+            points,
+            point_bytes,
+            self.max_storage_binding_bytes,
+        )?;
+        Ok(point_bytes)
+    }
+
+    /// Timestamp-query layout of one profiled execution of this plan.
+    #[cfg(feature = "gpu-profiling")]
+    pub(crate) fn profile_layout(&self, first_query: u32) -> Result<NufftGpuProfileLayout> {
+        match self.interpolation {
+            Interpolation1d::Binned { .. } => NufftGpuProfileLayout::type2_binned(first_query),
+            Interpolation1d::Direct { .. } => NufftGpuProfileLayout::type2(first_query),
+        }
+        .map_err(|_| NufftError::LengthOverflow {
+            context: "type-2 stage-profile query range",
+        })
     }
 
     #[cfg(feature = "gpu-profiling")]
@@ -304,10 +431,7 @@ impl Type2GpuPlan {
                 reason: "at least one point is required",
             });
         }
-        let layout =
-            NufftGpuProfileLayout::type2(first_query).map_err(|_| NufftError::LengthOverflow {
-                context: "type-2 stage-profile query range",
-            })?;
+        let layout = self.profile_layout(first_query)?;
         self.encode_impl(
             device,
             encoder,
@@ -316,6 +440,7 @@ impl Type2GpuPlan {
             points,
             coefficients,
             output,
+            true,
             GpuProfileQueryWriter::enabled(query_set, &layout),
         )?;
         Ok(layout)
@@ -331,6 +456,7 @@ impl Type2GpuPlan {
         points: &wgpu::Buffer,
         coefficients: &wgpu::Buffer,
         output: &wgpu::Buffer,
+        record_points: bool,
         #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
         if active_batch == 0 || active_batch > self.batch_capacity {
@@ -342,10 +468,7 @@ impl Type2GpuPlan {
         if point_count == 0 {
             return Ok(());
         }
-        u32::try_from(point_count).map_err(|_| NufftError::LengthOverflow {
-            context: "type-2 GPU point count",
-        })?;
-        let point_bytes = Self::point_buffer_size_bytes_for_precision(point_count, self.precision)?;
+        let point_bytes = self.validate_points(point_count, points)?;
         let coefficient_elements = checked_product(
             "type-2 batched Fourier coefficient count",
             active_batch,
@@ -367,12 +490,6 @@ impl Type2GpuPlan {
             self.precision,
         )?;
         validate_external_storage_buffer(
-            "type-2 point",
-            points,
-            point_bytes,
-            self.max_storage_binding_bytes,
-        )?;
-        validate_external_storage_buffer(
             "type-2 Fourier coefficient",
             coefficients,
             coefficient_bytes,
@@ -390,11 +507,16 @@ impl Type2GpuPlan {
                 second: "type-2 output",
             });
         }
-        let vector_tiles = active_batch.div_ceil(VECTOR_TILE);
+        // Binned interpolation runs one invocation per point and vector;
+        // direct interpolation one per point and vector tile.
+        let vectors_per_point = match self.interpolation {
+            Interpolation1d::Binned { .. } => active_batch,
+            Interpolation1d::Direct { .. } => active_batch.div_ceil(VECTOR_TILE),
+        };
         let interpolation_elements = checked_product(
             "type-2 batched interpolation work item count",
             point_count,
-            vector_tiles,
+            vectors_per_point,
         )?;
         let interpolation_elements_u32 =
             u32::try_from(interpolation_elements).map_err(|_| NufftError::LengthOverflow {
@@ -404,6 +526,25 @@ impl Type2GpuPlan {
             interpolation_elements_u32.div_ceil(WORKGROUP_SIZE),
             self.max_workgroups_per_dimension,
         )?;
+
+        // The binned profile layout measures point binning at offsets 0-1
+        // ahead of the three type-2 stages.
+        #[cfg(feature = "gpu-profiling")]
+        let stage_base = match self.interpolation {
+            Interpolation1d::Binned { .. } => 1,
+            Interpolation1d::Direct { .. } => 0,
+        };
+        if let (Interpolation1d::Binned { bins, .. }, true) = (&self.interpolation, record_points) {
+            bins.encode(
+                device,
+                encoder,
+                point_count,
+                points,
+                point_bytes,
+                #[cfg(feature = "gpu-profiling")]
+                profile,
+            )?;
+        }
 
         let predeconvolution_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.type2.predeconvolution.bind_group"),
@@ -426,7 +567,8 @@ impl Type2GpuPlan {
                 timestamp_writes: {
                     #[cfg(feature = "gpu-profiling")]
                     {
-                        profile.timestamp_writes(Some(0), Some(1))
+                        profile
+                            .timestamp_writes((stage_base == 0).then_some(0), Some(stage_base + 1))
                     }
                     #[cfg(not(feature = "gpu-profiling"))]
                     {
@@ -455,25 +597,53 @@ impl Type2GpuPlan {
                 source,
             })?;
 
-        let interpolation_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("wgpu_nufft.type2.interpolation.bind_group"),
-            layout: &self.interpolation_layout,
-            entries: &[
-                binding_entry(0, points, point_bytes),
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.fine_output.as_entire_binding(),
-                },
-                binding_entry(2, output, output_bytes),
-            ],
-        });
+        let (interpolation_pipeline, interpolation_bind_group) = match &self.interpolation {
+            Interpolation1d::Direct { pipeline, layout } => (
+                pipeline,
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("wgpu_nufft.type2.interpolation.bind_group"),
+                    layout,
+                    entries: &[
+                        binding_entry(0, points, point_bytes),
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: self.fine_output.as_entire_binding(),
+                        },
+                        binding_entry(2, output, output_bytes),
+                    ],
+                }),
+            ),
+            Interpolation1d::Binned {
+                bins,
+                pipeline,
+                layout,
+            } => {
+                let prepared = bins.prepared(point_count)?;
+                (
+                    pipeline,
+                    device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("wgpu_nufft.type2.binned_interpolation.bind_group"),
+                        layout,
+                        entries: &[
+                            binding_entry(0, &prepared.starts, prepared.start_bytes),
+                            binding_entry(1, &prepared.offsets, prepared.offset_bytes),
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: self.fine_output.as_entire_binding(),
+                            },
+                            binding_entry(3, output, output_bytes),
+                        ],
+                    }),
+                )
+            }
+        };
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("wgpu_nufft.type2.interpolation.pass"),
                 timestamp_writes: {
                     #[cfg(feature = "gpu-profiling")]
                     {
-                        profile.timestamp_writes(Some(2), Some(3))
+                        profile.timestamp_writes(Some(stage_base + 2), Some(stage_base + 3))
                     }
                     #[cfg(not(feature = "gpu-profiling"))]
                     {
@@ -481,7 +651,7 @@ impl Type2GpuPlan {
                     }
                 },
             });
-            pass.set_pipeline(&self.interpolation_pipeline);
+            pass.set_pipeline(interpolation_pipeline);
             pass.set_bind_group(0, &interpolation_bind_group, &[]);
             pass.dispatch_workgroups(
                 interpolation_dispatch.0,
@@ -565,7 +735,12 @@ fn create_compute_pipeline(
         layout: None,
         module: &shader,
         entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        // No shader here declares workgroup memory; skip the zero-fill
+        // prologue that DX12 FXC compiles slowly.
+        compilation_options: wgpu::PipelineCompilationOptions {
+            zero_initialize_workgroup_memory: false,
+            ..Default::default()
+        },
         cache: None,
     })
 }
@@ -757,6 +932,72 @@ fn main(
     }}
 }}
 "#,
+    )
+}
+
+/// F32 interpolation over prepared points in coarse-bin order: one invocation
+/// per point and vector, so neighbouring invocations read overlapping runs of
+/// fine-grid cells. Supports come from the prepared start and df64 offset of
+/// each point: the distance to support cell `start + j` is `(j + hi) + lo`.
+fn generate_binned_interpolation_wgsl(kernel: EsKernel, fine_length: usize) -> String {
+    let width = kernel.width();
+    let sum = (0..width)
+        .map(|offset| {
+            format!(
+                "fine_grid[vector_base + wrap_index(start.x + {offset})] *\n        es_weight(({offset}.0 + support.x) + support.y)"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" +\n        ");
+    format!(
+        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+const FINE_LENGTH: u32 = {fine_length}u;
+const FINE_LENGTH_I32: i32 = {fine_length}i;
+const WIDTH_F32: f32 = {width}.0;
+const BETA: f32 = {beta};
+
+@group(0) @binding(0) var<storage, read> prepared_starts: array<vec4<i32>>;
+@group(0) @binding(1) var<storage, read> prepared_offsets: array<vec2<f32>>;
+@group(0) @binding(2) var<storage, read> fine_grid: array<vec2<f32>>;
+@group(0) @binding(3) var<storage, read_write> output_values: array<vec2<f32>>;
+
+fn es_weight(distance: f32) -> f32 {{
+    let scaled = 2.0 * abs(distance) / WIDTH_F32;
+    let squared = scaled * scaled;
+    if (squared >= 1.0) {{ return 0.0; }}
+    return exp(BETA * (sqrt(max(0.0, 1.0 - squared)) - 1.0));
+}}
+
+fn wrap_index(index: i32) -> u32 {{
+    var wrapped = index;
+    if (wrapped < 0) {{ wrapped = wrapped + FINE_LENGTH_I32; }}
+    if (wrapped >= FINE_LENGTH_I32) {{ wrapped = wrapped - FINE_LENGTH_I32; }}
+    return u32(wrapped);
+}}
+
+@compute @workgroup_size({WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let point_count = arrayLength(&prepared_starts);
+    let total = arrayLength(&output_values);
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    if (wg_flat > (total - 1u) / WORKGROUP_SIZE) {{ return; }}
+    let work_index = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (work_index >= total) {{ return; }}
+
+    let batch_index = work_index / point_count;
+    let slot = work_index - batch_index * point_count;
+    let start = prepared_starts[slot];
+    let support = prepared_offsets[slot];
+    let vector_base = batch_index * FINE_LENGTH;
+    let sum = {sum};
+    output_values[batch_index * point_count + bitcast<u32>(start.w)] = sum;
+}}
+"#,
+        beta = format_wgsl_f32(kernel.beta() as f32),
     )
 }
 
@@ -1291,6 +1532,33 @@ fn binding_entry<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parses and validates generated WGSL without a GPU.
+    fn assert_valid_wgsl(source: &str) {
+        let module = wgpu::naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|error| panic!("{error:?}"));
+    }
+
+    #[test]
+    fn binned_interpolation_sums_contiguous_supports_from_prepared_points() {
+        let kernel = EsKernel::for_tolerance(1.0e-6, 2.0).unwrap();
+        let source = generate_binned_interpolation_wgsl(kernel, 64);
+        assert_valid_wgsl(&source);
+        assert!(!source.contains("df64"));
+        assert_eq!(
+            source
+                .matches("fine_grid[vector_base + wrap_index(")
+                .count(),
+            kernel.width()
+        );
+        assert!(source.contains("output_values[batch_index * point_count + bitcast<u32>(start.w)]"));
+    }
 
     #[test]
     fn predeconvolution_shader_maps_every_mode_order_and_zeros_holes() {
