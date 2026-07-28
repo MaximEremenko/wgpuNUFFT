@@ -19,6 +19,7 @@ use crate::gpu_dispatch::split_workgroups;
 use crate::gpu_point_bins::{PointBinOrder, PointBins};
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::GpuProfileQueryWriter;
+use crate::gpu_recorder::GpuRecorder;
 use crate::kernel::EsKernel;
 
 use super::{
@@ -143,7 +144,7 @@ impl BlockSpread2d {
     pub(super) fn encode_bins(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
         point_bytes: u64,
@@ -151,7 +152,7 @@ impl BlockSpread2d {
     ) -> Result<()> {
         self.bins.encode(
             device,
-            encoder,
+            recorder,
             point_count,
             points,
             point_bytes,
@@ -167,7 +168,7 @@ impl BlockSpread2d {
     pub(super) fn encode_spread(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         strengths: &wgpu::Buffer,
@@ -226,7 +227,7 @@ impl BlockSpread2d {
                 context: "batched type-1 2D strength permutation workgroup count",
             })?;
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.type1_2d.permute_strengths.pass",
             &self.permute_pipeline,
             &permute_bind_group,
@@ -245,7 +246,7 @@ impl BlockSpread2d {
             })?;
         let dispatch = split_workgroups(workgroups, self.max_workgroups_per_dimension)?;
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.type1_2d.tile_gather.pass",
             &self.spread_pipeline,
             &bind_group,

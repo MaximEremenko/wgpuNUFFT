@@ -11,6 +11,7 @@ use crate::gpu_dispatch::split_workgroups;
 use crate::gpu_point_bins::{PointBinOrder, PointBins};
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::{GpuProfileQueryWriter, NufftGpuProfileLayout};
+use crate::gpu_recorder::GpuRecorder;
 use crate::kernel::EsKernel;
 
 const WORKGROUP_SIZE: u32 = 64;
@@ -335,7 +336,7 @@ impl Type2GpuPlan3d {
     pub(crate) fn encode(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
         coefficients: &wgpu::Buffer,
@@ -343,7 +344,7 @@ impl Type2GpuPlan3d {
     ) -> Result<()> {
         self.encode_batch(
             device,
-            encoder,
+            recorder,
             self.batch_capacity,
             point_count,
             points,
@@ -356,7 +357,7 @@ impl Type2GpuPlan3d {
     pub(crate) fn encode_batch(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -365,7 +366,7 @@ impl Type2GpuPlan3d {
     ) -> Result<()> {
         self.encode_impl(
             device,
-            encoder,
+            recorder,
             active_batch,
             point_count,
             points,
@@ -384,7 +385,7 @@ impl Type2GpuPlan3d {
     pub(crate) fn set_points(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
     ) -> Result<()> {
@@ -395,7 +396,7 @@ impl Type2GpuPlan3d {
         if let Interpolation3d::Binned { bins, .. } = &self.interpolation {
             bins.encode(
                 device,
-                encoder,
+                recorder,
                 point_count,
                 points,
                 point_bytes,
@@ -412,7 +413,7 @@ impl Type2GpuPlan3d {
     pub(crate) fn encode_batch_with_recorded_points(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -421,7 +422,7 @@ impl Type2GpuPlan3d {
     ) -> Result<()> {
         self.encode_impl(
             device,
-            encoder,
+            recorder,
             active_batch,
             point_count,
             points,
@@ -474,7 +475,7 @@ impl Type2GpuPlan3d {
     pub(crate) fn encode_profiled(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
         coefficients: &wgpu::Buffer,
@@ -491,7 +492,7 @@ impl Type2GpuPlan3d {
         let layout = self.profile_layout(first_query)?;
         self.encode_impl(
             device,
-            encoder,
+            recorder,
             self.batch_capacity,
             point_count,
             points,
@@ -507,7 +508,7 @@ impl Type2GpuPlan3d {
     fn encode_impl(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -608,7 +609,7 @@ impl Type2GpuPlan3d {
         if let (Interpolation3d::Binned { bins, .. }, true) = (&self.interpolation, record_points) {
             bins.encode(
                 device,
-                encoder,
+                recorder,
                 point_count,
                 points,
                 point_bytes,
@@ -635,36 +636,22 @@ impl Type2GpuPlan3d {
         // The predeconvolution stage starts before the clear.
         #[cfg(feature = "gpu-profiling")]
         if stage_base == 0 {
-            profile.encode_start_marker(encoder);
+            profile.encode_start_marker(recorder);
         }
-        encoder.clear_buffer(&self.fine_input, 0, None);
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wgpu_nufft.type2_3d.predeconvolution.pass"),
-                timestamp_writes: {
-                    #[cfg(feature = "gpu-profiling")]
-                    {
-                        profile.timestamp_writes(None, Some(stage_base + 1))
-                    }
-                    #[cfg(not(feature = "gpu-profiling"))]
-                    {
-                        None
-                    }
-                },
-            });
-            pass.set_pipeline(&self.predeconvolution_pipeline);
-            pass.set_bind_group(0, &predeconvolution_bind_group, &[]);
-            pass.dispatch_workgroups(
-                predeconvolution_dispatch.0,
-                predeconvolution_dispatch.1,
-                predeconvolution_dispatch.2,
-            );
-        }
+        recorder.clear_buffer(&self.fine_input, 0, None);
+        recorder.dispatch_profiled(
+            "wgpu_nufft.type2_3d.predeconvolution.pass",
+            &self.predeconvolution_pipeline,
+            &predeconvolution_bind_group,
+            predeconvolution_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(stage_base + 1)),
+        );
 
         self.fft
             .execute_views(
                 device,
-                encoder,
+                recorder.encoder(),
                 BufferView::whole(&self.fine_input),
                 BufferView::whole(&self.fine_output),
             )
@@ -714,28 +701,14 @@ impl Type2GpuPlan3d {
                 )
             }
         };
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wgpu_nufft.type2_3d.interpolation.pass"),
-                timestamp_writes: {
-                    #[cfg(feature = "gpu-profiling")]
-                    {
-                        profile.timestamp_writes(Some(stage_base + 2), Some(stage_base + 3))
-                    }
-                    #[cfg(not(feature = "gpu-profiling"))]
-                    {
-                        None
-                    }
-                },
-            });
-            pass.set_pipeline(interpolation_pipeline);
-            pass.set_bind_group(0, &interpolation_bind_group, &[]);
-            pass.dispatch_workgroups(
-                interpolation_dispatch.0,
-                interpolation_dispatch.1,
-                interpolation_dispatch.2,
-            );
-        }
+        recorder.dispatch_profiled(
+            "wgpu_nufft.type2_3d.interpolation.pass",
+            interpolation_pipeline,
+            &interpolation_bind_group,
+            interpolation_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(Some(stage_base + 2), Some(stage_base + 3)),
+        );
         Ok(())
     }
 

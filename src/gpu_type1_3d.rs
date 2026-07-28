@@ -12,6 +12,7 @@ use crate::gpu::max_supported_workgroup_size;
 use crate::gpu_dispatch::split_workgroups;
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::{GpuProfileQueryWriter, NufftGpuProfileLayout};
+use crate::gpu_recorder::GpuRecorder;
 use crate::gpu_scan::GpuExclusiveScanU32;
 use crate::gpu_type1_scratch::Type1ScratchBuffers;
 use crate::kernel::EsKernel;
@@ -315,18 +316,18 @@ impl Type1GpuPlan3d {
     pub(crate) fn encode_spread(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
     ) -> Result<()> {
-        self.encode_spread_batch(device, encoder, 1, point_count, points, strengths)
+        self.encode_spread_batch(device, recorder, 1, point_count, points, strengths)
     }
 
     pub(crate) fn encode_spread_batch(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -335,7 +336,7 @@ impl Type1GpuPlan3d {
         self.validate_active_batch(active_batch)?;
         self.encode_spread_impl(
             device,
-            encoder,
+            recorder,
             active_batch,
             point_count,
             points,
@@ -359,7 +360,7 @@ impl Type1GpuPlan3d {
     pub(crate) fn encode(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
@@ -367,7 +368,7 @@ impl Type1GpuPlan3d {
     ) -> Result<()> {
         self.encode_batch(
             device,
-            encoder,
+            recorder,
             self.batch_capacity,
             point_count,
             points,
@@ -380,7 +381,7 @@ impl Type1GpuPlan3d {
     pub(crate) fn encode_batch(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -390,7 +391,7 @@ impl Type1GpuPlan3d {
         self.validate_active_batch(active_batch)?;
         self.encode_impl(
             device,
-            encoder,
+            recorder,
             active_batch,
             point_count,
             points,
@@ -409,7 +410,7 @@ impl Type1GpuPlan3d {
     pub(crate) fn set_points(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
     ) -> Result<()> {
@@ -417,7 +418,7 @@ impl Type1GpuPlan3d {
         if let (Spread3d::Block(block), true) = (&self.spread, point_count > 0) {
             block.encode_bins(
                 device,
-                encoder,
+                recorder,
                 point_count,
                 points,
                 point_bytes,
@@ -434,7 +435,7 @@ impl Type1GpuPlan3d {
     pub(crate) fn encode_batch_with_recorded_points(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -444,7 +445,7 @@ impl Type1GpuPlan3d {
         self.validate_active_batch(active_batch)?;
         self.encode_impl(
             device,
-            encoder,
+            recorder,
             active_batch,
             point_count,
             points,
@@ -479,7 +480,7 @@ impl Type1GpuPlan3d {
     pub(crate) fn encode_profiled(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
@@ -499,7 +500,7 @@ impl Type1GpuPlan3d {
             })?;
         self.encode_impl(
             device,
-            encoder,
+            recorder,
             self.batch_capacity,
             point_count,
             points,
@@ -515,7 +516,7 @@ impl Type1GpuPlan3d {
     fn encode_impl(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -560,7 +561,7 @@ impl Type1GpuPlan3d {
 
         self.encode_spread_impl(
             device,
-            encoder,
+            recorder,
             active_batch,
             point_count,
             points,
@@ -569,11 +570,11 @@ impl Type1GpuPlan3d {
             #[cfg(feature = "gpu-profiling")]
             profile,
         )?;
-        self.encode_fft(device, encoder)?;
+        self.encode_fft(device, recorder)?;
         let deconvolution_dispatch =
             dispatch_for_elements(output_elements, self.max_workgroups_per_dimension)?;
         self.encode_deconvolution(
-            encoder,
+            recorder,
             &output_bind_group,
             deconvolution_dispatch,
             #[cfg(feature = "gpu-profiling")]
@@ -586,7 +587,7 @@ impl Type1GpuPlan3d {
     fn encode_spread_impl(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -595,7 +596,7 @@ impl Type1GpuPlan3d {
         #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
         if point_count == 0 {
-            encoder.clear_buffer(self.fine_grid_buffer(), 0, None);
+            recorder.clear_buffer(self.fine_grid_buffer(), 0, None);
             return Ok(());
         }
 
@@ -631,7 +632,7 @@ impl Type1GpuPlan3d {
                 if record_points {
                     block.encode_bins(
                         device,
-                        encoder,
+                        recorder,
                         point_count,
                         points,
                         point_bytes,
@@ -641,7 +642,7 @@ impl Type1GpuPlan3d {
                 }
                 block.encode_spread(
                     device,
-                    encoder,
+                    recorder,
                     active_batch,
                     point_count,
                     strengths,
@@ -654,7 +655,7 @@ impl Type1GpuPlan3d {
             }
             Spread3d::PerCell(per_cell) => per_cell.encode(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -671,7 +672,7 @@ impl Type1GpuPlan3d {
             )?,
         }
         if active_batch < self.batch_capacity {
-            encoder.clear_buffer(
+            recorder.clear_buffer(
                 &self.fine_input,
                 active_fine_bytes,
                 Some(self.fine_input.size() - active_fine_bytes),
@@ -680,11 +681,11 @@ impl Type1GpuPlan3d {
         Ok(())
     }
 
-    fn encode_fft(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) -> Result<()> {
+    fn encode_fft(&self, device: &wgpu::Device, recorder: &mut GpuRecorder<'_>) -> Result<()> {
         self.fft
             .execute_views(
                 device,
-                encoder,
+                recorder.encoder(),
                 BufferView::whole(self.fine_grid_buffer()),
                 BufferView::whole(&self.fine_output),
             )
@@ -696,13 +697,13 @@ impl Type1GpuPlan3d {
 
     fn encode_deconvolution(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         bind_group: &wgpu::BindGroup,
         dispatch: (u32, u32, u32),
         #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) {
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.type1_3d.deconvolution.pass",
             &self.deconvolution_pipeline,
             bind_group,
@@ -862,7 +863,7 @@ impl PerCellSpread3d {
     fn encode(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -982,11 +983,11 @@ impl PerCellSpread3d {
         let gather_dispatch = split_workgroups(gather_workgroups, max_workgroups_per_dimension)?;
 
         #[cfg(feature = "gpu-profiling")]
-        profile.encode_start_marker(encoder);
-        encoder.clear_buffer(bin_counts, 0, None);
-        encoder.clear_buffer(bin_cursors, 0, None);
+        profile.encode_start_marker(recorder);
+        recorder.clear_buffer(bin_counts, 0, None);
+        recorder.clear_buffer(bin_cursors, 0, None);
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.type1_3d.bin_count.pass",
             &self.count_pipeline,
             &count_bind_group,
@@ -995,9 +996,9 @@ impl PerCellSpread3d {
             profile.timestamp_writes(None, Some(1)),
         );
         self.prefix_scan
-            .encode(device, encoder, bin_counts, bin_offsets)?;
+            .encode(device, recorder, bin_counts, bin_offsets)?;
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.type1_3d.bin_terminal.pass",
             &self.terminal_pipeline,
             &terminal_bind_group,
@@ -1006,7 +1007,7 @@ impl PerCellSpread3d {
             profile.timestamp_writes(None, Some(2)),
         );
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.type1_3d.bin_scatter.pass",
             &self.scatter_pipeline,
             &scatter_bind_group,
@@ -1015,7 +1016,7 @@ impl PerCellSpread3d {
             profile.timestamp_writes(None, Some(3)),
         );
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.type1_3d.bin_sort.pass",
             &self.sort_pipeline,
             &sort_bind_group,
@@ -1024,7 +1025,7 @@ impl PerCellSpread3d {
             profile.timestamp_writes(None, Some(4)),
         );
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.type1_3d.spread_gather.pass",
             &self.gather_pipeline,
             &gather_bind_group,
@@ -1222,7 +1223,7 @@ pub(crate) fn create_compute_pipeline(
 }
 
 pub(crate) fn encode_pass(
-    encoder: &mut wgpu::CommandEncoder,
+    recorder: &mut GpuRecorder<'_>,
     label: &str,
     pipeline: &wgpu::ComputePipeline,
     bind_group: &wgpu::BindGroup,
@@ -1231,22 +1232,14 @@ pub(crate) fn encode_pass(
         wgpu::ComputePassTimestampWrites<'_>,
     >,
 ) {
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some(label),
-        timestamp_writes: {
-            #[cfg(feature = "gpu-profiling")]
-            {
-                timestamp_writes
-            }
-            #[cfg(not(feature = "gpu-profiling"))]
-            {
-                None
-            }
-        },
-    });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, bind_group, &[]);
-    pass.dispatch_workgroups(dispatch.0, dispatch.1, dispatch.2);
+    recorder.dispatch_profiled(
+        label,
+        pipeline,
+        bind_group,
+        dispatch,
+        #[cfg(feature = "gpu-profiling")]
+        timestamp_writes,
+    );
 }
 
 pub(crate) fn generate_position_wgsl(fine_shape: [usize; DIMENSIONS]) -> String {

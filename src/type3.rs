@@ -1,5 +1,6 @@
 use crate::config::{NufftSign, DEFAULT_EPS, DEFAULT_SIGMA};
 use crate::error::{NufftError, Result};
+use crate::gpu_recorder::GpuRecorder;
 use crate::gpu_type3::GpuType3Plan;
 use crate::kernel::EsKernel;
 use crate::Complex64;
@@ -512,7 +513,7 @@ impl NufftType3Plan {
             })?;
         gpu.encode_batch(
             device,
-            encoder,
+            &mut GpuRecorder::new(encoder),
             active_batch,
             source_count,
             source_points,

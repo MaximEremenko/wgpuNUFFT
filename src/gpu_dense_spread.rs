@@ -16,6 +16,7 @@ use std::sync::Mutex;
 
 use crate::error::{NufftError, Result};
 use crate::gpu_dispatch::split_workgroups;
+use crate::gpu_recorder::GpuRecorder;
 use crate::gpu_type1_3d::{
     binding_entry, checked_buffer_size, create_compute_pipeline, encode_pass, format_wgsl_f32,
     validate_binding_limit, validate_buffer_limit,
@@ -172,7 +173,7 @@ impl DenseSpread {
     pub(crate) fn encode_spread_batch(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -193,7 +194,7 @@ impl DenseSpread {
         let active_fine_bytes =
             checked_buffer_size("dense-spread fine grid", active_cells, COMPLEX_F32_BYTES)?;
         if point_count == 0 {
-            encoder.clear_buffer(&self.fine_grid, 0, Some(active_fine_bytes));
+            recorder.clear_buffer(&self.fine_grid, 0, Some(active_fine_bytes));
             return Ok(());
         }
         let coordinates =
@@ -267,7 +268,7 @@ impl DenseSpread {
                 context: "dense-spread reduction workgroup count",
             })?;
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.dense_spread.spread.pass",
             &self.spread_pipeline,
             &spread_bind_group,
@@ -276,7 +277,7 @@ impl DenseSpread {
             None,
         );
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.dense_spread.reduce.pass",
             &self.reduce_pipeline,
             &reduce_bind_group,

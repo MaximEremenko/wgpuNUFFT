@@ -9,6 +9,7 @@ use crate::gpu_3d::Type2GpuPlan3d;
 use crate::gpu_nd::Type2GpuPlanNd;
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::NufftGpuProfileLayout;
+use crate::gpu_recorder::GpuRecorder;
 use crate::gpu_type1::Type1GpuPlan;
 use crate::gpu_type1_2d::{Type1Gather2d, Type1GpuPlan2d};
 use crate::gpu_type1_3d::{Type1Gather3d, Type1GpuPlan3d};
@@ -37,7 +38,7 @@ impl Type1GpuExecution {
     fn encode_batch(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -47,7 +48,7 @@ impl Type1GpuExecution {
         match self {
             Self::OneD(plan) => plan.encode_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -56,7 +57,7 @@ impl Type1GpuExecution {
             ),
             Self::TwoD(plan) => plan.encode_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -65,7 +66,7 @@ impl Type1GpuExecution {
             ),
             Self::ThreeD(plan) => plan.encode_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -74,7 +75,7 @@ impl Type1GpuExecution {
             ),
             Self::Nd(plan) => plan.encode_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -87,14 +88,14 @@ impl Type1GpuExecution {
     fn set_points(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
     ) -> Result<()> {
         match self {
-            Self::OneD(plan) => plan.set_points(device, encoder, point_count, points),
-            Self::TwoD(plan) => plan.set_points(device, encoder, point_count, points),
-            Self::ThreeD(plan) => plan.set_points(device, encoder, point_count, points),
+            Self::OneD(plan) => plan.set_points(device, recorder, point_count, points),
+            Self::TwoD(plan) => plan.set_points(device, recorder, point_count, points),
+            Self::ThreeD(plan) => plan.set_points(device, recorder, point_count, points),
             Self::Nd(_) => Ok(()),
         }
     }
@@ -103,7 +104,7 @@ impl Type1GpuExecution {
     fn encode_batch_with_recorded_points(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -113,7 +114,7 @@ impl Type1GpuExecution {
         match self {
             Self::OneD(plan) => plan.encode_batch_with_recorded_points(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -122,7 +123,7 @@ impl Type1GpuExecution {
             ),
             Self::TwoD(plan) => plan.encode_batch_with_recorded_points(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -131,7 +132,7 @@ impl Type1GpuExecution {
             ),
             Self::ThreeD(plan) => plan.encode_batch_with_recorded_points(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -140,7 +141,7 @@ impl Type1GpuExecution {
             ),
             Self::Nd(_) => self.encode_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -155,7 +156,7 @@ impl Type1GpuExecution {
     fn encode_profiled(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
@@ -166,7 +167,7 @@ impl Type1GpuExecution {
         match self {
             Self::OneD(plan) => plan.encode_profiled(
                 device,
-                encoder,
+                recorder,
                 point_count,
                 points,
                 strengths,
@@ -176,7 +177,7 @@ impl Type1GpuExecution {
             ),
             Self::TwoD(plan) => plan.encode_profiled(
                 device,
-                encoder,
+                recorder,
                 point_count,
                 points,
                 strengths,
@@ -186,7 +187,7 @@ impl Type1GpuExecution {
             ),
             Self::ThreeD(plan) => plan.encode_profiled(
                 device,
-                encoder,
+                recorder,
                 point_count,
                 points,
                 strengths,
@@ -196,7 +197,7 @@ impl Type1GpuExecution {
             ),
             Self::Nd(plan) => plan.encode_profiled(
                 device,
-                encoder,
+                recorder,
                 point_count,
                 points,
                 strengths,
@@ -230,7 +231,7 @@ impl Type2GpuExecution {
     fn encode_batch(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -240,7 +241,7 @@ impl Type2GpuExecution {
         match self {
             Self::OneD(plan) => plan.encode_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -249,7 +250,7 @@ impl Type2GpuExecution {
             ),
             Self::TwoD(plan) => plan.encode_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -258,7 +259,7 @@ impl Type2GpuExecution {
             ),
             Self::ThreeD(plan) => plan.encode_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -267,7 +268,7 @@ impl Type2GpuExecution {
             ),
             Self::Nd(plan) => plan.encode_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -280,14 +281,14 @@ impl Type2GpuExecution {
     fn set_points(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
     ) -> Result<()> {
         match self {
-            Self::OneD(plan) => plan.set_points(device, encoder, point_count, points),
-            Self::TwoD(plan) => plan.set_points(device, encoder, point_count, points),
-            Self::ThreeD(plan) => plan.set_points(device, encoder, point_count, points),
+            Self::OneD(plan) => plan.set_points(device, recorder, point_count, points),
+            Self::TwoD(plan) => plan.set_points(device, recorder, point_count, points),
+            Self::ThreeD(plan) => plan.set_points(device, recorder, point_count, points),
             Self::Nd(_) => Ok(()),
         }
     }
@@ -296,7 +297,7 @@ impl Type2GpuExecution {
     fn encode_batch_with_recorded_points(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -306,7 +307,7 @@ impl Type2GpuExecution {
         match self {
             Self::OneD(plan) => plan.encode_batch_with_recorded_points(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -315,7 +316,7 @@ impl Type2GpuExecution {
             ),
             Self::TwoD(plan) => plan.encode_batch_with_recorded_points(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -324,7 +325,7 @@ impl Type2GpuExecution {
             ),
             Self::ThreeD(plan) => plan.encode_batch_with_recorded_points(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -333,7 +334,7 @@ impl Type2GpuExecution {
             ),
             Self::Nd(_) => self.encode_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -362,7 +363,7 @@ impl Type2GpuExecution {
     fn encode_profiled(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
         coefficients: &wgpu::Buffer,
@@ -373,7 +374,7 @@ impl Type2GpuExecution {
         match self {
             Self::OneD(plan) => plan.encode_profiled(
                 device,
-                encoder,
+                recorder,
                 point_count,
                 points,
                 coefficients,
@@ -383,7 +384,7 @@ impl Type2GpuExecution {
             ),
             Self::TwoD(plan) => plan.encode_profiled(
                 device,
-                encoder,
+                recorder,
                 point_count,
                 points,
                 coefficients,
@@ -393,7 +394,7 @@ impl Type2GpuExecution {
             ),
             Self::ThreeD(plan) => plan.encode_profiled(
                 device,
-                encoder,
+                recorder,
                 point_count,
                 points,
                 coefficients,
@@ -403,7 +404,7 @@ impl Type2GpuExecution {
             ),
             Self::Nd(plan) => plan.encode_profiled(
                 device,
-                encoder,
+                recorder,
                 point_count,
                 points,
                 coefficients,
@@ -916,7 +917,7 @@ impl NufftPlan {
             })?;
         gpu.encode_batch(
             device,
-            encoder,
+            &mut GpuRecorder::new(encoder),
             active_batch,
             point_count,
             points,
@@ -960,7 +961,7 @@ impl NufftPlan {
                         reason: "construct the plan with NufftPlan::type1_gpu",
                     })?;
                 self.validate_point_buffer("type-1 point", point_count, points)?;
-                gpu.set_points(device, encoder, point_count, points)?;
+                gpu.set_points(device, &mut GpuRecorder::new(encoder), point_count, points)?;
             }
             NufftKind::Type2 => {
                 let gpu = self
@@ -971,7 +972,7 @@ impl NufftPlan {
                         reason: "construct the plan with NufftPlan::type2_gpu",
                     })?;
                 self.validate_point_buffer("type-2 point", point_count, points)?;
-                gpu.set_points(device, encoder, point_count, points)?;
+                gpu.set_points(device, &mut GpuRecorder::new(encoder), point_count, points)?;
             }
         }
         self.remember_points(point_count, points);
@@ -1020,7 +1021,7 @@ impl NufftPlan {
         let points = self.recorded_points("type-1")?;
         gpu.encode_batch_with_recorded_points(
             device,
-            encoder,
+            &mut GpuRecorder::new(encoder),
             active_batch,
             points.count,
             &points.buffer,
@@ -1067,7 +1068,7 @@ impl NufftPlan {
             })?;
         let layout = gpu.encode_profiled(
             device,
-            encoder,
+            &mut GpuRecorder::new(encoder),
             point_count,
             points,
             strengths,
@@ -1182,6 +1183,30 @@ impl NufftPlan {
         coefficients: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
+        self.record_type2_gpu_batch(
+            device,
+            &mut GpuRecorder::new(encoder),
+            point_count,
+            active_batch,
+            points,
+            coefficients,
+            output,
+        )
+    }
+
+    /// [`Self::encode_type2_gpu_batch`] recorded into `recorder`'s shared
+    /// compute pass.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_type2_gpu_batch(
+        &self,
+        device: &wgpu::Device,
+        recorder: &mut GpuRecorder<'_>,
+        point_count: usize,
+        active_batch: usize,
+        points: &wgpu::Buffer,
+        coefficients: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+    ) -> Result<()> {
         if self.kind != NufftKind::Type2 {
             return Err(NufftError::GpuExecutionUnavailable {
                 kind: "type-2",
@@ -1198,7 +1223,7 @@ impl NufftPlan {
             })?;
         gpu.encode_batch(
             device,
-            encoder,
+            recorder,
             active_batch,
             point_count,
             points,
@@ -1251,7 +1276,7 @@ impl NufftPlan {
         let points = self.recorded_points("type-2")?;
         gpu.encode_batch_with_recorded_points(
             device,
-            encoder,
+            &mut GpuRecorder::new(encoder),
             active_batch,
             points.count,
             &points.buffer,
@@ -1292,7 +1317,7 @@ impl NufftPlan {
             })?;
         let layout = gpu.encode_profiled(
             device,
-            encoder,
+            &mut GpuRecorder::new(encoder),
             point_count,
             points,
             coefficients,

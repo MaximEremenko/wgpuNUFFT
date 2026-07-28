@@ -25,6 +25,7 @@ use crate::gpu_nd::{
 };
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::NufftGpuProfileLayout;
+use crate::gpu_recorder::GpuRecorder;
 use crate::gpu_scan::GpuExclusiveScanU32;
 use crate::gpu_type1_scratch::Type1ScratchBuffers;
 use crate::kernel::EsKernel;
@@ -286,7 +287,7 @@ impl Type1GpuPlanNd {
     pub(crate) fn encode_batch(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -324,7 +325,7 @@ impl Type1GpuPlanNd {
         // run so the external output is fully overwritten.
         self.encode_spread_batch(
             device,
-            encoder,
+            recorder,
             active_batch,
             point_count,
             points,
@@ -334,7 +335,7 @@ impl Type1GpuPlanNd {
         self.fft
             .execute_views(
                 device,
-                encoder,
+                recorder.encoder(),
                 BufferView::whole(&self.fine_input),
                 BufferView::whole(&self.fine_output),
             )
@@ -366,19 +367,11 @@ impl Type1GpuPlanNd {
                 binding_entry(2, output, output_bytes),
             ],
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wgpu_nufft.type1_nd.deconvolution.pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.deconvolution_pipeline);
-            pass.set_bind_group(0, &deconvolution_bind_group, &[]);
-            pass.dispatch_workgroups(
-                deconvolution_dispatch.0,
-                deconvolution_dispatch.1,
-                deconvolution_dispatch.2,
-            );
-        }
+        recorder.dispatch(
+            &self.deconvolution_pipeline,
+            &deconvolution_bind_group,
+            deconvolution_dispatch,
+        );
         Ok(())
     }
 
@@ -387,7 +380,7 @@ impl Type1GpuPlanNd {
     pub(crate) fn encode_profiled(
         &self,
         _device: &wgpu::Device,
-        _encoder: &mut wgpu::CommandEncoder,
+        _recorder: &mut GpuRecorder<'_>,
         _point_count: usize,
         _points: &wgpu::Buffer,
         _strengths: &wgpu::Buffer,
@@ -413,7 +406,7 @@ impl Type1GpuPlanNd {
     pub(crate) fn encode_spread_batch(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -426,12 +419,12 @@ impl Type1GpuPlanNd {
             });
         }
         if point_count == 0 {
-            encoder.clear_buffer(&self.fine_input, 0, None);
+            recorder.clear_buffer(&self.fine_input, 0, None);
             return Ok(());
         }
         self.encode_spread(
             device,
-            encoder,
+            recorder,
             active_batch,
             point_count,
             points,
@@ -452,7 +445,7 @@ impl Type1GpuPlanNd {
     fn encode_spread(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -505,8 +498,8 @@ impl Type1GpuPlanNd {
             self.max_workgroups_per_dimension,
         )?;
 
-        encoder.clear_buffer(&self.scratch.bin_counts, 0, None);
-        encoder.clear_buffer(&self.scratch.bin_cursors, 0, None);
+        recorder.clear_buffer(&self.scratch.bin_counts, 0, None);
+        recorder.clear_buffer(&self.scratch.bin_cursors, 0, None);
 
         let count_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.type1_nd.bin_count.bind_group"),
@@ -519,19 +512,11 @@ impl Type1GpuPlanNd {
                 },
             ],
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wgpu_nufft.type1_nd.bin_count.pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.count_pipeline);
-            pass.set_bind_group(0, &count_bind_group, &[]);
-            pass.dispatch_workgroups(point_dispatch.0, point_dispatch.1, point_dispatch.2);
-        }
+        recorder.dispatch(&self.count_pipeline, &count_bind_group, point_dispatch);
 
         self.prefix_scan.encode(
             device,
-            encoder,
+            recorder,
             &self.scratch.bin_counts,
             &self.scratch.bin_offsets,
         )?;
@@ -550,15 +535,7 @@ impl Type1GpuPlanNd {
                 },
             ],
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wgpu_nufft.type1_nd.bin_terminal.pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.terminal_pipeline);
-            pass.set_bind_group(0, &terminal_bind_group, &[]);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
+        recorder.dispatch(&self.terminal_pipeline, &terminal_bind_group, (1, 1, 1));
 
         let scatter_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.type1_nd.bin_scatter.bind_group"),
@@ -576,15 +553,7 @@ impl Type1GpuPlanNd {
                 binding_entry(3, &sorted_indices, index_bytes),
             ],
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wgpu_nufft.type1_nd.bin_scatter.pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.scatter_pipeline);
-            pass.set_bind_group(0, &scatter_bind_group, &[]);
-            pass.dispatch_workgroups(point_dispatch.0, point_dispatch.1, point_dispatch.2);
-        }
+        recorder.dispatch(&self.scatter_pipeline, &scatter_bind_group, point_dispatch);
 
         let sort_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.type1_nd.bin_sort.bind_group"),
@@ -597,19 +566,7 @@ impl Type1GpuPlanNd {
                 binding_entry(1, &sorted_indices, index_bytes),
             ],
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wgpu_nufft.type1_nd.bin_sort.pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.sort_pipeline);
-            pass.set_bind_group(0, &sort_bind_group, &[]);
-            pass.dispatch_workgroups(
-                self.sort_dispatch.0,
-                self.sort_dispatch.1,
-                self.sort_dispatch.2,
-            );
-        }
+        recorder.dispatch(&self.sort_pipeline, &sort_bind_group, self.sort_dispatch);
 
         let vector_blocks = self.batch_capacity.div_ceil(VECTOR_BLOCK_SIZE);
         let gather_elements = checked_product(
@@ -642,15 +599,7 @@ impl Type1GpuPlanNd {
                 },
             ],
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wgpu_nufft.type1_nd.spread_gather.pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.gather_pipeline);
-            pass.set_bind_group(0, &gather_bind_group, &[]);
-            pass.dispatch_workgroups(gather_dispatch.0, gather_dispatch.1, gather_dispatch.2);
-        }
+        recorder.dispatch(&self.gather_pipeline, &gather_bind_group, gather_dispatch);
 
         // The gather derives active_batch from the bound strength size; the
         // fine-grid tail beyond active_batch may hold stale writes, so clear it
@@ -665,7 +614,7 @@ impl Type1GpuPlanNd {
                 )?,
                 self.precision.complex_size_bytes(),
             )?;
-            encoder.clear_buffer(&self.fine_input, active_fine_bytes, None);
+            recorder.clear_buffer(&self.fine_input, active_fine_bytes, None);
         }
         Ok(())
     }

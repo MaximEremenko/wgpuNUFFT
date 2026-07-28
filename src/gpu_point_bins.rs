@@ -33,6 +33,7 @@ use crate::error::{NufftError, Result};
 use crate::gpu_dispatch::split_workgroups;
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::GpuProfileQueryWriter;
+use crate::gpu_recorder::GpuRecorder;
 use crate::gpu_scan::GpuExclusiveScanU32;
 use crate::gpu_type1_3d::{
     binding_entry, checked_buffer_size, create_compute_pipeline, encode_pass, format_wgsl_f32,
@@ -363,7 +364,7 @@ impl PointBins {
     pub(crate) fn encode(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
         point_bytes: u64,
@@ -405,10 +406,10 @@ impl PointBins {
             ],
         });
         #[cfg(feature = "gpu-profiling")]
-        profile.encode_start_marker(encoder);
-        encoder.clear_buffer(bin_counts, 0, None);
+        profile.encode_start_marker(recorder);
+        recorder.clear_buffer(bin_counts, 0, None);
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.point_bins.count.pass",
             &self.count_pipeline,
             &count_bind_group,
@@ -419,7 +420,7 @@ impl PointBins {
                 .flatten(),
         );
         self.prefix_scan
-            .encode(device, encoder, bin_counts, bin_offsets)?;
+            .encode(device, recorder, bin_counts, bin_offsets)?;
 
         if let Some(fused) = fused {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -434,7 +435,7 @@ impl PointBins {
                 ],
             });
             encode_pass(
-                encoder,
+                recorder,
                 "wgpu_nufft.point_bins.scatter_prepare.pass",
                 &fused.pipeline,
                 &bind_group,
@@ -478,7 +479,7 @@ impl PointBins {
             entries: &prepare_entries,
         });
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.point_bins.scatter.pass",
             &indexed.scatter_pipeline,
             &scatter_bind_group,
@@ -498,7 +499,7 @@ impl PointBins {
                 ],
             });
             encode_pass(
-                encoder,
+                recorder,
                 "wgpu_nufft.point_bins.sort.pass",
                 &sort.pipeline,
                 &sort_bind_group,
@@ -508,7 +509,7 @@ impl PointBins {
             );
         }
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.point_bins.prepare.pass",
             &indexed.prepare_pipeline,
             &prepare_bind_group,

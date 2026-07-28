@@ -24,6 +24,7 @@ mod gpu_nd;
 mod gpu_point_bins;
 #[cfg(feature = "gpu-profiling")]
 mod gpu_profile;
+mod gpu_recorder;
 mod gpu_scan;
 mod gpu_type1;
 mod gpu_type1_2d;

@@ -2,6 +2,7 @@ use std::num::NonZeroU64;
 
 use crate::error::{NufftError, Result};
 use crate::gpu_dispatch::split_workgroups;
+use crate::gpu_recorder::GpuRecorder;
 
 const WORKGROUP_SIZE: u32 = 256;
 const ITEMS_PER_INVOCATION: u32 = 8;
@@ -160,7 +161,7 @@ impl GpuExclusiveScanU32 {
     pub(crate) fn encode(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
@@ -210,13 +211,7 @@ impl GpuExclusiveScanU32 {
                     binding_entry(2, &self.block_sums[level_index], block_sum_bytes),
                 ],
             });
-            encode_pass(
-                encoder,
-                "wgpu_nufft.scan.block.pass",
-                &self.block_pipeline,
-                &bind_group,
-                level.block_dispatch,
-            );
+            recorder.dispatch(&self.block_pipeline, &bind_group, level.block_dispatch);
         }
 
         for level_index in (0..self.levels.len().saturating_sub(1)).rev() {
@@ -238,13 +233,7 @@ impl GpuExclusiveScanU32 {
                     binding_entry(1, offsets, offset_bytes),
                 ],
             });
-            encode_pass(
-                encoder,
-                "wgpu_nufft.scan.fixup.pass",
-                &self.fixup_pipeline,
-                &bind_group,
-                level.fixup_dispatch,
-            );
+            recorder.dispatch(&self.fixup_pipeline, &bind_group, level.fixup_dispatch);
         }
         Ok(())
     }
@@ -280,22 +269,6 @@ fn create_compute_pipeline(
         },
         cache: None,
     })
-}
-
-fn encode_pass(
-    encoder: &mut wgpu::CommandEncoder,
-    label: &str,
-    pipeline: &wgpu::ComputePipeline,
-    bind_group: &wgpu::BindGroup,
-    dispatch: (u32, u32, u32),
-) {
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some(label),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(pipeline);
-    pass.set_bind_group(0, bind_group, &[]);
-    pass.dispatch_workgroups(dispatch.0, dispatch.1, dispatch.2);
 }
 
 fn binding_entry<'a>(
@@ -672,7 +645,8 @@ mod tests {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("wgpu_nufft.scan.test.encoder"),
         });
-        scan.encode(device, &mut encoder, &input, &output).unwrap();
+        scan.encode(device, &mut GpuRecorder::new(&mut encoder), &input, &output)
+            .unwrap();
         encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output_bytes);
         let submission = queue.submit([encoder.finish()]);
         let slice = readback.slice(..);

@@ -18,6 +18,7 @@ use crate::gpu_dispatch::split_workgroups;
 use crate::gpu_point_bins::{PointBinOrder, PointBins};
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::GpuProfileQueryWriter;
+use crate::gpu_recorder::GpuRecorder;
 use crate::kernel::EsKernel;
 
 use super::{
@@ -122,7 +123,7 @@ impl SegmentGather1d {
     pub(super) fn encode_bins(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
         point_bytes: u64,
@@ -130,7 +131,7 @@ impl SegmentGather1d {
     ) -> Result<()> {
         self.bins.encode(
             device,
-            encoder,
+            recorder,
             point_count,
             points,
             point_bytes,
@@ -146,7 +147,7 @@ impl SegmentGather1d {
     pub(super) fn encode_spread(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         strengths: &wgpu::Buffer,
@@ -214,7 +215,7 @@ impl SegmentGather1d {
                 context: "batched type-1 segment-gather workgroup count",
             })?;
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.type1.permute_strengths.pass",
             &self.permute_pipeline,
             &permute_bind_group,
@@ -223,7 +224,7 @@ impl SegmentGather1d {
             None,
         );
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.type1.segment_gather.pass",
             &self.gather_pipeline,
             &gather_bind_group,

@@ -13,6 +13,7 @@ use crate::error::{NufftError, Result};
 use crate::gpu_dispatch::split_workgroups;
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::GpuProfileQueryWriter;
+use crate::gpu_recorder::GpuRecorder;
 use crate::kernel::EsKernel;
 
 use super::{
@@ -166,7 +167,7 @@ impl BlockSpread3d {
     pub(super) fn encode_bins(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
         point_bytes: u64,
@@ -174,7 +175,7 @@ impl BlockSpread3d {
     ) -> Result<()> {
         self.bins.encode(
             device,
-            encoder,
+            recorder,
             point_count,
             points,
             point_bytes,
@@ -190,7 +191,7 @@ impl BlockSpread3d {
     pub(super) fn encode_spread(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         strengths: &wgpu::Buffer,
@@ -223,7 +224,7 @@ impl BlockSpread3d {
             })?;
         let dispatch = split_workgroups(workgroups, self.max_workgroups_per_dimension)?;
         encode_pass(
-            encoder,
+            recorder,
             "wgpu_nufft.type1_3d.block_spread.pass",
             &self.spread_pipeline,
             &bind_group,

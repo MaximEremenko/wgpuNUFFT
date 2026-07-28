@@ -6,6 +6,7 @@ use crate::error::{NufftError, Result};
 use crate::gpu::max_supported_workgroup_size;
 use crate::gpu_dense_spread::DenseSpread;
 use crate::gpu_dispatch::split_workgroups;
+use crate::gpu_recorder::GpuRecorder;
 use crate::gpu_type1::Type1GpuPlan;
 use crate::gpu_type1_2d::{Type1Gather2d, Type1GpuPlan2d};
 use crate::gpu_type1_3d::{Type1Gather3d, Type1GpuPlan3d};
@@ -277,7 +278,7 @@ impl GpuType3Plan {
     pub(crate) fn encode(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         source_count: usize,
         source_points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
@@ -287,7 +288,7 @@ impl GpuType3Plan {
     ) -> Result<()> {
         self.encode_batch(
             device,
-            encoder,
+            recorder,
             self.batch_capacity,
             source_count,
             source_points,
@@ -302,7 +303,7 @@ impl GpuType3Plan {
     pub(crate) fn encode_batch(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         source_count: usize,
         source_points: &wgpu::Buffer,
@@ -408,18 +409,12 @@ impl GpuType3Plan {
                     binding_entry(3, &scratch.prephased_strengths, strength_bytes),
                 ],
             });
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wgpu_nufft.type3.source_rescale_prephase.pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.source_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(source_dispatch.0, source_dispatch.1, source_dispatch.2);
+            recorder.dispatch(&self.source_pipeline, &bind_group, source_dispatch);
         }
 
         self.raw_spread.encode_spread_batch(
             device,
-            encoder,
+            recorder,
             active_batch,
             source_count,
             &scratch.rescaled_sources,
@@ -437,19 +432,11 @@ impl GpuType3Plan {
                 binding_entry(2, &scratch.target_factors, target_factor_bytes),
             ],
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wgpu_nufft.type3.target_rescale_correction.pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.target_pipeline);
-            pass.set_bind_group(0, &target_bind_group, &[]);
-            pass.dispatch_workgroups(target_dispatch.0, target_dispatch.1, target_dispatch.2);
-        }
+        recorder.dispatch(&self.target_pipeline, &target_bind_group, target_dispatch);
 
-        self.inner_type2.encode_type2_gpu_batch(
+        self.inner_type2.record_type2_gpu_batch(
             device,
-            encoder,
+            recorder,
             target_count,
             active_batch,
             &scratch.rescaled_targets,
@@ -474,15 +461,7 @@ impl GpuType3Plan {
                 binding_entry(2, output, output_bytes),
             ],
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wgpu_nufft.type3.final_correction.pass"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.final_pipeline);
-            pass.set_bind_group(0, &final_bind_group, &[]);
-            pass.dispatch_workgroups(final_dispatch.0, final_dispatch.1, final_dispatch.2);
-        }
+        recorder.dispatch(&self.final_pipeline, &final_bind_group, final_dispatch);
         Ok(())
     }
 
@@ -508,18 +487,18 @@ impl RawSpreadPlan {
     fn encode_spread(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
     ) -> Result<()> {
-        self.encode_spread_batch(device, encoder, 1, point_count, points, strengths)
+        self.encode_spread_batch(device, recorder, 1, point_count, points, strengths)
     }
 
     fn encode_spread_batch(
         &self,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
+        recorder: &mut GpuRecorder<'_>,
         active_batch: usize,
         point_count: usize,
         points: &wgpu::Buffer,
@@ -528,7 +507,7 @@ impl RawSpreadPlan {
         match self {
             Self::Dense(plan) => plan.encode_spread_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -536,7 +515,7 @@ impl RawSpreadPlan {
             ),
             Self::OneD(plan) => plan.encode_spread_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -544,7 +523,7 @@ impl RawSpreadPlan {
             ),
             Self::TwoD(plan) => plan.encode_spread_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -552,7 +531,7 @@ impl RawSpreadPlan {
             ),
             Self::ThreeD(plan) => plan.encode_spread_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,
@@ -560,7 +539,7 @@ impl RawSpreadPlan {
             ),
             Self::Nd(plan) => plan.encode_spread_batch(
                 device,
-                encoder,
+                recorder,
                 active_batch,
                 point_count,
                 points,

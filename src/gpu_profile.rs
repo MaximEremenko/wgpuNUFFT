@@ -1,3 +1,4 @@
+use crate::gpu_recorder::GpuRecorder;
 use std::fmt;
 use std::ops::Range;
 
@@ -241,7 +242,7 @@ impl<'a> GpuProfileQueryWriter<'a> {
 
     /// Encodes an empty pass whose end timestamp precedes the buffer clears
     /// that open the first stage.
-    pub(crate) fn encode_start_marker(&self, encoder: &mut wgpu::CommandEncoder) {
+    pub(crate) fn encode_start_marker(&self, recorder: &mut GpuRecorder<'_>) {
         let Some(timestamp_writes) = self.timestamp_writes(None, Some(0)) else {
             return;
         };
@@ -255,10 +256,12 @@ impl<'a> GpuProfileQueryWriter<'a> {
                 )
             ));
         }
-        let _pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("wgpu_nufft.profile.start_marker"),
-            timestamp_writes: Some(timestamp_writes),
-        });
+        let _pass = recorder
+            .encoder()
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("wgpu_nufft.profile.start_marker"),
+                timestamp_writes: Some(timestamp_writes),
+            });
     }
 }
 
