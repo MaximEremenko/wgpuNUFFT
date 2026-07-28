@@ -48,6 +48,11 @@ const POINT_SLOT_BYTES: u64 = 8;
 const PREPARED_START_BYTES: u64 = 16;
 /// One `vec2<f32>` high/low offset `start - position` per axis.
 const PREPARED_OFFSET_BYTES_PER_AXIS: u64 = 8;
+/// Largest bin that stable mode orders by ranking instead of sorting: every
+/// point of such a bin counts the bin's smaller point indices, which is
+/// quadratic per bin but runs one invocation per point. Larger bins keep a
+/// one-invocation heap sort.
+const SMALL_BIN: u32 = 64;
 /// Largest prepared footprint written by the fused scatter-and-prepare pass.
 /// Its writes land in random slots; the fused pass
 /// beat the indexed passes by 13-17% up to 32 MiB (2D, 1M points) but was
@@ -246,7 +251,7 @@ impl PointBins {
                 let pipeline = create_compute_pipeline(
                     device,
                     "wgpu_nufft.point_bins.sort",
-                    &generate_sort_wgsl(),
+                    &generate_large_bin_sort_wgsl(),
                 );
                 let workgroups = u32::try_from(bin_count.div_ceil(WORKGROUP_SIZE as usize))
                     .map_err(|_| NufftError::LengthOverflow {
@@ -267,7 +272,12 @@ impl PointBins {
         let prepare_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.point_bins.prepare",
-            &generate_prepare_wgsl(kernel, dimensions, position_wgsl),
+            &generate_prepare_wgsl(
+                kernel,
+                dimensions,
+                order == PointBinOrder::Stable,
+                position_wgsl,
+            ),
         );
         let indexed = IndexedPrepare {
             scatter_layout: scatter_pipeline.get_bind_group_layout(0),
@@ -451,15 +461,21 @@ impl PointBins {
                 binding_entry(2, &sorted_indices, index_bytes),
             ],
         });
+        let mut prepare_entries = vec![
+            binding_entry(0, points, point_bytes),
+            binding_entry(1, &sorted_indices, index_bytes),
+            binding_entry(2, &prepared.starts, prepared.start_bytes),
+            binding_entry(3, &prepared.offsets, prepared.offset_bytes),
+        ];
+        if indexed.sort.is_some() {
+            // Stable mode ranks the points of small bins while preparing.
+            prepare_entries.push(binding_entry(4, &point_slots, slot_bytes));
+            prepare_entries.push(binding_entry(5, bin_offsets, offset_bytes));
+        }
         let prepare_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.point_bins.prepare.bind_group"),
             layout: &indexed.prepare_layout,
-            entries: &[
-                binding_entry(0, points, point_bytes),
-                binding_entry(1, &sorted_indices, index_bytes),
-                binding_entry(2, &prepared.starts, prepared.start_bytes),
-                binding_entry(3, &prepared.offsets, prepared.offset_bytes),
-            ],
+            entries: &prepare_entries,
         });
         encode_pass(
             encoder,
@@ -655,14 +671,46 @@ fn prepare_statements(dimensions: usize) -> String {
     format!("{axes}    prepared_starts[slot] = vec4<i32>({starts}, bitcast<i32>(point_index));\n")
 }
 
-fn generate_prepare_wgsl(kernel: EsKernel, dimensions: usize, position_wgsl: &str) -> String {
+/// Prepares binned points in slot order. In stable mode the scatter left
+/// small bins in atomic order: each of their points then takes the slot of
+/// its rank by original index within the bin, while larger bins were
+/// heap-sorted beforehand and keep their slots.
+fn generate_prepare_wgsl(
+    kernel: EsKernel,
+    dimensions: usize,
+    stable: bool,
+    position_wgsl: &str,
+) -> String {
     let header = prepare_header(kernel, dimensions, 2);
     let statements = prepare_statements(dimensions);
+    let (rank_bindings, rank) = if stable {
+        (
+            "@group(0) @binding(4) var<storage, read> point_slots: array<vec2<u32>>;
+@group(0) @binding(5) var<storage, read> bin_offsets: array<u32>;
+",
+            format!(
+                "    var slot = record;
+    let bin = point_slots[point_index].x;
+    let bin_start = bin_offsets[bin];
+    let bin_end = bin_offsets[bin + 1u];
+    if (bin_end - bin_start <= {SMALL_BIN}u) {{
+        var rank = 0u;
+        for (var other = bin_start; other < bin_end; other = other + 1u) {{
+            if (sorted_indices[other] < point_index) {{ rank = rank + 1u; }}
+        }}
+        slot = bin_start + rank;
+    }}
+"
+            ),
+        )
+    } else {
+        ("", "    let slot = record;\n".to_string())
+    };
     let entry = format!(
         r#"{header}
 @group(0) @binding(0) var<storage, read> points: array<f32>;
 @group(0) @binding(1) var<storage, read> sorted_indices: array<u32>;
-
+{rank_bindings}
 @compute @workgroup_size({WORKGROUP_SIZE})
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -672,15 +720,34 @@ fn main(
     let total = arrayLength(&sorted_indices);
     let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
     if (wg_flat > (total - 1u) / WORKGROUP_SIZE) {{ return; }}
-    let slot = wg_flat * WORKGROUP_SIZE + lid.x;
-    if (slot >= total) {{ return; }}
+    let record = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (record >= total) {{ return; }}
 
-    let point_index = sorted_indices[slot];
-    let point_base = point_index * POINT_DIMENSIONS;
+    let point_index = sorted_indices[record];
+{rank}    let point_base = point_index * POINT_DIMENSIONS;
 {statements}}}
 "#,
     );
     format!("{}\n{position_wgsl}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
+}
+
+/// The per-bin heap sort restricted to bins above [`SMALL_BIN`] points.
+fn generate_large_bin_sort_wgsl() -> String {
+    let source = generate_sort_wgsl();
+    let call = "    heap_sort(bin_offsets[bin], bin_offsets[bin + 1u]);";
+    assert!(
+        source.contains(call),
+        "sort shader no longer contains {call:?}"
+    );
+    source.replace(
+        call,
+        &format!(
+            "    let start = bin_offsets[bin];
+    let end = bin_offsets[bin + 1u];
+    // The prepare pass ranks the points of smaller bins directly.
+    if (end - start > {SMALL_BIN}u) {{ heap_sort(start, end); }}"
+        ),
+    )
 }
 
 fn generate_scatter_prepare_wgsl(
@@ -742,7 +809,7 @@ mod tests {
             assert_valid_wgsl(&count);
         }
         for source in [
-            generate_prepare_wgsl(kernel, 1, &position),
+            generate_prepare_wgsl(kernel, 1, true, &position),
             generate_scatter_prepare_wgsl(kernel, 1, &position),
         ] {
             assert!(source.contains("vec4<i32>(start_0, 0, 0, bitcast<i32>(point_index))"));
@@ -770,7 +837,7 @@ mod tests {
             assert_valid_wgsl(&count_2d);
             assert_valid_wgsl(&count_3d);
         }
-        let prepare_2d = generate_prepare_wgsl(kernel, 2, &position_2d);
+        let prepare_2d = generate_prepare_wgsl(kernel, 2, false, &position_2d);
         assert!(prepare_2d.contains("vec4<i32>(start_0, start_1, 0, bitcast<i32>(point_index))"));
         let prepare_3d = generate_scatter_prepare_wgsl(kernel, 3, &position_3d);
         assert!(
@@ -780,9 +847,10 @@ mod tests {
         for source in [
             prepare_2d,
             prepare_3d,
-            generate_prepare_wgsl(kernel, 3, &position_3d),
+            generate_prepare_wgsl(kernel, 3, true, &position_3d),
             generate_scatter_prepare_wgsl(kernel, 2, &position_2d),
             generate_bin_scatter_wgsl(),
+            generate_large_bin_sort_wgsl(),
         ] {
             assert_valid_wgsl(&source);
         }
