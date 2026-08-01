@@ -338,16 +338,6 @@ fn bin_ranges(low: i32, high: i32) -> BinRanges {{
     return BinRanges(low / BIN_SIDE, high / BIN_SIDE, 0, -1);
 }}
 
-fn bin_range_length(ranges: BinRanges) -> i32 {{
-    return (ranges.last_0 - ranges.first_0 + 1) + max(ranges.last_1 - ranges.first_1 + 1, 0);
-}}
-
-fn bin_range_item(ranges: BinRanges, item: i32) -> i32 {{
-    let first_length = ranges.last_0 - ranges.first_0 + 1;
-    if (item < first_length) {{ return ranges.first_0 + item; }}
-    return ranges.first_1 + (item - first_length);
-}}
-
 @compute @workgroup_size({WORKGROUP_SIZE})
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -363,13 +353,22 @@ fn main(
     let strength_base = vector_index * arrayLength(&prepared_starts);
 
     let ranges = bin_ranges(x0 - REACH_BELOW, x0 + SEGMENT - 1 + REACH_ABOVE);
-    let bins = bin_range_length(ranges);
+    // The bins in reach hold consecutive records, split in two only where
+    // the segment's reach wraps around the grid.
+    let pieces = select(1, 2, ranges.last_1 >= ranges.first_1);
 {initialize}
-    // Bins in a fixed order, then points in their stable in-bin order.
-    for (var item = 0; item < bins; item = item + 1) {{
-        let bin = u32(bin_range_item(ranges, item));
-        let end = bin_offsets[bin + 1u];
-        for (var record = bin_offsets[bin]; record < end; record = record + 1u) {{
+    // Pieces in a fixed order, then records in bin order and stable in-bin
+    // order. Looping over whole pieces instead of single bins keeps the lanes
+    // of a warp from reconverging after every bin.
+    for (var piece = 0; piece < pieces; piece = piece + 1) {{
+        var first = ranges.first_0;
+        var last = ranges.last_0;
+        if (piece == 1) {{
+            first = ranges.first_1;
+            last = ranges.last_1;
+        }}
+        let end = bin_offsets[u32(last) + 1u];
+        for (var record = bin_offsets[u32(first)]; record < end; record = record + 1u) {{
             var base = x0 - prepared_starts[record].x;
             if (base < 0) {{ base = base + FINE_I32; }}
             if (base >= FINE_I32) {{ base = base - FINE_I32; }}

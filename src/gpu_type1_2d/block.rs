@@ -305,15 +305,14 @@ fn generate_tile_gather_wgsl(
         (0..TILE[axis])
             .map(|cell| {
                 format!(
-                    "            var {name}{cell} = 0.0;
-            {{
-                var offset = base_{axis} + {cell};
-                if (offset >= {length}) {{ offset = offset - {length}; }}
-                if (offset < WIDTH_I32) {{
-                    {name}{cell} = es_weight((f32(offset) + offset_{axis}.x) + offset_{axis}.y);
-                    reaches_{axis} = true;
-                }}
+                    "        var {name}{cell} = 0.0;
+        {{
+            var offset = base_{axis} + {cell};
+            if (offset >= {length}) {{ offset = offset - {length}; }}
+            if (offset < WIDTH_I32) {{
+                {name}{cell} = es_weight((f32(offset) + offset_{axis}.x) + offset_{axis}.y);
             }}
+        }}
 "
                 )
             })
@@ -428,29 +427,53 @@ fn main(
 
     let ranges_0 = bin_ranges(x0 - REACH_BELOW, x0 + TILE_0 - 1 + REACH_ABOVE, FINE_0_I32);
     let ranges_1 = bin_ranges(y0 - REACH_BELOW, y0 + TILE_1 - 1 + REACH_ABOVE, FINE_1_I32);
-    let bins_x = bin_range_length(ranges_0);
-    let bins_y = bin_range_length(ranges_1);
+    let bin_rows = bin_range_length(ranges_1);
+    // The x bins of one bin row hold consecutive records, split in two only
+    // where the tile's reach wraps around the grid.
+    let row_pieces = select(1, 2, ranges_0.last_1 >= ranges_0.first_1);
 {initialize}
-    // Bins in a fixed order, then points in their stable in-bin order.
-    for (var item_1 = 0; item_1 < bins_y; item_1 = item_1 + 1) {{
-        let row_bin = BINS_0 * bin_range_item(ranges_1, item_1);
-        for (var item_0 = 0; item_0 < bins_x; item_0 = item_0 + 1) {{
-            let bin = u32(row_bin + bin_range_item(ranges_0, item_0));
-            let end = bin_offsets[bin + 1u];
-            for (var record = bin_offsets[bin]; record < end; record = record + 1u) {{
-                let start = prepared_starts[record];
-                let base_0 = wrap_offset(x0 - start.x, FINE_0_I32);
-                let base_1 = wrap_offset(y0 - start.y, FINE_1_I32);
-                let offset_0 = prepared_offsets[2u * record];
-                let offset_1 = prepared_offsets[2u * record + 1u];
-                var reaches_0 = false;
-                var reaches_1 = false;
-{weights_0}{weights_1}                if (reaches_0 && reaches_1) {{
-                    let value = strengths[strength_base + record];
-{accumulate}                }}
+    // Rows and pieces in a fixed order, then records in bin order and stable
+    // in-bin order. One flat loop moves to the next range inline, so lanes
+    // of a warp diverge by their total record counts rather than reconverging
+    // after every bin.
+    var item_1 = -1;
+    var piece = row_pieces - 1;
+    var record = 0u;
+    var end = 0u;
+    loop {{
+        if (record >= end) {{
+            piece = piece + 1;
+            if (piece == row_pieces) {{
+                piece = 0;
+                item_1 = item_1 + 1;
+                if (item_1 == bin_rows) {{ break; }}
             }}
+            let row_bin = BINS_0 * bin_range_item(ranges_1, item_1);
+            var first = ranges_0.first_0;
+            var last = ranges_0.last_0;
+            if (piece == 1) {{
+                first = ranges_0.first_1;
+                last = ranges_0.last_1;
+            }}
+            record = bin_offsets[u32(row_bin + first)];
+            end = bin_offsets[u32(row_bin + last) + 1u];
+            continue;
         }}
-    }}
+        let start = prepared_starts[record];
+        let base_0 = wrap_offset(x0 - start.x, FINE_0_I32);
+        let base_1 = wrap_offset(y0 - start.y, FINE_1_I32);
+        record = record + 1u;
+        // The support [start, start + width) meets the tile when some tile
+        // cell's periodic offset from the start lies below the width.
+        if ((base_0 >= WIDTH_I32 && base_0 <= FINE_0_I32 - TILE_0)
+            || (base_1 >= WIDTH_I32 && base_1 <= FINE_1_I32 - TILE_1)) {{
+            continue;
+        }}
+        let slot = record - 1u;
+        let offset_0 = prepared_offsets[2u * slot];
+        let offset_1 = prepared_offsets[2u * slot + 1u];
+{weights_0}{weights_1}        let value = strengths[strength_base + slot];
+{accumulate}    }}
 
     let row_base = vector_index * FINE_COUNT;
 {store}}}
@@ -506,7 +529,7 @@ mod tests {
             source.matches("fine_grid[row_base + ").count(),
             TILE[0] * TILE[1]
         );
-        assert!(source.contains("let value = strengths[strength_base + record];"));
+        assert!(source.contains("let value = strengths[strength_base + slot];"));
         assert_valid_wgsl(&generate_permute_wgsl());
     }
 }
