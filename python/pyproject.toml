@@ -9,7 +9,6 @@ description = "Portable GPU NUFFT plans for NumPy arrays"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
 dependencies = ["numpy>=1.23"]
 
 [tool.maturin]

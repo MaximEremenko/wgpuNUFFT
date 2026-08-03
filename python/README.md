@@ -11,11 +11,13 @@ downloads its result; plan and GPU pipeline setup are reused.
 
 ## Local build
 
-From the repository root in PowerShell:
+From the repository root in PowerShell. The pinned development tools need
+Python 3.12 or newer (NumPy 2.5.2 has no older wheels); the built package
+itself supports Python 3.10 and newer.
 
 ```powershell
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-py -3.14 -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install "maturin==1.15.0" "numpy==2.5.2" "pytest==9.1.1"
 $env:PYO3_PYTHON = (Resolve-Path .\.venv\Scripts\python.exe).Path

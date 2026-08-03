@@ -73,11 +73,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 `python/` builds a native CPython extension directly from the Rust library
 with PyO3, NumPy, and maturin. It does not add a separate C ABI and it is not
 published. The first supported Python data path is `float32` coordinates with
-`complex64` values for reusable type-1, type-2, and type-3 GPU plans.
+`complex64` values for reusable type-1, type-2, and type-3 GPU plans. The
+pinned development tools below need Python 3.12 or newer (NumPy 2.5.2 has no
+older wheels); the built package itself supports Python 3.10 and newer.
 
 ```powershell
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-py -3.14 -m venv .venv
+py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install "maturin==1.15.0" "numpy==2.5.2" "pytest==9.1.1"
 $env:PYO3_PYTHON = (Resolve-Path .\.venv\Scripts\python.exe).Path
