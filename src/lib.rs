@@ -35,6 +35,8 @@ mod gpu_type3;
 mod kernel;
 mod plan;
 mod type3;
+#[cfg(test)]
+mod wgsl_validation;
 
 pub use config::{
     ModeOrder, NufftConfig, NufftSign, DEFAULT_EPS, DEFAULT_SIGMA, MAX_NUFFT_DIMENSIONS,

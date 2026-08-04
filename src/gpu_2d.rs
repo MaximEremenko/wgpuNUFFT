@@ -1765,18 +1765,7 @@ fn binding_entry<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Parses and validates generated WGSL without a GPU.
-    fn assert_valid_wgsl(source: &str) {
-        let module = wgpu::naga::front::wgsl::parse_str(source)
-            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
-        wgpu::naga::valid::Validator::new(
-            wgpu::naga::valid::ValidationFlags::all(),
-            wgpu::naga::valid::Capabilities::FLOAT64,
-        )
-        .validate(&module)
-        .unwrap_or_else(|error| panic!("{error:?}"));
-    }
+    use crate::wgsl_validation::assert_valid_wgsl_f64;
 
     #[test]
     fn binned_interpolation_reads_rows_across_lanes_and_sums_in_lane_order() {
@@ -1787,7 +1776,7 @@ mod tests {
             assert!(lanes >= width && lanes.is_power_of_two());
             assert_eq!(BINNED_WORKGROUP_SIZE as usize % lanes, 0);
             let source = generate_binned_interpolation_wgsl(kernel, &[16, 20]);
-            assert_valid_wgsl(&source);
+            assert_valid_wgsl_f64(&source);
             assert!(source.contains("point_index = bitcast<u32>(start.w);"));
             assert!(!source.contains("df64"));
             assert_eq!(
@@ -1806,7 +1795,7 @@ mod tests {
     fn derived_predeconvolution_shaders_validate() {
         for precision in [FftPrecision::F64, FftPrecision::Df64] {
             let config = NufftConfig::new([5, 4], 1.0e-6).with_precision(precision);
-            assert_valid_wgsl(&generate_predeconvolution_wgsl(&config, &[16, 18]));
+            assert_valid_wgsl_f64(&generate_predeconvolution_wgsl(&config, &[16, 18]));
         }
     }
 
@@ -1840,7 +1829,7 @@ mod tests {
     fn predeconvolution_shader_uses_axis0_fast_tensor_mapping() {
         let config = NufftConfig::new([5, 4], 1.0e-6).with_mode_order(ModeOrder::Centered);
         let source = generate_predeconvolution_wgsl(&config, &[16, 18]);
-        assert_valid_wgsl(&source);
+        assert_valid_wgsl_f64(&source);
         assert!(source.contains("fine_axis_index(mode_index % MODE0, MODE0, FINE0)"));
         assert!(source.contains("fine_axis_index(mode_index / MODE0, MODE1, FINE1)"));
         assert!(source.contains("let fine_index = fine_index0 + FINE0 * fine_index1;"));

@@ -1896,25 +1896,13 @@ fn binding_entry<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Parses and validates generated WGSL without a GPU, so reserved words
-    /// and type errors fail here rather than at pipeline creation.
-    fn assert_valid_wgsl(source: &str) {
-        let module = wgpu::naga::front::wgsl::parse_str(source)
-            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
-        wgpu::naga::valid::Validator::new(
-            wgpu::naga::valid::ValidationFlags::all(),
-            wgpu::naga::valid::Capabilities::FLOAT64,
-        )
-        .validate(&module)
-        .unwrap_or_else(|error| panic!("{error:?}"));
-    }
+    use crate::wgsl_validation::assert_valid_wgsl_f64;
 
     #[test]
     fn f32_predeconvolution_scatters_axis_zero_fast_modes_into_a_cleared_grid() {
         let config = NufftConfig::new([6, 8, 10], 1.0e-6);
         let source = generate_predeconvolution_wgsl(&config, &[16, 20, 24]);
-        assert_valid_wgsl(&source);
+        assert_valid_wgsl_f64(&source);
         assert!(source.contains("let total = arrayLength(&coefficients);"));
         assert!(source.contains("fine_axis_index(mode_index % MODE0, MODE0, FINE0)"));
         assert!(source.contains("fine_axis_index((mode_index / MODE0) % MODE1, MODE1, FINE1)"));
@@ -2009,7 +1997,7 @@ mod tests {
             assert!(lanes >= width && lanes.is_power_of_two());
             assert_eq!(BINNED_WORKGROUP_SIZE as usize % lanes, 0);
             let source = generate_binned_interpolation_wgsl(kernel, &[16, 20, 24]);
-            assert_valid_wgsl(&source);
+            assert_valid_wgsl_f64(&source);
             assert!(source.contains("point_index = bitcast<u32>(start.w);"));
             assert!(!source.contains("df64"));
             assert!(source.contains(&format!("const LANES: u32 = {lanes}u;")));
@@ -2037,7 +2025,7 @@ mod tests {
             generate_interpolation_wgsl_for_precision(FftPrecision::F64, kernel, &[16, 20, 24]),
         ];
         for source in sources {
-            assert_valid_wgsl(&source);
+            assert_valid_wgsl_f64(&source);
             assert!(source.contains("array<vec2<f64>>"));
             assert!(source.contains("array<f64>"));
             for forbidden in ["exp(", "log(", "pow(", "sin(", "cos("] {
@@ -2058,7 +2046,7 @@ mod tests {
             generate_interpolation_wgsl_for_precision(FftPrecision::Df64, kernel, &[16, 20, 24]),
         ];
         for source in sources {
-            assert_valid_wgsl(&source);
+            assert_valid_wgsl_f64(&source);
             assert!(source.contains("array<vec4<f32>>"));
             assert!(source.contains("df64_complex_scale"));
             assert!(source.contains("struct Df64"));
