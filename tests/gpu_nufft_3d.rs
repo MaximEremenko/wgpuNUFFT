@@ -695,8 +695,8 @@ fn validate_block_type1_active_batch(device: &wgpu::Device, queue: &wgpu::Queue)
     plan.encode_type1_gpu_batch(
         device,
         &mut encoder,
-        701,
         2,
+        701,
         &points_buffer,
         &strengths_buffer,
         &output,
@@ -956,8 +956,8 @@ fn validate_binned_type2_active_batch(device: &wgpu::Device, queue: &wgpu::Queue
     plan.encode_type2_gpu_batch(
         device,
         &mut encoder,
-        point_count,
         2,
+        point_count,
         &points_buffer,
         &coefficients_buffer,
         &outputs[0],

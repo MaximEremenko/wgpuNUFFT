@@ -437,8 +437,8 @@ impl GpuType3Plan {
         self.inner_type2.record_type2_gpu_batch(
             device,
             recorder,
-            target_count,
             active_batch,
+            target_count,
             &scratch.rescaled_targets,
             self.raw_spread.fine_grid_buffer(),
             &scratch.interpolated,

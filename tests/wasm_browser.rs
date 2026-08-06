@@ -206,8 +206,8 @@ async fn run_type12_case(
                 .encode_type1_gpu_batch(
                     &context.device,
                     encoder,
-                    TYPE12_POINT_COUNT,
                     BATCH,
+                    TYPE12_POINT_COUNT,
                     &point_buffer,
                     &strength_buffer,
                     output,
@@ -247,8 +247,8 @@ async fn run_type12_case(
                 .encode_type2_gpu_batch(
                     &context.device,
                     encoder,
-                    TYPE12_POINT_COUNT,
                     BATCH,
+                    TYPE12_POINT_COUNT,
                     &point_buffer,
                     &coefficient_buffer,
                     output,

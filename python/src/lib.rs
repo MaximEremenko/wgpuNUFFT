@@ -659,8 +659,8 @@ fn run_type1(
         .encode_type1_gpu_batch(
             &context.device,
             &mut encoder,
-            point_count,
             active_batch,
+            point_count,
             &point_buffer,
             &strength_buffer,
             &output,
@@ -718,8 +718,8 @@ fn run_type2(
         .encode_type2_gpu_batch(
             &context.device,
             &mut encoder,
-            point_count,
             active_batch,
+            point_count,
             &point_buffer,
             &coefficient_buffer,
             &output,

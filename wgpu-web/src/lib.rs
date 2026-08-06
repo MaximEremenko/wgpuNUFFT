@@ -843,8 +843,8 @@ impl WgpuNufftPlan {
             NufftKind::Type1 => self.plan.encode_type1_gpu_batch(
                 &self.runtime.device,
                 &mut encoder,
-                self.point_count,
                 active_batch,
+                self.point_count,
                 &points.buffer,
                 &input.buffer,
                 &output.buffer,
@@ -852,8 +852,8 @@ impl WgpuNufftPlan {
             NufftKind::Type2 => self.plan.encode_type2_gpu_batch(
                 &self.runtime.device,
                 &mut encoder,
-                self.point_count,
                 active_batch,
+                self.point_count,
                 &points.buffer,
                 &input.buffer,
                 &output.buffer,

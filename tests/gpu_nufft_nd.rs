@@ -529,8 +529,8 @@ fn execute_type2(
     plan.encode_type2_gpu_batch(
         device,
         &mut encoder,
-        point_count,
         batch,
+        point_count,
         &point_buffer,
         &coefficient_buffer,
         &output,
@@ -593,8 +593,8 @@ fn execute_type1(
     plan.encode_type1_gpu_batch(
         device,
         &mut encoder,
-        point_count,
         batch,
+        point_count,
         &point_buffer,
         &strength_buffer,
         &output,
@@ -657,8 +657,8 @@ fn execute_type2_bytes(
     plan.encode_type2_gpu_batch(
         device,
         &mut encoder,
-        point_count,
         batch,
+        point_count,
         &point_buffer,
         &coefficient_buffer,
         &output,
@@ -722,8 +722,8 @@ fn execute_type1_bytes(
     plan.encode_type1_gpu_batch(
         device,
         &mut encoder,
-        point_count,
         batch,
+        point_count,
         &point_buffer,
         &strength_buffer,
         &output,

@@ -613,8 +613,8 @@ fn execute_type1_active(
         plan.encode_type1_gpu_batch(
             device,
             encoder,
-            point_count,
             active_batch,
+            point_count,
             &points,
             &strengths,
             output,
@@ -662,8 +662,8 @@ fn execute_type2_active(
         plan.encode_type2_gpu_batch(
             device,
             encoder,
-            point_count,
             active_batch,
+            point_count,
             &points,
             &coefficients,
             output,

@@ -495,8 +495,8 @@ fn submit_native(
         TransformKind::Type1 => plan.encode_type1_gpu_batch(
             device,
             &mut encoder,
-            point_count,
             batch,
+            point_count,
             &buffers.points,
             &buffers.native.strengths,
             &buffers.native.type1_output,
@@ -504,8 +504,8 @@ fn submit_native(
         TransformKind::Type2 => plan.encode_type2_gpu_batch(
             device,
             &mut encoder,
-            point_count,
             batch,
+            point_count,
             &buffers.points,
             &buffers.native.modes,
             &buffers.native.type2_output,

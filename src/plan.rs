@@ -877,8 +877,8 @@ impl NufftPlan {
         self.encode_type1_gpu_batch(
             device,
             encoder,
-            point_count,
             self.config.batch(),
+            point_count,
             points,
             strengths,
             output,
@@ -889,14 +889,16 @@ impl NufftPlan {
     ///
     /// Strength and output buffers are transform-major. `active_batch` may be
     /// smaller than the capacity selected with [`NufftConfig::with_batch`],
-    /// but it must be at least one.
+    /// but it must be at least one. Like every batched entry point, including
+    /// [`NufftType3Plan::encode_gpu_batch`](crate::NufftType3Plan::encode_gpu_batch),
+    /// this takes `active_batch` directly after the encoder.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_type1_gpu_batch(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        point_count: usize,
         active_batch: usize,
+        point_count: usize,
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
         output: &wgpu::Buffer,
@@ -1160,8 +1162,8 @@ impl NufftPlan {
         self.encode_type2_gpu_batch(
             device,
             encoder,
-            point_count,
             self.config.batch(),
+            point_count,
             points,
             coefficients,
             output,
@@ -1172,13 +1174,15 @@ impl NufftPlan {
     ///
     /// Coefficient and output buffers are transform-major. `active_batch` may
     /// be smaller than the configured batch capacity, but it must be nonzero.
+    /// As in every batched entry point, `active_batch` comes directly after
+    /// the encoder.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_type2_gpu_batch(
         &self,
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
-        point_count: usize,
         active_batch: usize,
+        point_count: usize,
         points: &wgpu::Buffer,
         coefficients: &wgpu::Buffer,
         output: &wgpu::Buffer,
@@ -1186,8 +1190,8 @@ impl NufftPlan {
         self.record_type2_gpu_batch(
             device,
             &mut GpuRecorder::new(encoder),
-            point_count,
             active_batch,
+            point_count,
             points,
             coefficients,
             output,
@@ -1201,8 +1205,8 @@ impl NufftPlan {
         &self,
         device: &wgpu::Device,
         recorder: &mut GpuRecorder<'_>,
-        point_count: usize,
         active_batch: usize,
+        point_count: usize,
         points: &wgpu::Buffer,
         coefficients: &wgpu::Buffer,
         output: &wgpu::Buffer,
