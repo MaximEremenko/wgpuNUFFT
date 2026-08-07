@@ -281,6 +281,8 @@ pub struct NufftType3Plan {
     axes: Vec<NufftType3AxisMetadata>,
     outer_grid_count: usize,
     gpu: Option<Box<GpuType3Plan>>,
+    /// The device owning the GPU resources, if the plan has any.
+    gpu_device: Option<wgpu::Device>,
 }
 
 impl fmt::Debug for NufftType3Plan {
@@ -337,6 +339,7 @@ impl NufftType3Plan {
             axes,
             outer_grid_count,
             gpu: None,
+            gpu_device: None,
         })
     }
 
@@ -362,6 +365,7 @@ impl NufftType3Plan {
         let gpu = GpuType3Plan::new(device, queue, &plan)?;
         debug_assert_eq!(gpu.dimensions(), plan.config.dimensions());
         plan.gpu = Some(Box::new(gpu));
+        plan.gpu_device = Some(device.clone());
         Ok(plan)
     }
 
@@ -503,6 +507,13 @@ impl NufftType3Plan {
         target_points: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
+        if self
+            .gpu_device
+            .as_ref()
+            .is_some_and(|plan_device| plan_device != device)
+        {
+            return Err(NufftError::GpuDeviceMismatch { kind: "type-3" });
+        }
         validate_active_batch(active_batch, self.config.batch())?;
         let gpu = self
             .gpu

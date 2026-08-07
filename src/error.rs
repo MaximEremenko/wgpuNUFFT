@@ -133,6 +133,11 @@ pub enum NufftError {
         kind: &'static str,
         reason: &'static str,
     },
+    /// A GPU call received a different `wgpu::Device` than the plan was
+    /// created with.
+    GpuDeviceMismatch {
+        kind: &'static str,
+    },
     GpuBufferTooSmall {
         buffer: &'static str,
         required_bytes: u64,
@@ -349,6 +354,10 @@ impl fmt::Display for NufftError {
             Self::GpuExecutionUnavailable { kind, reason } => {
                 write!(f, "GPU {kind} execution is unavailable: {reason}")
             }
+            Self::GpuDeviceMismatch { kind } => write!(
+                f,
+                "the GPU {kind} plan was created on a different wgpu::Device than the one passed"
+            ),
             Self::GpuBufferTooSmall {
                 buffer,
                 required_bytes,

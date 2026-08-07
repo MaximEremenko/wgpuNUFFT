@@ -438,6 +438,8 @@ pub struct NufftPlan {
     centered_kernel_fourier_coefficients: Vec<Vec<f64>>,
     gpu_type1: Option<Box<Type1GpuExecution>>,
     gpu_type2: Option<Box<Type2GpuExecution>>,
+    /// The device owning the GPU resources, if the plan has any.
+    gpu_device: Option<wgpu::Device>,
     recorded_points: Mutex<Option<RecordedPoints>>,
 }
 
@@ -653,6 +655,7 @@ impl NufftPlan {
             )?),
         };
         plan.gpu_type1 = Some(Box::new(gpu));
+        plan.gpu_device = Some(device.clone());
         Ok(plan)
     }
 
@@ -705,6 +708,7 @@ impl NufftPlan {
             )?),
         };
         plan.gpu_type2 = Some(Box::new(gpu));
+        plan.gpu_device = Some(device.clone());
         Ok(plan)
     }
 
@@ -741,6 +745,7 @@ impl NufftPlan {
             centered_kernel_fourier_coefficients,
             gpu_type1: None,
             gpu_type2: None,
+            gpu_device: None,
             recorded_points: Mutex::new(None),
         })
     }
@@ -903,6 +908,7 @@ impl NufftPlan {
         strengths: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
+        self.validate_device(device, "type-1")?;
         if self.kind != NufftKind::Type1 {
             return Err(NufftError::GpuExecutionUnavailable {
                 kind: "type-1",
@@ -955,6 +961,7 @@ impl NufftPlan {
     ) -> Result<()> {
         match self.kind {
             NufftKind::Type1 => {
+                self.validate_device(device, "type-1")?;
                 let gpu = self
                     .gpu_type1
                     .as_deref()
@@ -966,6 +973,7 @@ impl NufftPlan {
                 gpu.set_points(device, &mut GpuRecorder::new(encoder), point_count, points)?;
             }
             NufftKind::Type2 => {
+                self.validate_device(device, "type-2")?;
                 let gpu = self
                     .gpu_type2
                     .as_deref()
@@ -1006,6 +1014,7 @@ impl NufftPlan {
         strengths: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
+        self.validate_device(device, "type-1")?;
         if self.kind != NufftKind::Type1 {
             return Err(NufftError::GpuExecutionUnavailable {
                 kind: "type-1",
@@ -1054,6 +1063,7 @@ impl NufftPlan {
         query_set: &wgpu::QuerySet,
         first_query: u32,
     ) -> Result<NufftGpuProfileLayout> {
+        self.validate_device(device, "type-1")?;
         self.validate_gpu_profiling(device, "type-1")?;
         if self.kind != NufftKind::Type1 {
             return Err(NufftError::GpuExecutionUnavailable {
@@ -1211,6 +1221,7 @@ impl NufftPlan {
         coefficients: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
+        self.validate_device(device, "type-2")?;
         if self.kind != NufftKind::Type2 {
             return Err(NufftError::GpuExecutionUnavailable {
                 kind: "type-2",
@@ -1263,6 +1274,7 @@ impl NufftPlan {
         coefficients: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
+        self.validate_device(device, "type-2")?;
         if self.kind != NufftKind::Type2 {
             return Err(NufftError::GpuExecutionUnavailable {
                 kind: "type-2",
@@ -1305,6 +1317,7 @@ impl NufftPlan {
         query_set: &wgpu::QuerySet,
         first_query: u32,
     ) -> Result<NufftGpuProfileLayout> {
+        self.validate_device(device, "type-2")?;
         self.validate_gpu_profiling(device, "type-2")?;
         if self.kind != NufftKind::Type2 {
             return Err(NufftError::GpuExecutionUnavailable {
@@ -1363,6 +1376,17 @@ impl NufftPlan {
                 .gpu_type2
                 .as_deref()
                 .map(Type2GpuExecution::fft_diagnostics),
+        }
+    }
+
+    /// Rejects a device other than the one owning the plan's GPU resources,
+    /// where wgpu would otherwise panic on the first cross-device binding.
+    fn validate_device(&self, device: &wgpu::Device, kind: &'static str) -> Result<()> {
+        match &self.gpu_device {
+            Some(plan_device) if plan_device != device => {
+                Err(NufftError::GpuDeviceMismatch { kind })
+            }
+            _ => Ok(()),
         }
     }
 
