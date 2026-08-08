@@ -1,7 +1,8 @@
 //! Native NumPy bindings for `wgpu-nufft`.
 
 use std::f64::consts::PI;
-use std::sync::{mpsc, Arc, Mutex};
+use std::panic::AssertUnwindSafe;
+use std::sync::{mpsc, Arc, Mutex, PoisonError};
 
 use numpy::{
     ndarray::{ArrayD, IxDyn},
@@ -21,6 +22,9 @@ struct ContextInner {
     _adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// First wgpu error raised outside an error scope, reported by the next
+    /// guarded operation instead of wgpu's default panic.
+    uncaptured_error: Arc<Mutex<Option<String>>>,
     adapter_name: String,
     backend: String,
     device_type: String,
@@ -159,18 +163,73 @@ fn initialize_gpu(
         }
     };
 
+    // wgpu's default handler panics on errors outside an error scope.
+    let uncaptured_error = Arc::new(Mutex::new(None));
+    let sink = Arc::clone(&uncaptured_error);
+    device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+        sink.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_or_insert_with(|| error.to_string());
+    }));
+
     let info = adapter.get_info();
     Ok(ContextInner {
         _instance: instance,
         _adapter: adapter,
         device,
         queue,
+        uncaptured_error,
         adapter_name: info.name,
         backend: format!("{:?}", info.backend),
         device_type: format!("{:?}", info.device_type),
         driver: info.driver,
         driver_info: info.driver_info,
     })
+}
+
+/// Runs GPU work so that wgpu errors and Rust panics come back as `Err`
+/// instead of a Python `PanicException`.
+///
+/// Error scopes capture validation, out-of-memory and internal errors. wgpu
+/// treats some failures as fatal and panics, for example polling a lost
+/// device, so a panic is caught and reported as an error too.
+fn guarded<T>(
+    context: &ContextInner,
+    work: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let out_of_memory = context
+        .device
+        .push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+    let validation = context
+        .device
+        .push_error_scope(wgpu::ErrorFilter::Validation);
+    let internal = context.device.push_error_scope(wgpu::ErrorFilter::Internal);
+    let result = std::panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|payload| {
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown panic");
+        Err(format!("GPU operation panicked: {message}"))
+    });
+    // Scopes pop in reverse order of their creation.
+    let scoped = [
+        pollster::block_on(internal.pop()),
+        pollster::block_on(validation.pop()),
+        pollster::block_on(out_of_memory.pop()),
+    ];
+    let uncaptured = context
+        .uncaptured_error
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    if let Some(error) = scoped.into_iter().flatten().next() {
+        return Err(format!("GPU error: {error}"));
+    }
+    if let Some(error) = uncaptured {
+        return Err(format!("GPU error: {error}"));
+    }
+    result
 }
 
 #[derive(Default)]
@@ -591,14 +650,17 @@ fn build_type12_plan(
     let plan = py
         .detach(move || {
             let _cache_guard = PipelineCacheClearGuard(&plan_runtime.device);
-            match kind {
-                Type12Kind::Type1 => {
-                    NufftPlan::type1_gpu(&plan_runtime.device, &plan_runtime.queue, config)
+            guarded(&plan_runtime, || {
+                match kind {
+                    Type12Kind::Type1 => {
+                        NufftPlan::type1_gpu(&plan_runtime.device, &plan_runtime.queue, config)
+                    }
+                    Type12Kind::Type2 => {
+                        NufftPlan::type2_gpu(&plan_runtime.device, &plan_runtime.queue, config)
+                    }
                 }
-                Type12Kind::Type2 => {
-                    NufftPlan::type2_gpu(&plan_runtime.device, &plan_runtime.queue, config)
-                }
-            }
+                .map_err(|error| error.to_string())
+            })
         })
         .map_err(|error| WgpuNufftError::new_err(format!("GPU plan creation failed: {error}")))?;
 
@@ -828,18 +890,21 @@ impl Type1Plan {
         let n_modes = self.n_modes.clone();
         let output = py
             .detach(move || {
-                let mut state = state
-                    .lock()
-                    .map_err(|_| "type-1 plan lock is poisoned".to_owned())?;
-                let core = run_type1(
-                    &context,
-                    &mut state,
-                    point_count,
-                    active_batch,
-                    &points,
-                    &strengths,
-                )?;
-                Ok::<_, String>(unpack_core_modes(core, &n_modes, active_batch))
+                guarded(&context, || {
+                    // A panic caught by `guarded` poisons this lock, but every
+                    // update to the guarded state is a single assignment, so
+                    // the state stays usable.
+                    let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                    let core = run_type1(
+                        &context,
+                        &mut state,
+                        point_count,
+                        active_batch,
+                        &points,
+                        &strengths,
+                    )?;
+                    Ok(unpack_core_modes(core, &n_modes, active_batch))
+                })
             })
             .map_err(WgpuNufftError::new_err)?;
         complex_output(py, output_shape, output)
@@ -954,18 +1019,21 @@ impl Type2Plan {
         let n_modes = self.n_modes.clone();
         let output = py
             .detach(move || {
-                let mut state = state
-                    .lock()
-                    .map_err(|_| "type-2 plan lock is poisoned".to_owned())?;
-                run_type2(
-                    &context,
-                    &mut state,
-                    &n_modes,
-                    point_count,
-                    active_batch,
-                    &points,
-                    &coefficients,
-                )
+                guarded(&context, || {
+                    // A panic caught by `guarded` poisons this lock, but every
+                    // update to the guarded state is a single assignment, so
+                    // the state stays usable.
+                    let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                    run_type2(
+                        &context,
+                        &mut state,
+                        &n_modes,
+                        point_count,
+                        active_batch,
+                        &points,
+                        &coefficients,
+                    )
+                })
             })
             .map_err(WgpuNufftError::new_err)?;
         complex_output(py, output_shape, output)
@@ -1150,7 +1218,10 @@ impl Type3Plan {
         let plan = py
             .detach(move || {
                 let _cache_guard = PipelineCacheClearGuard(&plan_runtime.device);
-                NufftType3Plan::new_gpu(&plan_runtime.device, &plan_runtime.queue, config)
+                guarded(&plan_runtime, || {
+                    NufftType3Plan::new_gpu(&plan_runtime.device, &plan_runtime.queue, config)
+                        .map_err(|error| error.to_string())
+                })
             })
             .map_err(|error| {
                 WgpuNufftError::new_err(format!("type-3 GPU plan creation failed: {error}"))
@@ -1218,19 +1289,22 @@ impl Type3Plan {
         let state = Arc::clone(&self.state);
         let output = py
             .detach(move || {
-                let mut state = state
-                    .lock()
-                    .map_err(|_| "type-3 plan lock is poisoned".to_owned())?;
-                run_type3(
-                    &context,
-                    &mut state,
-                    active_batch,
-                    source_count,
-                    &source_points,
-                    &strengths,
-                    target_count,
-                    &target_points,
-                )
+                guarded(&context, || {
+                    // A panic caught by `guarded` poisons this lock, but every
+                    // update to the guarded state is a single assignment, so
+                    // the state stays usable.
+                    let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                    run_type3(
+                        &context,
+                        &mut state,
+                        active_batch,
+                        source_count,
+                        &source_points,
+                        &strengths,
+                        target_count,
+                        &target_points,
+                    )
+                })
             })
             .map_err(WgpuNufftError::new_err)?;
         complex_output(py, output_shape, output)
@@ -1292,6 +1366,38 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guarded_reports_panics_and_gpu_errors_as_errors() {
+        if std::env::var_os("WGPU_FFT_RUN_GPU_TESTS").is_none() {
+            eprintln!("skipping GPU test; set WGPU_FFT_RUN_GPU_TESTS=1 to run it");
+            return;
+        }
+        let context = initialize_gpu(wgpu::PowerPreference::HighPerformance, false).unwrap();
+        // MAP_READ may only be combined with COPY_DST.
+        let invalid_buffer = wgpu::BufferDescriptor {
+            label: Some("wgpu_nufft.python.test.invalid"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        };
+
+        let panicked = guarded(&context, || -> Result<(), String> { panic!("boom") });
+        assert!(panicked.unwrap_err().contains("boom"));
+
+        let scoped = guarded(&context, || {
+            context.device.create_buffer(&invalid_buffer);
+            Ok(())
+        });
+        assert!(scoped.unwrap_err().starts_with("GPU error: "));
+
+        // Outside any scope, the error is held for the next guarded call.
+        context.device.create_buffer(&invalid_buffer);
+        assert!(guarded(&context, || Ok(1)).unwrap_err().starts_with("GPU error: "));
+
+        assert_eq!(guarded(&context, || Ok(2)), Ok(2));
+        std::mem::forget(context);
+    }
 
     #[test]
     fn non_square_mode_repacking_is_inverse() {
