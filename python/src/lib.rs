@@ -1386,14 +1386,16 @@ mod tests {
         assert!(panicked.unwrap_err().contains("boom"));
 
         let scoped = guarded(&context, || {
-            context.device.create_buffer(&invalid_buffer);
+            drop(context.device.create_buffer(&invalid_buffer));
             Ok(())
         });
         assert!(scoped.unwrap_err().starts_with("GPU error: "));
 
         // Outside any scope, the error is held for the next guarded call.
-        context.device.create_buffer(&invalid_buffer);
-        assert!(guarded(&context, || Ok(1)).unwrap_err().starts_with("GPU error: "));
+        drop(context.device.create_buffer(&invalid_buffer));
+        assert!(guarded(&context, || Ok(1))
+            .unwrap_err()
+            .starts_with("GPU error: "));
 
         assert_eq!(guarded(&context, || Ok(2)), Ok(2));
         std::mem::forget(context);
