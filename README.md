@@ -208,6 +208,22 @@ weight as `(j + hi) + lo` without refolding coordinates:
 F64/Df64 plans, smaller grids, and devices without the required workgroup
 limits keep the per-cell gather and direct interpolation.
 
+### Known limitation: clustered points
+
+Type-1 plans cost roughly `n log n` in the largest number of points that share
+one coarse bin. Two steps are serial for such a bin: restoring input order,
+where one invocation heap-sorts every bin above 64 points, and the gather,
+where each tile's invocation walks every point in reach. Uniformly spread
+points put only a handful in each bin, but tightly clustered inputs, such as
+displacement vectors near zero, do not. 65,536 points inside a
+single bin take about 24 ms in 1D, 150 ms in 2D and 120 ms in 3D per
+execution.
+
+Around a million points in one bin, a single dispatch can run long enough for
+the Windows TDR watchdog to reset the GPU driver, which ends every process
+using the GPU. Until large bins are sorted and gathered in parallel, keep
+heavily clustered type-1 inputs well below that size.
+
 ### Reusing a point set
 
 `NufftPlan::set_points_gpu` records the point-dependent work (for the F32
