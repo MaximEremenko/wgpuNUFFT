@@ -10,6 +10,9 @@ pub(crate) struct Type1ScratchBuffers {
     pub(crate) bin_counts: wgpu::Buffer,
     pub(crate) bin_cursors: wgpu::Buffer,
     pub(crate) bin_offsets: wgpu::Buffer,
+    /// Set by the small-bin sort when a bin exceeds its limit; read by the
+    /// large-bin sort.
+    pub(crate) large_bin_flag: wgpu::Buffer,
     device: wgpu::Device,
     sorted_indices: Mutex<GrowableBuffer>,
     label_prefix: &'static str,
@@ -48,6 +51,12 @@ impl Type1ScratchBuffers {
                 label: Some(&offset_label),
                 size: offset_bytes,
                 usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            }),
+            large_bin_flag: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("{label_prefix}.large_bin_flag")),
+                size: 4,
+                usage: atomic_usage,
                 mapped_at_creation: false,
             }),
             device: device.clone(),

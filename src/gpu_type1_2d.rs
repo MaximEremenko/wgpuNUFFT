@@ -9,6 +9,7 @@ use crate::config::{NufftConfig, NufftSign};
 use crate::direct::mode_for_storage_index;
 use crate::error::{NufftError, Result};
 use crate::gpu::max_supported_workgroup_size;
+use crate::gpu_bin_sort::{generate_small_bin_sort_wgsl, LargeBinSort};
 use crate::gpu_dispatch::split_workgroups;
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::{GpuProfileQueryWriter, NufftGpuProfileLayout};
@@ -720,6 +721,7 @@ struct PerCellSpread2d {
     gather_pipeline: wgpu::ComputePipeline,
     gather_layout: wgpu::BindGroupLayout,
     sort_dispatch: (u32, u32, u32),
+    large_bin_sort: LargeBinSort,
     gather_workgroups_per_vector_block: u32,
     fine_count: usize,
 }
@@ -773,7 +775,7 @@ impl PerCellSpread2d {
         let sort_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.type1_2d.bin_sort",
-            &generate_sort_wgsl(),
+            &generate_small_bin_sort_wgsl(WORKGROUP_SIZE),
         );
         let sort_layout = sort_pipeline.get_bind_group_layout(0);
         let (gather_label, gather_source, gather_workgroups_per_vector_block) = match precision {
@@ -842,6 +844,7 @@ impl PerCellSpread2d {
             gather_pipeline,
             gather_layout,
             sort_dispatch,
+            large_bin_sort: LargeBinSort::new(device),
             gather_workgroups_per_vector_block,
             fine_count,
         })
@@ -944,6 +947,10 @@ impl PerCellSpread2d {
                     resource: bin_offsets.as_entire_binding(),
                 },
                 binding_entry(1, &sorted_indices, index_bytes),
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.scratch.large_bin_flag.as_entire_binding(),
+                },
             ],
         });
         let gather_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -974,6 +981,7 @@ impl PerCellSpread2d {
         profile.encode_start_marker(recorder);
         recorder.clear_buffer(bin_counts, 0, None);
         recorder.clear_buffer(bin_cursors, 0, None);
+        recorder.clear_buffer(&self.scratch.large_bin_flag, 0, None);
         encode_pass(
             recorder,
             "wgpu_nufft.type1_2d.bin_count.pass",
@@ -1012,6 +1020,16 @@ impl PerCellSpread2d {
             #[cfg(feature = "gpu-profiling")]
             profile.timestamp_writes(None, Some(4)),
         );
+        // The small-bin sort flagged any bin it left for these stages.
+        self.large_bin_sort.encode(
+            device,
+            recorder,
+            &self.scratch.bin_offsets,
+            self.scratch.bin_offsets.size(),
+            &self.scratch.large_bin_flag,
+            &sorted_indices,
+            point_count,
+        )?;
         encode_pass(
             recorder,
             "wgpu_nufft.type1_2d.spread_gather.pass",
@@ -1577,73 +1595,6 @@ fn main(
 "#,
     );
     format!("{position}\n{entry}")
-}
-
-fn generate_sort_wgsl() -> String {
-    format!(
-        r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
-
-@group(0) @binding(0) var<storage, read> bin_offsets: array<u32>;
-@group(0) @binding(1) var<storage, read_write> sorted_indices: array<u32>;
-
-fn swap_indices(left: u32, right: u32) {{
-    let temporary = sorted_indices[left];
-    sorted_indices[left] = sorted_indices[right];
-    sorted_indices[right] = temporary;
-}}
-
-fn sift_down(start: u32, count: u32, initial_root: u32) {{
-    var root = initial_root;
-    loop {{
-        let child = root * 2u + 1u;
-        if (child >= count) {{ break; }}
-        var greatest = root;
-        if (sorted_indices[start + greatest] < sorted_indices[start + child]) {{
-            greatest = child;
-        }}
-        if (child + 1u < count &&
-            sorted_indices[start + greatest] < sorted_indices[start + child + 1u]) {{
-            greatest = child + 1u;
-        }}
-        if (greatest == root) {{ break; }}
-        swap_indices(start + root, start + greatest);
-        root = greatest;
-    }}
-}}
-
-fn heap_sort(start: u32, end: u32) {{
-    let count = end - start;
-    if (count < 2u) {{ return; }}
-    var root = count / 2u;
-    loop {{
-        if (root == 0u) {{ break; }}
-        root = root - 1u;
-        sift_down(start, count, root);
-    }}
-    var remaining = count;
-    loop {{
-        if (remaining <= 1u) {{ break; }}
-        remaining = remaining - 1u;
-        swap_indices(start, start + remaining);
-        sift_down(start, remaining, 0u);
-    }}
-}}
-
-@compute @workgroup_size({WORKGROUP_SIZE})
-fn main(
-    @builtin(local_invocation_id) lid: vec3<u32>,
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(num_workgroups) nwg: vec3<u32>,
-) {{
-    let total_bins = arrayLength(&bin_offsets) - 1u;
-    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
-    if (wg_flat > (total_bins - 1u) / WORKGROUP_SIZE) {{ return; }}
-    let bin = wg_flat * WORKGROUP_SIZE + lid.x;
-    if (bin >= total_bins) {{ return; }}
-    heap_sort(bin_offsets[bin], bin_offsets[bin + 1u]);
-}}
-"#,
-    )
 }
 
 fn generate_gather_wgsl(kernel: EsKernel, fine_shape: [usize; DIMENSIONS]) -> String {
@@ -2979,14 +2930,6 @@ mod tests {
             (16_384, 1, 1)
         );
         assert_eq!(tiled_gather_tile_counts([30, 36]).unwrap(), (2, 3, 6));
-    }
-
-    #[test]
-    fn each_flattened_bin_is_sorted_by_original_point_index() {
-        let source = generate_sort_wgsl();
-        assert!(source.contains("fn heap_sort(start: u32, end: u32)"));
-        assert!(source.contains("sorted_indices[start + greatest] <"));
-        assert!(source.contains("heap_sort(bin_offsets[bin], bin_offsets[bin + 1u]);"));
     }
 
     #[test]

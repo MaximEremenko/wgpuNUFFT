@@ -22,14 +22,16 @@
 //! straight to its slot; larger sets scatter point indices first and then
 //! prepare in slot order, which keeps the wide writes coalesced.
 //! [`PointBinOrder::Stable`] bins with the exact df64
-//! fold and restores original point order inside every bin with a per-bin
-//! sort before preparing, so the order is deterministic; the 3D type-1 block
-//! spreader sums points in this order, walking the bins through
+//! fold and restores original point order inside every bin, so the order is
+//! deterministic: [`LargeBinSort`] sorts bins above [`SMALL_BIN`] points in
+//! parallel, and the prepare pass ranks the points of smaller bins. The type-1
+//! spreaders sum points in this order, walking the bins through
 //! [`PointBins::bin_offsets`].
 
 use std::sync::Mutex;
 
 use crate::error::{NufftError, Result};
+use crate::gpu_bin_sort::{LargeBinSort, SMALL_BIN};
 use crate::gpu_dispatch::split_workgroups;
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::GpuProfileQueryWriter;
@@ -37,7 +39,7 @@ use crate::gpu_recorder::GpuRecorder;
 use crate::gpu_scan::GpuExclusiveScanU32;
 use crate::gpu_type1_3d::{
     binding_entry, checked_buffer_size, create_compute_pipeline, encode_pass, format_wgsl_f32,
-    generate_sort_wgsl, validate_binding_limit, validate_buffer_limit,
+    validate_binding_limit, validate_buffer_limit,
 };
 use crate::kernel::EsKernel;
 
@@ -49,11 +51,6 @@ const POINT_SLOT_BYTES: u64 = 8;
 const PREPARED_START_BYTES: u64 = 16;
 /// One `vec2<f32>` high/low offset `start - position` per axis.
 const PREPARED_OFFSET_BYTES_PER_AXIS: u64 = 8;
-/// Largest bin that stable mode orders by ranking instead of sorting: every
-/// point of such a bin counts the bin's smaller point indices, which is
-/// quadratic per bin but runs one invocation per point. Larger bins keep a
-/// one-invocation heap sort.
-const SMALL_BIN: u32 = 64;
 /// Largest prepared footprint written by the fused scatter-and-prepare pass.
 /// Its writes land in random slots; the fused pass
 /// beat the indexed passes by 13-17% up to 32 MiB (2D, 1M points) but was
@@ -118,7 +115,8 @@ pub(crate) struct PreparedPoints {
 pub(crate) struct PointBins {
     dimensions: usize,
     /// One count per bin plus a trailing zero, so the scan also yields the
-    /// total.
+    /// total, and behind them the flag stable counting sets when a bin holds
+    /// more than [`SMALL_BIN`] points.
     bin_counts: wgpu::Buffer,
     bin_offsets: wgpu::Buffer,
     point_slots: GrowOnlyBuffer,
@@ -140,21 +138,15 @@ struct FusedPrepare {
     layout: wgpu::BindGroupLayout,
 }
 
-/// Index scatter, the per-bin sort of stable mode, then preparation in slot
-/// order.
+/// Index scatter, the large-bin sort of stable mode, then preparation in
+/// slot order.
 struct IndexedPrepare {
     scatter_pipeline: wgpu::ComputePipeline,
     scatter_layout: wgpu::BindGroupLayout,
-    sort: Option<BinSort>,
+    sort: Option<LargeBinSort>,
     prepare_pipeline: wgpu::ComputePipeline,
     prepare_layout: wgpu::BindGroupLayout,
     sorted_indices: GrowOnlyBuffer,
-}
-
-struct BinSort {
-    pipeline: wgpu::ComputePipeline,
-    layout: wgpu::BindGroupLayout,
-    dispatch: (u32, u32, u32),
 }
 
 impl PointBins {
@@ -200,19 +192,21 @@ impl PointBins {
             entry_count,
             U32_BYTES,
         )?;
+        // The counts also carry the large-bin flag behind their trailing zero.
+        let count_bytes = entry_bytes + U32_BYTES;
         validate_binding_limit(
             "coarse point-bin counts and offsets",
-            entry_bytes,
+            count_bytes,
             limits.max_storage_buffer_binding_size,
         )?;
         validate_buffer_limit(
             "coarse point-bin counts and offsets",
-            entry_bytes,
+            count_bytes,
             limits.max_buffer_size,
         )?;
         let bin_counts = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wgpu_nufft.point_bins.bin_counts"),
-            size: entry_bytes,
+            size: count_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -246,25 +240,7 @@ impl PointBins {
                 pipeline,
             }
         });
-        let sort = match order {
-            PointBinOrder::Grouped => None,
-            PointBinOrder::Stable => {
-                let pipeline = create_compute_pipeline(
-                    device,
-                    "wgpu_nufft.point_bins.sort",
-                    &generate_large_bin_sort_wgsl(),
-                );
-                let workgroups = u32::try_from(bin_count.div_ceil(WORKGROUP_SIZE as usize))
-                    .map_err(|_| NufftError::LengthOverflow {
-                        context: "coarse point-bin sort workgroup count",
-                    })?;
-                Some(BinSort {
-                    layout: pipeline.get_bind_group_layout(0),
-                    pipeline,
-                    dispatch: split_workgroups(workgroups, max_workgroups_per_dimension)?,
-                })
-            }
-        };
+        let sort = (order == PointBinOrder::Stable).then(|| LargeBinSort::new(device));
         let scatter_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.point_bins.scatter",
@@ -490,23 +466,16 @@ impl PointBins {
                 .flatten(),
         );
         if let Some(sort) = &indexed.sort {
-            let sort_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("wgpu_nufft.point_bins.sort.bind_group"),
-                layout: &sort.layout,
-                entries: &[
-                    binding_entry(0, bin_offsets, offset_bytes),
-                    binding_entry(1, &sorted_indices, index_bytes),
-                ],
-            });
-            encode_pass(
+            // The count pass left the large-bin flag in the last count word.
+            sort.encode(
+                device,
                 recorder,
-                "wgpu_nufft.point_bins.sort.pass",
-                &sort.pipeline,
-                &sort_bind_group,
-                sort.dispatch,
-                #[cfg(feature = "gpu-profiling")]
-                None,
-            );
+                bin_offsets,
+                offset_bytes,
+                bin_counts,
+                &sorted_indices,
+                point_count,
+            )?;
         }
         encode_pass(
             recorder,
@@ -557,9 +526,22 @@ fn generate_bin_count_wgsl(
     for axis in (0..dimensions - 1).rev() {
         bin = format!("cell_{axis} / BIN_SIDE_{axis} + BINS_{axis} * ({bin})");
     }
+    let record = if exact {
+        // The point that overfills a small bin flags the large-bin sort,
+        // behind the counts and their trailing zero.
+        "    let rank = atomicAdd(&bin_counts[bin], 1u);
+    point_slots[point_index] = vec2<u32>(bin, rank);
+    if (rank == SMALL_BIN) {
+        atomicMax(&bin_counts[arrayLength(&bin_counts) - 1u], 1u);
+    }
+"
+    } else {
+        "    point_slots[point_index] = vec2<u32>(bin, atomicAdd(&bin_counts[bin], 1u));\n"
+    };
     let entry = format!(
         r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
 const POINT_DIMENSIONS: u32 = {dimensions}u;
+const SMALL_BIN: u32 = {SMALL_BIN}u;
 {constants}
 @group(0) @binding(0) var<storage, read> points: array<f32>;
 @group(0) @binding(1) var<storage, read_write> bin_counts: array<atomic<u32>>;
@@ -587,8 +569,7 @@ fn main(
 
     let point_base = point_index * POINT_DIMENSIONS;
 {cells}    let bin = {bin};
-    point_slots[point_index] = vec2<u32>(bin, atomicAdd(&bin_counts[bin], 1u));
-}}
+{record}}}
 "#,
     );
     format!("{}\n{position_wgsl}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
@@ -674,8 +655,8 @@ fn prepare_statements(dimensions: usize) -> String {
 
 /// Prepares binned points in slot order. In stable mode the scatter left
 /// small bins in atomic order: each of their points then takes the slot of
-/// its rank by original index within the bin, while larger bins were
-/// heap-sorted beforehand and keep their slots.
+/// its rank by original index within the bin, while [`LargeBinSort`] already
+/// ordered the larger bins, whose points keep their slots.
 fn generate_prepare_wgsl(
     kernel: EsKernel,
     dimensions: usize,
@@ -730,25 +711,6 @@ fn main(
 "#,
     );
     format!("{}\n{position_wgsl}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
-}
-
-/// The per-bin heap sort restricted to bins above [`SMALL_BIN`] points.
-fn generate_large_bin_sort_wgsl() -> String {
-    let source = generate_sort_wgsl();
-    let call = "    heap_sort(bin_offsets[bin], bin_offsets[bin + 1u]);";
-    assert!(
-        source.contains(call),
-        "sort shader no longer contains {call:?}"
-    );
-    source.replace(
-        call,
-        &format!(
-            "    let start = bin_offsets[bin];
-    let end = bin_offsets[bin + 1u];
-    // The prepare pass ranks the points of smaller bins directly.
-    if (end - start > {SMALL_BIN}u) {{ heap_sort(start, end); }}"
-        ),
-    )
 }
 
 fn generate_scatter_prepare_wgsl(
@@ -841,7 +803,6 @@ mod tests {
             generate_prepare_wgsl(kernel, 3, true, &position_3d),
             generate_scatter_prepare_wgsl(kernel, 2, &position_2d),
             generate_bin_scatter_wgsl(),
-            generate_large_bin_sort_wgsl(),
         ] {
             assert_valid_wgsl(&source);
         }
