@@ -187,9 +187,9 @@ Executions on a given plan must remain in queue order.
 F32 plans whose fine grid is large enough (at `eps = 1e-6`, at least 18 cells
 per axis in 1D and 2D, and 32/32/22 cells in 3D) use coarse-bin paths instead.
 The points are grouped into small bins once (integer-atomic counts, a prefix
-scan, and, for type 1, a per-bin sort back into input order), and every point's
-support start and df64 offset are prepared once, so the kernels evaluate every
-weight as `(j + hi) + lo` without refolding coordinates:
+scan, and, for type 1, a sort back into input order inside every bin), and
+every point's support start and df64 offset are prepared once, so the kernels
+evaluate every weight as `(j + hi) + lo` without refolding coordinates:
 
 - Type-1 spreading stays output-stationary. In 1D each invocation owns four
   consecutive fine-grid cells and in 2D a `4x4` tile, and walks only the few
@@ -208,21 +208,26 @@ weight as `(j + hi) + lo` without refolding coordinates:
 F64/Df64 plans, smaller grids, and devices without the required workgroup
 limits keep the per-cell gather and direct interpolation.
 
-### Known limitation: clustered points
+### Clustered points
 
-Type-1 plans cost roughly `n log n` in the largest number of points that share
-one coarse bin. Two steps are serial for such a bin: restoring input order,
-where one invocation heap-sorts every bin above 64 points, and the gather,
-where each tile's invocation walks every point in reach. Uniformly spread
-points put only a handful in each bin, but tightly clustered inputs, such as
-displacement vectors near zero, do not. 65,536 points inside a
-single bin take about 24 ms in 1D, 150 ms in 2D and 120 ms in 3D per
-execution.
+Tightly clustered inputs, such as displacement vectors near zero, put many
+points into a few coarse bins. Type-1 plans keep such inputs parallel and
+deterministic:
 
-Around a million points in one bin, a single dispatch can run long enough for
-the Windows TDR watchdog to reset the GPU driver, which ends every process
-using the GPU. Until large bins are sorted and gathered in parallel, keep
-heavily clustered type-1 inputs well below that size.
+- Restoring input order inside a bin ranks the points of bins up to 64 points
+  and sorts larger bins with a parallel merge sort over all invocations,
+  instead of one invocation per bin.
+- A gather tile or block whose reach holds more records than a fixed limit is
+  handed to a heavy pass: in 1D and 2D a whole workgroup shares the tile, and
+  in 3D the block's records are split into parts, one workgroup each. Every
+  heavy path takes records in a fixed order and adds partial sums in a fixed
+  order, so outputs stay bitwise repeatable.
+
+4,194,304 points inside a single bin take about 44 ms in 1D,
+69 ms in 2D and 93 ms in 3D per execution, far from the Windows TDR limit.
+Evenly spread points pay a few microseconds for the checks. F64 and Df64
+plans, and grids too small for the coarse-bin paths, sort in parallel too but
+keep the per-cell gather, which still walks each cell's reach serially.
 
 ### Reusing a point set
 

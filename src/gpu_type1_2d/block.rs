@@ -11,6 +11,13 @@
 //! kernel weight into `es_weight((j + hi) + lo)`, without df64 folding, and
 //! a permutation pass first copies the strengths into bin order, so the
 //! gather reads them as contiguously as the prepared points.
+//!
+//! A dense cluster would make one invocation walk a huge reach serially, so
+//! a tile whose reach holds more than [`HEAVY_TILE_RECORDS`] records is left
+//! to a second pass, in which a whole workgroup shares the tile: every
+//! invocation takes every [`HEAVY_WORKGROUP_SIZE`]-th record in reach order,
+//! and the partial sums meet in a fixed-order tree, so those cells stay
+//! deterministic too.
 
 use std::sync::Mutex;
 
@@ -32,6 +39,15 @@ const WORKGROUP_SIZE: u32 = 64;
 const BIN_SIDE: usize = 4;
 /// Fine-grid cells owned by one invocation, axis zero first.
 const TILE: [usize; DIMENSIONS] = [4, 4];
+/// Records in reach above which a tile goes to the heavy pass. One
+/// invocation spends about 0.7 us per record.
+const HEAVY_TILE_RECORDS: u32 = 2048;
+/// Invocations sharing one heavy tile.
+const HEAVY_WORKGROUP_SIZE: u32 = 256;
+/// Tile cells summed per round of the heavy pass's workgroup reduction.
+const HEAVY_CELLS_PER_ROUND: usize = 4;
+/// Workgroups of the heavy pass, which stride over the heavy tiles.
+const HEAVY_WORKGROUPS: u32 = 128;
 
 /// Static geometry of the tile gather for one plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +108,11 @@ pub(super) struct BlockSpread2d {
     permute_layout: wgpu::BindGroupLayout,
     spread_pipeline: wgpu::ComputePipeline,
     spread_layout: wgpu::BindGroupLayout,
+    heavy_pipeline: wgpu::ComputePipeline,
+    heavy_layout: wgpu::BindGroupLayout,
+    /// A count and the tiles left to the heavy pass; the permutation pass
+    /// resets the count.
+    heavy_tiles: wgpu::Buffer,
     /// Strengths in bin order, grown on demand.
     binned_strengths: Mutex<Option<wgpu::Buffer>>,
     device: wgpu::Device,
@@ -119,6 +140,17 @@ impl BlockSpread2d {
             &generate_tile_gather_wgsl(kernel, fine_shape, layout),
         );
         let spread_layout = spread_pipeline.get_bind_group_layout(0);
+        let heavy_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1_2d.heavy_tile_gather",
+            &generate_heavy_tile_gather_wgsl(kernel, fine_shape, layout),
+        );
+        let heavy_tiles = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu_nufft.type1_2d.heavy_tiles"),
+            size: (layout.tile_count() as u64 + 1) * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let permute_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.type1_2d.permute_strengths",
@@ -131,6 +163,9 @@ impl BlockSpread2d {
             permute_pipeline,
             spread_pipeline,
             spread_layout,
+            heavy_layout: heavy_pipeline.get_bind_group_layout(0),
+            heavy_pipeline,
+            heavy_tiles,
             binned_strengths: Mutex::new(None),
             device: device.clone(),
             max_workgroups_per_dimension: device.limits().max_compute_workgroups_per_dimension,
@@ -206,18 +241,26 @@ impl BlockSpread2d {
                 binding_entry(0, &prepared.starts, prepared.start_bytes),
                 binding_entry(1, strengths, strength_bytes),
                 binding_entry(2, &binned_strengths, strength_bytes),
+                binding_entry(3, &self.heavy_tiles, self.heavy_tiles.size()),
             ],
         });
+        let gather_entries = [
+            binding_entry(0, &prepared.starts, prepared.start_bytes),
+            binding_entry(1, &prepared.offsets, prepared.offset_bytes),
+            binding_entry(2, &binned_strengths, strength_bytes),
+            binding_entry(3, bin_offsets, bin_offsets.size()),
+            binding_entry(4, fine_grid, active_fine_bytes),
+            binding_entry(5, &self.heavy_tiles, self.heavy_tiles.size()),
+        ];
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.type1_2d.tile_gather.bind_group"),
             layout: &self.spread_layout,
-            entries: &[
-                binding_entry(0, &prepared.starts, prepared.start_bytes),
-                binding_entry(1, &prepared.offsets, prepared.offset_bytes),
-                binding_entry(2, &binned_strengths, strength_bytes),
-                binding_entry(3, bin_offsets, bin_offsets.size()),
-                binding_entry(4, fine_grid, active_fine_bytes),
-            ],
+            entries: &gather_entries,
+        });
+        let heavy_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1_2d.heavy_tile_gather.bind_group"),
+            layout: &self.heavy_layout,
+            entries: &gather_entries,
         });
         let permute_workgroups = point_count
             .checked_mul(active_batch)
@@ -252,6 +295,15 @@ impl BlockSpread2d {
             &bind_group,
             dispatch,
             #[cfg(feature = "gpu-profiling")]
+            None,
+        );
+        encode_pass(
+            recorder,
+            "wgpu_nufft.type1_2d.heavy_tile_gather.pass",
+            &self.heavy_pipeline,
+            &heavy_bind_group,
+            (HEAVY_WORKGROUPS, 1, 1),
+            #[cfg(feature = "gpu-profiling")]
             profile.timestamp_writes(None, Some(5)),
         );
         Ok(())
@@ -259,7 +311,8 @@ impl BlockSpread2d {
 }
 
 /// Copies transform-major strengths into bin order: slot `s` of every
-/// vector receives the strength of the point prepared into slot `s`.
+/// vector receives the strength of the point prepared into slot `s`. It also
+/// resets the heavy-tile count for the gather that follows.
 fn generate_permute_wgsl() -> String {
     format!(
         r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
@@ -267,6 +320,7 @@ fn generate_permute_wgsl() -> String {
 @group(0) @binding(0) var<storage, read> prepared_starts: array<vec4<i32>>;
 @group(0) @binding(1) var<storage, read> strengths: array<vec2<f32>>;
 @group(0) @binding(2) var<storage, read_write> binned_strengths: array<vec2<f32>>;
+@group(0) @binding(3) var<storage, read_write> heavy_tiles: array<u32>;
 
 @compute @workgroup_size({WORKGROUP_SIZE})
 fn main(
@@ -279,6 +333,7 @@ fn main(
     if (wg_flat > (total - 1u) / WORKGROUP_SIZE) {{ return; }}
     let index = wg_flat * WORKGROUP_SIZE + lid.x;
     if (index >= total) {{ return; }}
+    if (index == 0u) {{ heavy_tiles[0] = 0u; }}
     let point_count = arrayLength(&prepared_starts);
     let vector_base = (index / point_count) * point_count;
     let slot = index - vector_base;
@@ -288,63 +343,13 @@ fn main(
     )
 }
 
-fn generate_tile_gather_wgsl(
-    kernel: EsKernel,
-    fine_shape: [usize; DIMENSIONS],
-    layout: BlockLayout2d,
-) -> String {
-    let position = generate_position_wgsl(fine_shape);
+/// Constants, bindings 0-4 and helper functions shared by the tile gathers.
+fn tile_gather_common(kernel: EsKernel, layout: BlockLayout2d) -> String {
     let width = layout.width;
-    let initialize: String = (0..TILE[1])
-        .flat_map(|row| {
-            (0..TILE[0])
-                .map(move |column| format!("    var sum_{row}_{column} = vec2<f32>(0.0, 0.0);\n"))
-        })
-        .collect();
-    let axis_weights = |axis: usize, name: &str, length: &str| -> String {
-        (0..TILE[axis])
-            .map(|cell| {
-                format!(
-                    "        var {name}{cell} = 0.0;
-        {{
-            var offset = base_{axis} + {cell};
-            if (offset >= {length}) {{ offset = offset - {length}; }}
-            if (offset < WIDTH_I32) {{
-                {name}{cell} = es_weight((f32(offset) + offset_{axis}.x) + offset_{axis}.y);
-            }}
-        }}
-"
-                )
-            })
-            .collect()
-    };
-    let weights_0 = axis_weights(0, "wx", "FINE_0_I32");
-    let weights_1 = axis_weights(1, "wy", "FINE_1_I32");
-    let accumulate: String = (0..TILE[1])
-        .map(|row| {
-            let columns: String = (0..TILE[0])
-                .map(|column| {
-                    format!(
-                        "                    sum_{row}_{column} = sum_{row}_{column} + value_{row} * wx{column};\n"
-                    )
-                })
-                .collect();
-            format!(
-                "                {{\n                    let value_{row} = value * wy{row};\n{columns}                }}\n"
-            )
-        })
-        .collect();
-    let store: String = (0..TILE[1])
-        .flat_map(|row| {
-            (0..TILE[0]).map(move |column| {
-                format!(
-                    "    if (x0 + {column} < FINE_0_I32 && y0 + {row} < FINE_1_I32) {{ fine_grid[row_base + u32(x0 + {column}) + FINE_0 * u32(y0 + {row})] = sum_{row}_{column}; }}\n"
-                )
-            })
-        })
-        .collect();
-    let entry = format!(
+    format!(
         r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
+const HEAVY_WORKGROUP_SIZE: u32 = {HEAVY_WORKGROUP_SIZE}u;
+const HEAVY_TILE_RECORDS: u32 = {HEAVY_TILE_RECORDS}u;
 const WIDTH_I32: i32 = {width}i;
 const WIDTH_F32: f32 = {width}.0;
 const BETA: f32 = {beta};
@@ -408,6 +413,133 @@ fn wrap_offset(offset: i32, fine_length: i32) -> i32 {{
     return wrapped;
 }}
 
+// The first and last bin along axis 0 of piece `piece` of a row's reach.
+fn row_piece_bins(ranges: BinRanges, piece: i32) -> vec2<i32> {{
+    if (piece == 1) {{ return vec2<i32>(ranges.first_1, ranges.last_1); }}
+    return vec2<i32>(ranges.first_0, ranges.last_0);
+}}
+"#,
+        beta = format_wgsl_f32(kernel.beta() as f32),
+        bins_0 = layout.bins[0],
+        tile_0 = TILE[0],
+        tile_1 = TILE[1],
+        tiles_0 = layout.tiles[0],
+        tile_count = layout.tile_count(),
+        reach_below = width.div_ceil(2),
+        reach_above = width / 2,
+    )
+}
+
+/// Statements locating the tile of `tile` and `vector_index` and its reach.
+const TILE_REACH: &str = r#"    let x0 = i32(tile % TILES_0) * TILE_0;
+    let y0 = i32(tile / TILES_0) * TILE_1;
+    let strength_base = vector_index * arrayLength(&prepared_starts);
+    let ranges_0 = bin_ranges(x0 - REACH_BELOW, x0 + TILE_0 - 1 + REACH_ABOVE, FINE_0_I32);
+    let ranges_1 = bin_ranges(y0 - REACH_BELOW, y0 + TILE_1 - 1 + REACH_ABOVE, FINE_1_I32);
+    let bin_rows = bin_range_length(ranges_1);
+    // The x bins of one bin row hold consecutive records, split in two only
+    // where the tile's reach wraps around the grid.
+    let row_pieces = select(1, 2, ranges_0.last_1 >= ranges_0.first_1);
+"#;
+
+/// Indents every nonempty line of `block` by `spaces`.
+fn indent(block: &str, spaces: usize) -> String {
+    let pad = " ".repeat(spaces);
+    block
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                "\n".to_string()
+            } else {
+                format!("{pad}{line}\n")
+            }
+        })
+        .collect()
+}
+
+/// The register sums of a tile's cells.
+fn tile_sums() -> String {
+    (0..TILE[1])
+        .flat_map(|row| {
+            (0..TILE[0])
+                .map(move |column| format!("var sum_{row}_{column} = vec2<f32>(0.0, 0.0);\n"))
+        })
+        .collect()
+}
+
+/// Adds the point prepared into `slot` to the tile's register sums, or
+/// `continue`s when its support misses the tile.
+fn tile_contribution() -> String {
+    let axis_weights = |axis: usize, name: &str, length: &str| -> String {
+        (0..TILE[axis])
+            .map(|cell| {
+                format!(
+                    "var {name}{cell} = 0.0;
+{{
+    var offset = base_{axis} + {cell};
+    if (offset >= {length}) {{ offset = offset - {length}; }}
+    if (offset < WIDTH_I32) {{
+        {name}{cell} = es_weight((f32(offset) + offset_{axis}.x) + offset_{axis}.y);
+    }}
+}}
+"
+                )
+            })
+            .collect()
+    };
+    let accumulate: String = (0..TILE[1])
+        .map(|row| {
+            let columns: String = (0..TILE[0])
+                .map(|column| {
+                    format!(
+                        "    sum_{row}_{column} = sum_{row}_{column} + value_{row} * wx{column};\n"
+                    )
+                })
+                .collect();
+            format!("{{\n    let value_{row} = value * wy{row};\n{columns}}}\n")
+        })
+        .collect();
+    format!(
+        "let start = prepared_starts[slot];
+let base_0 = wrap_offset(x0 - start.x, FINE_0_I32);
+let base_1 = wrap_offset(y0 - start.y, FINE_1_I32);
+// The support [start, start + width) meets the tile when some tile cell's
+// periodic offset from the start lies below the width.
+if ((base_0 >= WIDTH_I32 && base_0 <= FINE_0_I32 - TILE_0)
+    || (base_1 >= WIDTH_I32 && base_1 <= FINE_1_I32 - TILE_1)) {{
+    continue;
+}}
+let offset_0 = prepared_offsets[2u * slot];
+let offset_1 = prepared_offsets[2u * slot + 1u];
+{weights_0}{weights_1}let value = strengths[strength_base + slot];
+{accumulate}",
+        weights_0 = axis_weights(0, "wx", "FINE_0_I32"),
+        weights_1 = axis_weights(1, "wy", "FINE_1_I32"),
+    )
+}
+
+fn generate_tile_gather_wgsl(
+    kernel: EsKernel,
+    fine_shape: [usize; DIMENSIONS],
+    layout: BlockLayout2d,
+) -> String {
+    let position = generate_position_wgsl(fine_shape);
+    let common = tile_gather_common(kernel, layout);
+    let sums = indent(&tile_sums(), 4);
+    let contribution = indent(&tile_contribution(), 8);
+    let store: String = (0..TILE[1])
+        .flat_map(|row| {
+            (0..TILE[0]).map(move |column| {
+                format!(
+                    "    if (x0 + {column} < FINE_0_I32 && y0 + {row} < FINE_1_I32) {{ fine_grid[row_base + u32(x0 + {column}) + FINE_0 * u32(y0 + {row})] = sum_{row}_{column}; }}\n"
+                )
+            })
+        })
+        .collect();
+    let entry = format!(
+        r#"{common}
+@group(0) @binding(5) var<storage, read_write> heavy_tiles: array<atomic<u32>>;
+
 @compute @workgroup_size({WORKGROUP_SIZE})
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -420,18 +552,8 @@ fn main(
     if (index >= TILE_COUNT * total_vectors) {{ return; }}
     let vector_index = index / TILE_COUNT;
     let tile = index - vector_index * TILE_COUNT;
-    let x0 = i32(tile % TILES_0) * TILE_0;
-    let y0 = i32(tile / TILES_0) * TILE_1;
-    let point_count = arrayLength(&prepared_starts);
-    let strength_base = vector_index * point_count;
-
-    let ranges_0 = bin_ranges(x0 - REACH_BELOW, x0 + TILE_0 - 1 + REACH_ABOVE, FINE_0_I32);
-    let ranges_1 = bin_ranges(y0 - REACH_BELOW, y0 + TILE_1 - 1 + REACH_ABOVE, FINE_1_I32);
-    let bin_rows = bin_range_length(ranges_1);
-    // The x bins of one bin row hold consecutive records, split in two only
-    // where the tile's reach wraps around the grid.
-    let row_pieces = select(1, 2, ranges_0.last_1 >= ranges_0.first_1);
-{initialize}
+{TILE_REACH}
+{sums}
     // Rows and pieces in a fixed order, then records in bin order and stable
     // in-bin order. One flat loop moves to the next range inline, so lanes
     // of a warp diverge by their total record counts rather than reconverging
@@ -440,6 +562,7 @@ fn main(
     var piece = row_pieces - 1;
     var record = 0u;
     var end = 0u;
+    var reach_records = 0u;
     loop {{
         if (record >= end) {{
             piece = piece + 1;
@@ -449,43 +572,135 @@ fn main(
                 if (item_1 == bin_rows) {{ break; }}
             }}
             let row_bin = BINS_0 * bin_range_item(ranges_1, item_1);
-            var first = ranges_0.first_0;
-            var last = ranges_0.last_0;
-            if (piece == 1) {{
-                first = ranges_0.first_1;
-                last = ranges_0.last_1;
+            let piece_bins = row_piece_bins(ranges_0, piece);
+            record = bin_offsets[u32(row_bin + piece_bins.x)];
+            end = bin_offsets[u32(row_bin + piece_bins.y) + 1u];
+            // A dense cluster would serialize this invocation: once the reach
+            // passes the limit, the tile goes to the heavy pass, which writes
+            // its cells for every vector. The running total costs no reads.
+            reach_records = reach_records + (end - record);
+            if (reach_records > HEAVY_TILE_RECORDS) {{
+                if (vector_index == 0u) {{
+                    atomicStore(&heavy_tiles[atomicAdd(&heavy_tiles[0], 1u) + 1u], tile);
+                }}
+                return;
             }}
-            record = bin_offsets[u32(row_bin + first)];
-            end = bin_offsets[u32(row_bin + last) + 1u];
             continue;
         }}
-        let start = prepared_starts[record];
-        let base_0 = wrap_offset(x0 - start.x, FINE_0_I32);
-        let base_1 = wrap_offset(y0 - start.y, FINE_1_I32);
+        let slot = record;
         record = record + 1u;
-        // The support [start, start + width) meets the tile when some tile
-        // cell's periodic offset from the start lies below the width.
-        if ((base_0 >= WIDTH_I32 && base_0 <= FINE_0_I32 - TILE_0)
-            || (base_1 >= WIDTH_I32 && base_1 <= FINE_1_I32 - TILE_1)) {{
-            continue;
-        }}
-        let slot = record - 1u;
-        let offset_0 = prepared_offsets[2u * slot];
-        let offset_1 = prepared_offsets[2u * slot + 1u];
-{weights_0}{weights_1}        let value = strengths[strength_base + slot];
-{accumulate}    }}
+{contribution}    }}
 
     let row_base = vector_index * FINE_COUNT;
 {store}}}
 "#,
-        beta = format_wgsl_f32(kernel.beta() as f32),
-        bins_0 = layout.bins[0],
-        tile_0 = TILE[0],
-        tile_1 = TILE[1],
-        tiles_0 = layout.tiles[0],
-        tile_count = layout.tile_count(),
-        reach_below = width.div_ceil(2),
-        reach_above = width / 2,
+    );
+    format!("{}\n{position}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
+}
+
+/// The heavy pass: every workgroup strides over the (heavy tile, vector)
+/// pairs the tile gather left. Each invocation sums every
+/// [`HEAVY_WORKGROUP_SIZE`]-th record of the tile's reach, in reach order,
+/// and a fixed-order tree in workgroup memory adds the partial sums,
+/// [`HEAVY_CELLS_PER_ROUND`] cells at a time.
+fn generate_heavy_tile_gather_wgsl(
+    kernel: EsKernel,
+    fine_shape: [usize; DIMENSIONS],
+    layout: BlockLayout2d,
+) -> String {
+    let position = generate_position_wgsl(fine_shape);
+    let common = tile_gather_common(kernel, layout);
+    let sums = indent(&tile_sums(), 8);
+    let contribution = indent(&tile_contribution(), 20);
+    let reach = indent(TILE_REACH, 4);
+    let cells: Vec<(usize, usize)> = (0..TILE[1])
+        .flat_map(|row| (0..TILE[0]).map(move |column| (row, column)))
+        .collect();
+    let reduce: String = cells
+        .chunks(HEAVY_CELLS_PER_ROUND)
+        .map(|round| {
+            let publish: String = round
+                .iter()
+                .enumerate()
+                .map(|(lane, (row, column))| {
+                    format!("        partials[{lane}u * HEAVY_WORKGROUP_SIZE + lid.x] = sum_{row}_{column};\n")
+                })
+                .collect();
+            let add: String = (0..round.len())
+                .map(|lane| {
+                    format!(
+                        "                partials[{lane}u * HEAVY_WORKGROUP_SIZE + lid.x] = partials[{lane}u * HEAVY_WORKGROUP_SIZE + lid.x]
+                    + partials[{lane}u * HEAVY_WORKGROUP_SIZE + lid.x + half];\n"
+                    )
+                })
+                .collect();
+            let store: String = round
+                .iter()
+                .enumerate()
+                .map(|(lane, (row, column))| {
+                    format!(
+                        "            if (x0 + {column} < FINE_0_I32 && y0 + {row} < FINE_1_I32) {{ fine_grid[row_base + u32(x0 + {column}) + FINE_0 * u32(y0 + {row})] = partials[{lane}u * HEAVY_WORKGROUP_SIZE]; }}\n"
+                    )
+                })
+                .collect();
+            format!(
+                "{publish}        workgroupBarrier();
+        for (var half = HEAVY_WORKGROUP_SIZE / 2u; half > 0u; half = half / 2u) {{
+            if (lid.x < half) {{
+{add}            }}
+            workgroupBarrier();
+        }}
+        if (lid.x == 0u) {{
+{store}        }}
+        workgroupBarrier();
+"
+            )
+        })
+        .collect();
+    let entry = format!(
+        r#"{common}
+@group(0) @binding(5) var<storage, read> heavy_tiles: array<u32>;
+
+var<workgroup> heavy_count: u32;
+var<workgroup> partials: array<vec2<f32>, {partial_count}>;
+
+@compute @workgroup_size({HEAVY_WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    if (lid.x == 0u) {{ heavy_count = heavy_tiles[0]; }}
+    let tiles = workgroupUniformLoad(&heavy_count);
+    let items = tiles * (arrayLength(&fine_grid) / FINE_COUNT);
+    for (var item = wid.x; item < items; item = item + nwg.x) {{
+        let vector_index = item / tiles;
+        let tile = heavy_tiles[1u + item - vector_index * tiles];
+{reach}
+{sums}
+        var ordinal = 0u;
+        for (var bin_row = 0; bin_row < bin_rows; bin_row = bin_row + 1) {{
+            let row_bin = BINS_0 * bin_range_item(ranges_1, bin_row);
+            for (var piece = 0; piece < row_pieces; piece = piece + 1) {{
+                let piece_bins = row_piece_bins(ranges_0, piece);
+                let range_start = bin_offsets[u32(row_bin + piece_bins.x)];
+                let range_end = bin_offsets[u32(row_bin + piece_bins.y) + 1u];
+                // This invocation's records are those whose ordinal in the
+                // reach is congruent to its index.
+                let skipped = (lid.x + HEAVY_WORKGROUP_SIZE - ordinal % HEAVY_WORKGROUP_SIZE)
+                    % HEAVY_WORKGROUP_SIZE;
+                for (var slot = range_start + skipped; slot < range_end;
+                    slot = slot + HEAVY_WORKGROUP_SIZE) {{
+{contribution}                }}
+                ordinal = ordinal + (range_end - range_start);
+            }}
+        }}
+
+        let row_base = vector_index * FINE_COUNT;
+{reduce}    }}
+}}
+"#,
+        partial_count = HEAVY_WORKGROUP_SIZE as usize * HEAVY_CELLS_PER_ROUND,
     );
     format!("{}\n{position}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
 }
@@ -513,7 +728,8 @@ mod tests {
             BlockLayout2d::for_grid(kernel, [1024, 768], &wgpu::Limits::default()).unwrap();
         let source = generate_tile_gather_wgsl(kernel, [1024, 768], layout);
         assert_valid_wgsl(&source);
-        assert!(!source.contains("atomic"));
+        // The only atomics count and list heavy tiles.
+        assert_eq!(source.matches("atomic").count(), 3);
         assert!(!source.contains("var<workgroup>"));
         assert_eq!(
             source.matches("fine_grid[row_base + ").count(),
@@ -521,5 +737,12 @@ mod tests {
         );
         assert!(source.contains("let value = strengths[strength_base + slot];"));
         assert_valid_wgsl(&generate_permute_wgsl());
+        let heavy = generate_heavy_tile_gather_wgsl(kernel, [1024, 768], layout);
+        assert_valid_wgsl(&heavy);
+        assert!(!heavy.contains("atomic"));
+        assert_eq!(
+            heavy.matches("fine_grid[row_base + ").count(),
+            TILE[0] * TILE[1]
+        );
     }
 }
