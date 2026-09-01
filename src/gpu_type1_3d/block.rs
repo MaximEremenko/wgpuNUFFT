@@ -10,13 +10,14 @@
 //! once: no float atomics, no read-modify-write, and no clearing pass.
 //!
 //! Every invocation walks all records in reach, so a dense cluster would make
-//! one workgroup run for seconds. A block whose reach holds more than
-//! [`HEAVY_BLOCK_RECORDS`] records is left to two more passes: the heavy
-//! part pass splits the block's records, in reach order, into a fixed number
-//! of parts, one workgroup each, which write partial sums to scratch, and
-//! the heavy reduce pass adds the parts of every cell in part order. The
-//! part count depends only on the plan, the point count and the batch, so
-//! those cells stay deterministic too.
+//! one workgroup run for seconds. A classify pass first flags and lists every
+//! block whose reach holds more than [`HEAVY_BLOCK_RECORDS`] records; the
+//! block spreader skips flagged blocks, the heavy part pass splits each listed
+//! block's records, in reach order, into a fixed number of parts, one
+//! workgroup each, which write partial sums to scratch, and the heavy reduce
+//! pass adds the parts of every cell in part order. The part count depends
+//! only on the plan, the point count and the batch, so those cells stay
+//! deterministic too.
 
 use std::sync::Mutex;
 
@@ -62,6 +63,8 @@ const MAX_HEAVY_PARTS: u64 = 32;
 const HEAVY_SCRATCH_BUDGET_BYTES: u64 = 64 << 20;
 /// Invocations of the heavy reduce pass, one cell each.
 const REDUCE_WORKGROUP_SIZE: u32 = 256;
+/// Invocations of the classify pass, one block each.
+const CLASSIFY_WORKGROUP_SIZE: u32 = 64;
 
 /// Static geometry of the block spreader for one plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,12 +156,16 @@ pub(super) struct BlockSpread3d {
     spread_layout: wgpu::BindGroupLayout,
     reset_pipeline: wgpu::ComputePipeline,
     reset_layout: wgpu::BindGroupLayout,
+    classify_pipeline: wgpu::ComputePipeline,
+    classify_layout: wgpu::BindGroupLayout,
     part_pipeline: wgpu::ComputePipeline,
     part_layout: wgpu::BindGroupLayout,
     reduce_pipeline: wgpu::ComputePipeline,
     reduce_layout: wgpu::BindGroupLayout,
     /// A count and the blocks left to the heavy passes, one entry per block.
     heavy_blocks: wgpu::Buffer,
+    /// Whether each block is listed, rewritten by every classify pass.
+    heavy_flags: wgpu::Buffer,
     /// Partial sums of the heavy parts, grown on demand.
     partials: Mutex<Option<wgpu::Buffer>>,
     device: wgpu::Device,
@@ -241,6 +248,17 @@ impl BlockSpread3d {
             "wgpu_nufft.type1_3d.heavy_block_reduce",
             &generate_heavy_reduce_wgsl(fine_shape, layout),
         );
+        let classify_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.type1_3d.heavy_block_classify",
+            &generate_heavy_classify_wgsl(fine_shape, layout),
+        );
+        let heavy_flags = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu_nufft.type1_3d.heavy_flags"),
+            size: layout.block_count() as u64 * 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let heavy_blocks = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wgpu_nufft.type1_3d.heavy_blocks"),
             size: (layout.block_count() as u64 + 1) * 4,
@@ -254,11 +272,14 @@ impl BlockSpread3d {
             spread_pipeline,
             reset_layout: reset_pipeline.get_bind_group_layout(0),
             reset_pipeline,
+            classify_layout: classify_pipeline.get_bind_group_layout(0),
+            classify_pipeline,
             part_layout: part_pipeline.get_bind_group_layout(0),
             part_pipeline,
             reduce_layout: reduce_pipeline.get_bind_group_layout(0),
             reduce_pipeline,
             heavy_blocks,
+            heavy_flags,
             partials: Mutex::new(None),
             device: device.clone(),
             max_workgroups_per_dimension: device.limits().max_compute_workgroups_per_dimension,
@@ -326,7 +347,7 @@ impl BlockSpread3d {
             binding_entry(2, strengths, strength_bytes),
             binding_entry(3, bin_offsets, bin_offsets.size()),
             binding_entry(4, fine_grid, active_fine_bytes),
-            binding_entry(5, &self.heavy_blocks, heavy_bytes),
+            binding_entry(5, &self.heavy_flags, self.heavy_flags.size()),
         ];
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.type1_3d.block_spread.bind_group"),
@@ -339,6 +360,28 @@ impl BlockSpread3d {
             entries: &[binding_entry(0, &self.heavy_blocks, 4)],
         });
         recorder.dispatch(&self.reset_pipeline, &reset_bind_group, (1, 1, 1));
+        let classify_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.type1_3d.heavy_block_classify.bind_group"),
+            layout: &self.classify_layout,
+            entries: &[
+                binding_entry(0, bin_offsets, bin_offsets.size()),
+                binding_entry(1, &self.heavy_blocks, heavy_bytes),
+                binding_entry(2, &self.heavy_flags, self.heavy_flags.size()),
+            ],
+        });
+        let classify_workgroups = u32::try_from(
+            self.layout
+                .block_count()
+                .div_ceil(CLASSIFY_WORKGROUP_SIZE as usize),
+        )
+        .map_err(|_| NufftError::LengthOverflow {
+            context: "type-1 3D heavy-block classify workgroup count",
+        })?;
+        recorder.dispatch(
+            &self.classify_pipeline,
+            &classify_bind_group,
+            split_workgroups(classify_workgroups, self.max_workgroups_per_dimension)?,
+        );
         let workgroups = self
             .layout
             .block_count()
@@ -517,34 +560,19 @@ fn generate_block_spread_wgsl(
     };
     let (mode_bindings, mode_workgroup, locate, records) = match mode {
         SpreadMode::Light => (
-            "@group(0) @binding(5) var<storage, read_write> heavy_blocks: array<atomic<u32>>;\n",
+            "@group(0) @binding(5) var<storage, read> heavy_flags: array<u32>;\n",
             "",
             "    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
     let total_vectors = arrayLength(&fine_grid) / FINE_COUNT;
     if (wg_flat >= BLOCK_COUNT * total_vectors) { return; }
     let vector_index = wg_flat / BLOCK_COUNT;
     let block = wg_flat - vector_index * BLOCK_COUNT;
+    // The heavy passes write listed blocks. Deciding this here, at the top,
+    // keeps the chunk loop below as it was: any heavy decision next to it
+    // made this pass 11% slower.
+    if (heavy_flags[block] != 0u) { return; }
 ",
-            "    // A dense cluster would make every invocation walk a huge reach: the
-    // heavy passes split such a block's records across workgroups instead.
-    // All reaches hold at most BLOCKS_PER_BIN * point_count records, so at
-    // most `capacity` blocks exceed floor(that / (capacity + 1)): raising the
-    // limit to it keeps the list within its binding, and the result depends
-    // only on the point count and the binding.
-    let capacity = arrayLength(&heavy_blocks) - 1u;
-    var limit = 0xffffffffu;
-    let per_entry = point_count / (capacity + 1u);
-    if (capacity > 0u && per_entry < 0xffffffffu / BLOCKS_PER_BIN) {
-        limit = max(HEAVY_BLOCK_RECORDS, BLOCKS_PER_BIN * per_entry
-            + BLOCKS_PER_BIN * (point_count % (capacity + 1u)) / (capacity + 1u));
-    }
-    if (total > limit) {
-        if (lid == 0u && vector_index == 0u) {
-            atomicStore(&heavy_blocks[atomicAdd(&heavy_blocks[0], 1u) + 1u], block);
-        }
-        return;
-    }
-    let records_start = 0u;
+            "    let records_start = 0u;
     let records_end = total;
 ",
         ),
@@ -799,6 +827,132 @@ fn main(
     format!("{}\n{position}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
 }
 
+/// Flags and lists every block whose reach holds more records than the
+/// light pass may walk, one invocation per block.
+///
+/// All reaches hold at most `BLOCKS_PER_BIN * point_count` records, so at
+/// most `capacity` blocks exceed `floor(that / (capacity + 1))`: raising the
+/// limit from [`HEAVY_BLOCK_RECORDS`] to it keeps the list within its binding
+/// and depends only on the point count and the binding.
+fn generate_heavy_classify_wgsl(fine_shape: [usize; DIMENSIONS], layout: BlockLayout) -> String {
+    let position = generate_position_wgsl(fine_shape);
+    let width = layout.width;
+    let entry = format!(
+        r#"const WORKGROUP_SIZE: u32 = {CLASSIFY_WORKGROUP_SIZE}u;
+const BIN_SIDE: i32 = {BIN_SIDE}i;
+const BINS_0: i32 = {bins_0}i;
+const BINS_1: i32 = {bins_1}i;
+const BLOCK_0: i32 = {block_0}i;
+const BLOCK_1: i32 = {block_1}i;
+const BLOCK_2: i32 = {block_2}i;
+const BLOCKS_0: u32 = {blocks_0}u;
+const BLOCKS_1: u32 = {blocks_1}u;
+const BLOCK_COUNT: u32 = {block_count}u;
+const REACH_BELOW: i32 = {reach_below}i;
+const REACH_ABOVE: i32 = {reach_above}i;
+const HEAVY_BLOCK_RECORDS: u32 = {HEAVY_BLOCK_RECORDS}u;
+const BLOCKS_PER_BIN: u32 = {blocks_per_bin}u;
+
+@group(0) @binding(0) var<storage, read> bin_offsets: array<u32>;
+@group(0) @binding(1) var<storage, read_write> heavy_blocks: array<atomic<u32>>;
+@group(0) @binding(2) var<storage, read_write> heavy_flags: array<u32>;
+
+// Bins covering cells [low, high] of a periodic axis as up to two ranges.
+struct BinRanges {{
+    first_0: i32,
+    last_0: i32,
+    first_1: i32,
+    last_1: i32,
+}}
+
+fn bin_ranges(low: i32, high: i32, fine_length: i32) -> BinRanges {{
+    if (low < 0) {{
+        return BinRanges((low + fine_length) / BIN_SIDE, (fine_length - 1) / BIN_SIDE,
+            0, high / BIN_SIDE);
+    }}
+    if (high >= fine_length) {{
+        return BinRanges(low / BIN_SIDE, (fine_length - 1) / BIN_SIDE,
+            0, (high - fine_length) / BIN_SIDE);
+    }}
+    return BinRanges(low / BIN_SIDE, high / BIN_SIDE, 0, -1);
+}}
+
+fn bin_range_length(ranges: BinRanges) -> i32 {{
+    return (ranges.last_0 - ranges.first_0 + 1) + max(ranges.last_1 - ranges.first_1 + 1, 0);
+}}
+
+fn bin_range_item(ranges: BinRanges, item: i32) -> i32 {{
+    let first_length = ranges.last_0 - ranges.first_0 + 1;
+    if (item < first_length) {{ return ranges.first_0 + item; }}
+    return ranges.first_1 + (item - first_length);
+}}
+
+@compute @workgroup_size({CLASSIFY_WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    let block = wg_flat * WORKGROUP_SIZE + lid.x;
+    if (block >= BLOCK_COUNT) {{ return; }}
+    let origin = vec3<i32>(
+        i32(block % BLOCKS_0) * BLOCK_0,
+        i32((block / BLOCKS_0) % BLOCKS_1) * BLOCK_1,
+        i32(block / (BLOCKS_0 * BLOCKS_1)) * BLOCK_2);
+    let ranges_0 = bin_ranges(origin.x - REACH_BELOW, origin.x + BLOCK_0 - 1 + REACH_ABOVE,
+        FINE_0_I32);
+    let ranges_1 = bin_ranges(origin.y - REACH_BELOW, origin.y + BLOCK_1 - 1 + REACH_ABOVE,
+        FINE_1_I32);
+    let ranges_2 = bin_ranges(origin.z - REACH_BELOW, origin.z + BLOCK_2 - 1 + REACH_ABOVE,
+        FINE_2_I32);
+    // The same reach the block spreader walks: along x, every bin row is one
+    // contiguous range, split in two where the reach wraps.
+    let rows_1 = bin_range_length(ranges_1);
+    let rows = rows_1 * bin_range_length(ranges_2);
+    var total = 0u;
+    for (var row = 0; row < rows; row = row + 1) {{
+        let bin_1 = bin_range_item(ranges_1, row % rows_1);
+        let bin_2 = bin_range_item(ranges_2, row / rows_1);
+        let row_bin = BINS_0 * (bin_1 + BINS_1 * bin_2);
+        total = total + bin_offsets[u32(row_bin + ranges_0.last_0) + 1u]
+            - bin_offsets[u32(row_bin + ranges_0.first_0)];
+        if (ranges_0.last_1 >= ranges_0.first_1) {{
+            total = total + bin_offsets[u32(row_bin + ranges_0.last_1) + 1u]
+                - bin_offsets[u32(row_bin + ranges_0.first_1)];
+        }}
+    }}
+
+    let point_count = bin_offsets[arrayLength(&bin_offsets) - 1u];
+    let capacity = arrayLength(&heavy_blocks) - 1u;
+    var limit = 0xffffffffu;
+    let per_entry = point_count / (capacity + 1u);
+    if (capacity > 0u && per_entry < 0xffffffffu / BLOCKS_PER_BIN) {{
+        limit = max(HEAVY_BLOCK_RECORDS, BLOCKS_PER_BIN * per_entry
+            + BLOCKS_PER_BIN * (point_count % (capacity + 1u)) / (capacity + 1u));
+    }}
+    let heavy = total > limit;
+    heavy_flags[block] = select(0u, 1u, heavy);
+    if (heavy) {{
+        atomicStore(&heavy_blocks[atomicAdd(&heavy_blocks[0], 1u) + 1u], block);
+    }}
+}}
+"#,
+        bins_0 = layout.bins[0],
+        bins_1 = layout.bins[1],
+        block_0 = BLOCK[0],
+        block_1 = BLOCK[1],
+        block_2 = BLOCK[2],
+        blocks_0 = layout.blocks[0],
+        blocks_1 = layout.blocks[1],
+        block_count = layout.block_count(),
+        reach_below = width.div_ceil(2) + REACH_MARGIN,
+        reach_above = width / 2 + REACH_MARGIN,
+        blocks_per_bin = blocks_per_bin(width),
+    );
+    format!("{}\n{position}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
+}
+
 /// Adds the parts of every cell of every listed block in part order and
 /// writes the cell, one invocation per (listed block, vector, cell).
 fn generate_heavy_reduce_wgsl(fine_shape: [usize; DIMENSIONS], layout: BlockLayout) -> String {
@@ -901,8 +1055,8 @@ mod tests {
             BlockLayout::for_grid(kernel, [256, 256, 256], &wgpu::Limits::default()).unwrap();
         let source = generate_block_spread_wgsl(kernel, [256, 256, 256], layout, SpreadMode::Light);
         assert_valid_wgsl(&source);
-        // The only atomics count and list heavy blocks.
-        assert_eq!(source.matches("atomic").count(), 3);
+        assert!(!source.contains("atomic"));
+        assert!(source.contains("if (heavy_flags[block] != 0u) { return; }"));
         assert_eq!(source.matches("fine_grid[row_index + ").count(), BLOCK[0]);
         assert!(source.contains("var sum_15 = vec2<f32>(0.0, 0.0);"));
         assert!(source.contains("workgroupUniformLoad(&segment_prefix[SEGMENTS])"));
@@ -914,6 +1068,9 @@ mod tests {
         assert!(!part.contains("atomic"));
         assert!(!part.contains("fine_grid[row_index"));
         assert_valid_wgsl(&generate_heavy_reduce_wgsl([256, 256, 256], layout));
+        let classify = generate_heavy_classify_wgsl([256, 256, 256], layout);
+        assert_valid_wgsl(&classify);
+        assert_eq!(classify.matches("atomic").count(), 3);
         assert_valid_wgsl(HEAVY_RESET_WGSL);
     }
 
