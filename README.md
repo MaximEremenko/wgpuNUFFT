@@ -144,9 +144,9 @@ readback. Plan-owned fine-grid buffers are reused between ordered executions.
 Points are point-major values in the configured precision (scalar in 1D and, for example,
 `[x0, y0, z0, x1, y1, z1, ...]` in 3D), while coefficients and outputs are
 interleaved complex `(re, im)` pairs; all require `STORAGE` buffer usage.
-Call `NufftPlan::required_point_buffer_size_bytes` when sizing a plan's
-coordinate buffer; the older transform-specific static helpers retain their 1D
-contract.
+Size every buffer with the plan's `required_*_buffer_size_bytes` methods, which
+follow its dimensionality, precision, and configured batch; the `*_for_batch`
+variants size a smaller active batch.
 
 `NufftConfig::with_batch(ntr)` and `NufftType3Config::with_batch(ntr)` follow
 the `ntransf` batching convention: every transform shares one point set, while
@@ -288,10 +288,9 @@ that of `f32` (approximately `1e-38` through `1e38`). Its split-based Dekker
 products avoid relying on fused multiply-add contraction; exact-word arithmetic
 canaries in `wgpu-fft` define the backend support contract. Vulkan and DX12 are
 tested. Metal remains the riskiest untested backend because its
-shader compiler enables fast-math transformations by default. Plan-aware
+shader compiler enables fast-math transformations by default. The plans'
 byte-size helpers account for 8-byte coordinates and 16-byte complex values in
-both high-precision formats; legacy static helpers retain their documented
-one-dimensional f32 ABI.
+both high-precision formats.
 
 Both the crate and the `wgpu-web` JavaScript surface run on browser WebGPU.
 Chrome/Tint testing at exact WebGPU defaults covers batched type 1/2/3 in one

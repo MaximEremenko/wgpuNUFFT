@@ -535,7 +535,9 @@ fn execute_type2(
         contents: bytemuck::cast_slice(coefficients),
         usage: wgpu::BufferUsages::STORAGE,
     });
-    let output_bytes = NufftPlan::required_type2_output_buffer_size_bytes(points.len()).unwrap();
+    let output_bytes = plan
+        .required_type2_output_buffer_size_bytes(points.len())
+        .unwrap();
     let output = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("wgpu_nufft.test.output"),
         size: output_bytes,
@@ -586,8 +588,10 @@ fn execute_type1(
 ) -> Vec<f32> {
     assert_eq!(strengths.len(), points.len() * 2);
     let point_count = points.len();
-    let point_bytes = NufftPlan::required_type1_point_buffer_size_bytes(point_count).unwrap();
-    let strength_bytes = NufftPlan::required_type1_strength_buffer_size_bytes(point_count).unwrap();
+    let point_bytes = plan.required_point_buffer_size_bytes(point_count).unwrap();
+    let strength_bytes = plan
+        .required_type1_strength_buffer_size_bytes(point_count)
+        .unwrap();
     let output_bytes = plan.required_type1_output_buffer_size_bytes().unwrap();
     assert_eq!(point_bytes, point_count as u64 * 4);
     assert_eq!(strength_bytes, point_count as u64 * 8);

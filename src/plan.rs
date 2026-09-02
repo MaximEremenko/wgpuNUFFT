@@ -782,12 +782,6 @@ impl NufftPlan {
         }
     }
 
-    /// Required bytes for `point_count` scalar `f32` coordinates in the
-    /// legacy one-dimensional layout.
-    pub fn required_type1_point_buffer_size_bytes(point_count: usize) -> Result<u64> {
-        Type1GpuPlan::point_buffer_size_bytes(point_count)
-    }
-
     /// Required bytes for this plan's point-major coordinate buffer.
     ///
     /// A point occupies one scalar per configured dimension, so a 3D plan
@@ -806,14 +800,11 @@ impl NufftPlan {
             })
     }
 
-    /// Required bytes for one vector of `point_count` interleaved-complex
-    /// `f32` strengths.
-    ///
-    /// This legacy helper intentionally retains its single-vector behavior.
-    /// Batched callers should use
-    /// [`Self::required_type1_strength_buffer_size_bytes_for_batch`].
-    pub fn required_type1_strength_buffer_size_bytes(point_count: usize) -> Result<u64> {
-        Type1GpuPlan::strength_buffer_size_bytes(point_count)
+    /// Required bytes for this plan's configured number of transform-major
+    /// complex type-1 strength vectors of `point_count` points each, in the
+    /// configured precision.
+    pub fn required_type1_strength_buffer_size_bytes(&self, point_count: usize) -> Result<u64> {
+        self.required_type1_strength_buffer_size_bytes_for_batch(point_count, self.config.batch())
     }
 
     /// Required bytes for `active_batch` transform-major type-1 strength vectors.
@@ -1092,12 +1083,6 @@ impl NufftPlan {
         Ok(layout)
     }
 
-    /// Required bytes for `point_count` scalar `f32` coordinates in the
-    /// legacy one-dimensional layout.
-    pub fn required_type2_point_buffer_size_bytes(point_count: usize) -> Result<u64> {
-        Type2GpuPlan::point_buffer_size_bytes(point_count)
-    }
-
     /// Required bytes for this plan's configured number of transform-major
     /// complex coefficient vectors in the configured precision.
     pub fn required_type2_coefficient_buffer_size_bytes(&self) -> Result<u64> {
@@ -1122,14 +1107,11 @@ impl NufftPlan {
         )
     }
 
-    /// Required bytes for one vector of `point_count` interleaved-complex
-    /// `f32` outputs.
-    ///
-    /// This legacy helper intentionally retains its single-vector behavior.
-    /// Batched callers should use
-    /// [`Self::required_type2_output_buffer_size_bytes_for_batch`].
-    pub fn required_type2_output_buffer_size_bytes(point_count: usize) -> Result<u64> {
-        Type2GpuPlan::complex_buffer_size_bytes("type-2 output buffer", point_count)
+    /// Required bytes for this plan's configured number of transform-major
+    /// complex type-2 output vectors of `point_count` points each, in the
+    /// configured precision.
+    pub fn required_type2_output_buffer_size_bytes(&self, point_count: usize) -> Result<u64> {
+        self.required_type2_output_buffer_size_bytes_for_batch(point_count, self.config.batch())
     }
 
     /// Required bytes for `active_batch` transform-major type-2 output vectors.
@@ -1558,14 +1540,25 @@ mod tests {
             5 * 2 * 16
         );
 
-        // Legacy static helpers retain their documented f32, one-vector ABI.
+        // The batch-free helpers size the configured batch in the configured
+        // precision.
         assert_eq!(
-            NufftPlan::required_type1_point_buffer_size_bytes(5).unwrap(),
-            20
+            f32_plan
+                .required_type1_strength_buffer_size_bytes(5)
+                .unwrap(),
+            5 * 3 * 8
         );
         assert_eq!(
-            NufftPlan::required_type2_output_buffer_size_bytes(5).unwrap(),
-            40
+            f64_plan
+                .required_type1_strength_buffer_size_bytes(5)
+                .unwrap(),
+            5 * 3 * 16
+        );
+        assert_eq!(
+            df64_plan
+                .required_type2_output_buffer_size_bytes(5)
+                .unwrap(),
+            5 * 3 * 16
         );
     }
 

@@ -561,20 +561,12 @@ fn plan_is_reusable_and_exposes_type_specific_cpu_fallback() {
     assert_eq!(first, second);
     assert!(!type1.is_gpu_ready());
     assert!(!type2.is_gpu_ready());
-    assert_eq!(
-        NufftPlan::required_type1_point_buffer_size_bytes(7).unwrap(),
-        28
-    );
     assert_eq!(type1.required_point_buffer_size_bytes(7).unwrap(), 28);
     assert_eq!(
-        NufftPlan::required_type1_strength_buffer_size_bytes(7).unwrap(),
+        type1.required_type1_strength_buffer_size_bytes(7).unwrap(),
         56
     );
     assert_eq!(type1.required_type1_output_buffer_size_bytes().unwrap(), 64);
-    assert_eq!(
-        NufftPlan::required_type2_point_buffer_size_bytes(7).unwrap(),
-        28
-    );
     assert_eq!(type2.required_point_buffer_size_bytes(7).unwrap(), 28);
     assert_eq!(
         type2
@@ -583,7 +575,7 @@ fn plan_is_reusable_and_exposes_type_specific_cpu_fallback() {
         64
     );
     assert_eq!(
-        NufftPlan::required_type2_output_buffer_size_bytes(7).unwrap(),
+        type2.required_type2_output_buffer_size_bytes(7).unwrap(),
         56
     );
 }
@@ -827,14 +819,14 @@ fn many_vector_direct_references_are_transform_major_and_match_single_loops() {
 }
 
 #[test]
-fn batch_aware_buffer_sizes_preserve_legacy_single_vector_helpers() {
+fn buffer_sizes_default_to_the_configured_batch() {
     let config = NufftConfig::new([3, 2], 1.0e-6).with_batch(3);
     let type1 = NufftPlan::type1(config.clone()).unwrap();
     let type2 = NufftPlan::type2(config).unwrap();
 
     assert_eq!(
-        NufftPlan::required_type1_strength_buffer_size_bytes(2).unwrap(),
-        16
+        type1.required_type1_strength_buffer_size_bytes(2).unwrap(),
+        48
     );
     assert_eq!(
         type1
@@ -865,8 +857,8 @@ fn batch_aware_buffer_sizes_preserve_legacy_single_vector_helpers() {
         96
     );
     assert_eq!(
-        NufftPlan::required_type2_output_buffer_size_bytes(2).unwrap(),
-        16
+        type2.required_type2_output_buffer_size_bytes(2).unwrap(),
+        48
     );
     assert_eq!(
         type2

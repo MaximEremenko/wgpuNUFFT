@@ -205,10 +205,6 @@ impl Type1GpuPlan {
         })
     }
 
-    pub(crate) fn point_buffer_size_bytes(point_count: usize) -> Result<u64> {
-        checked_buffer_size("type-1 point buffer", point_count, F32_BYTES)
-    }
-
     pub(crate) fn point_buffer_size_bytes_for_precision(
         point_count: usize,
         precision: FftPrecision,
@@ -220,10 +216,6 @@ impl Type1GpuPlan {
         )
     }
 
-    pub(crate) fn strength_buffer_size_bytes(point_count: usize) -> Result<u64> {
-        Self::complex_buffer_size_bytes("type-1 strength buffer", point_count)
-    }
-
     pub(crate) fn strength_buffer_size_bytes_for_precision(
         point_count: usize,
         precision: FftPrecision,
@@ -233,13 +225,6 @@ impl Type1GpuPlan {
             point_count,
             precision,
         )
-    }
-
-    pub(crate) fn complex_buffer_size_bytes(
-        buffer: &'static str,
-        element_count: usize,
-    ) -> Result<u64> {
-        checked_buffer_size(buffer, element_count, COMPLEX_F32_BYTES)
     }
 
     pub(crate) fn complex_buffer_size_bytes_for_precision(
@@ -2162,10 +2147,17 @@ mod tests {
 
     #[test]
     fn type1_buffer_sizes_are_exact_prefix_sizes() {
-        assert_eq!(Type1GpuPlan::point_buffer_size_bytes(7).unwrap(), 28);
-        assert_eq!(Type1GpuPlan::strength_buffer_size_bytes(7).unwrap(), 56);
         assert_eq!(
-            Type1GpuPlan::complex_buffer_size_bytes("test", 11).unwrap(),
+            Type1GpuPlan::point_buffer_size_bytes_for_precision(7, FftPrecision::F32).unwrap(),
+            28
+        );
+        assert_eq!(
+            Type1GpuPlan::strength_buffer_size_bytes_for_precision(7, FftPrecision::F64).unwrap(),
+            112
+        );
+        assert_eq!(
+            Type1GpuPlan::complex_buffer_size_bytes_for_precision("test", 11, FftPrecision::F32)
+                .unwrap(),
             88
         );
     }

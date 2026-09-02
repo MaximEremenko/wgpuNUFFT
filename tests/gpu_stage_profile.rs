@@ -197,7 +197,9 @@ fn run_type2_case(device: &wgpu::Device, queue: &wgpu::Queue, points: &[f32], pe
     let coefficients = test_complex_values(MODE_COUNT, 0.23, 0.37);
     let point_buffer = create_storage_buffer(device, "type2.points", points);
     let coefficient_buffer = create_storage_buffer(device, "type2.coefficients", &coefficients);
-    let output_bytes = NufftPlan::required_type2_output_buffer_size_bytes(points.len()).unwrap();
+    let output_bytes = plan
+        .required_type2_output_buffer_size_bytes(points.len())
+        .unwrap();
     let ordinary_output = create_output_buffer(device, "type2.ordinary_output", output_bytes);
     let profiled_output = create_output_buffer(device, "type2.profiled_output", output_bytes);
     let query_count = plan.gpu_profile_query_count();
@@ -320,7 +322,9 @@ fn run_type2_case_2d(device: &wgpu::Device, queue: &wgpu::Queue, points: &[f32],
     let coefficients = test_complex_values(MODE_COUNT_2D, 0.21, 0.35);
     let point_buffer = create_storage_buffer(device, "type2_2d.points", points);
     let coefficient_buffer = create_storage_buffer(device, "type2_2d.coefficients", &coefficients);
-    let output_bytes = NufftPlan::required_type2_output_buffer_size_bytes(POINT_COUNT_2D).unwrap();
+    let output_bytes = plan
+        .required_type2_output_buffer_size_bytes(POINT_COUNT_2D)
+        .unwrap();
     let ordinary_output = create_output_buffer(device, "type2_2d.ordinary_output", output_bytes);
     let profiled_output = create_output_buffer(device, "type2_2d.profiled_output", output_bytes);
     let query_count = plan.gpu_profile_query_count();
@@ -389,7 +393,9 @@ fn run_binned_type2_case_3d(
     let coefficients = test_complex_values(MODE_COUNT_3D, 0.19, 0.31);
     let point_buffer = create_storage_buffer(device, "type2_3d.points", points);
     let coefficient_buffer = create_storage_buffer(device, "type2_3d.coefficients", &coefficients);
-    let output_bytes = NufftPlan::required_type2_output_buffer_size_bytes(POINT_COUNT_3D).unwrap();
+    let output_bytes = plan
+        .required_type2_output_buffer_size_bytes(POINT_COUNT_3D)
+        .unwrap();
     let ordinary_output = create_output_buffer(device, "type2_3d.ordinary_output", output_bytes);
     let profiled_output = create_output_buffer(device, "type2_3d.profiled_output", output_bytes);
     let query_count = plan.gpu_profile_query_count();

@@ -997,7 +997,9 @@ fn execute_type2_with_set_points(
     point_count: usize,
     coefficient_vectors: &[&[f32]],
 ) -> Vec<Vec<f32>> {
-    let output_bytes = NufftPlan::required_type2_output_buffer_size_bytes(point_count).unwrap();
+    let output_bytes = plan
+        .required_type2_output_buffer_size_bytes(point_count)
+        .unwrap();
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("wgpu_nufft.3d.test.type2_set_points.encoder"),
     });
@@ -1172,7 +1174,9 @@ fn execute_type2(
     let points_buffer = storage_buffer_init(device, "wgpu_nufft.3d.test.points", points);
     let coefficients_buffer =
         storage_buffer_init(device, "wgpu_nufft.3d.test.coefficients", coefficients);
-    let output_bytes = NufftPlan::required_type2_output_buffer_size_bytes(point_count).unwrap();
+    let output_bytes = plan
+        .required_type2_output_buffer_size_bytes(point_count)
+        .unwrap();
     let output = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("wgpu_nufft.3d.test.output"),
         size: output_bytes,

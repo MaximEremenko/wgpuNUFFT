@@ -1196,8 +1196,8 @@ fn create_case_buffers(
         contents: bytemuck::cast_slice(&modes),
         usage,
     });
-    let type1_output_bytes = NufftPlan::required_type1_strength_buffer_size_bytes(mode_count)?;
-    let type2_output_bytes = NufftPlan::required_type2_output_buffer_size_bytes(point_count)?;
+    let type1_output_bytes = complex_f32_bytes(mode_count)?;
+    let type2_output_bytes = complex_f32_bytes(point_count)?;
     let type1_output = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("wgpu_nufft.stage_profile.type1_output"),
         size: type1_output_bytes,
@@ -1217,6 +1217,13 @@ fn create_case_buffers(
         type1_output,
         type2_output,
     })
+}
+
+fn complex_f32_bytes(count: usize) -> BenchResult<u64> {
+    count
+        .checked_mul(2 * size_of::<f32>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| input_error("benchmark complex-buffer size overflow"))
 }
 
 fn generate_case_data(

@@ -377,7 +377,7 @@ async fn run_cases(
             mode_count,
             mode_count,
             point_bytes,
-            NufftPlan::required_type1_strength_buffer_size_bytes(mode_count)?,
+            complex_f32_bytes(mode_count)?,
         );
 
         for kind in TransformKind::ALL {
@@ -651,7 +651,7 @@ fn create_case_buffers(device: &wgpu::Device, count: usize) -> BenchResult<CaseB
         contents: bytemuck::cast_slice(&modes),
         usage: storage_usage,
     });
-    let complex_bytes = NufftPlan::required_type1_strength_buffer_size_bytes(count)?;
+    let complex_bytes = complex_f32_bytes(count)?;
     let type1_output = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("wgpu_nufft.2d_bench.type1_output"),
         size: complex_bytes,
@@ -671,6 +671,13 @@ fn create_case_buffers(device: &wgpu::Device, count: usize) -> BenchResult<CaseB
         type1_output,
         type2_output,
     })
+}
+
+fn complex_f32_bytes(count: usize) -> BenchResult<u64> {
+    count
+        .checked_mul(2 * size_of::<f32>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or_else(|| input_error("benchmark complex-buffer size overflow"))
 }
 
 fn generate_case_data(count: usize) -> BenchResult<(Vec<f32>, Vec<f32>, Vec<f32>)> {

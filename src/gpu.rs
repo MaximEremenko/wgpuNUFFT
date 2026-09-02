@@ -18,8 +18,6 @@ const WORKGROUP_SIZE: u32 = 64;
 /// Cells per coarse point bin of the binned interpolation.
 const BINNED_INTERPOLATION_BIN_SIDE: usize = 8;
 const VECTOR_TILE: usize = 4;
-const COMPLEX_F32_BYTES: u64 = 8;
-const F32_BYTES: u64 = 4;
 
 pub(crate) fn max_supported_workgroup_size(limits: &wgpu::Limits) -> u32 {
     limits
@@ -253,17 +251,6 @@ impl Type2GpuPlan {
             precision,
             max_storage_binding_bytes,
         })
-    }
-
-    pub(crate) fn point_buffer_size_bytes(point_count: usize) -> Result<u64> {
-        checked_buffer_size("type-2 point buffer", point_count, F32_BYTES)
-    }
-
-    pub(crate) fn complex_buffer_size_bytes(
-        buffer: &'static str,
-        element_count: usize,
-    ) -> Result<u64> {
-        checked_buffer_size(buffer, element_count, COMPLEX_F32_BYTES)
     }
 
     pub(crate) fn point_buffer_size_bytes_for_precision(

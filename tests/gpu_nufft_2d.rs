@@ -1063,7 +1063,9 @@ fn execute_type2(
     assert_eq!(point_bytes, points.len() as u64 * 4);
     let coefficient_bytes = plan.required_type2_coefficient_buffer_size_bytes().unwrap();
     assert_eq!(coefficient_bytes, coefficients.len() as u64 * 4);
-    let output_bytes = NufftPlan::required_type2_output_buffer_size_bytes(point_count).unwrap();
+    let output_bytes = plan
+        .required_type2_output_buffer_size_bytes(point_count)
+        .unwrap();
 
     let point_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("wgpu_nufft.test2d.type2.points"),
