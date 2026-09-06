@@ -116,6 +116,10 @@ pub enum NufftError {
     FineGridMustBeEven {
         length: usize,
     },
+    FineGridTooLarge {
+        requested: usize,
+        maximum: usize,
+    },
     FftShapeUnsupported {
         stage: &'static str,
         source: wgpu_fft::FftError,
@@ -336,6 +340,10 @@ impl fmt::Display for NufftError {
             Self::FineGridMustBeEven { length } => {
                 write!(f, "fine-grid length {length} must be even")
             }
+            Self::FineGridTooLarge { requested, maximum } => write!(
+                f,
+                "no supported fine-grid length of at least {requested} fits the per-axis maximum {maximum}"
+            ),
             Self::FftShapeUnsupported { stage, source } => {
                 write!(f, "{stage} is unsupported by wgpu-fft: {source}")
             }

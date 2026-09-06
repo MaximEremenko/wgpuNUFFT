@@ -4,6 +4,8 @@ use std::f64::consts::PI;
 pub const MIN_ES_KERNEL_WIDTH: usize = 2;
 pub const MAX_ES_KERNEL_WIDTH: usize = 16;
 const MAX_HORNER_COEFFICIENTS: usize = 19;
+/// Shaders index fine grids with `u32`.
+const MAX_FINE_GRID_LENGTH: usize = u32::MAX as usize;
 
 /// Fixed-width exponential-of-semicircle spreading kernel.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -272,7 +274,7 @@ fn polynomial_fit_chebyshev(function: impl Fn(f64) -> f64, coefficient_count: us
 }
 
 /// Chooses the smallest even length at least `max(ceil(sigma*N), 2*w)` that
-/// `wgpu-fft` reports as directly factorable.
+/// `wgpu-fft` reports as directly factorable, up to `u32::MAX`.
 pub fn select_fine_grid_size(n_modes: usize, sigma: f64, kernel_width: usize) -> Result<usize> {
     if n_modes == 0 {
         return Err(NufftError::ZeroMode { axis: 0 });
@@ -313,14 +315,21 @@ pub fn select_fine_grid_size(n_modes: usize, sigma: f64, kernel_width: usize) ->
         })?
     };
 
-    loop {
+    // Factorable lengths grow sparse, so the cap also keeps a huge `sigma`
+    // from scanning an enormous range.
+    while candidate <= MAX_FINE_GRID_LENGTH {
         if wgpu_fft::runtime::factor_supported_length(candidate).is_ok() {
             return Ok(candidate);
         }
-        candidate = candidate.checked_add(2).ok_or(NufftError::LengthOverflow {
-            context: "next supported fine-grid length",
-        })?;
+        let Some(next) = candidate.checked_add(2) else {
+            break;
+        };
+        candidate = next;
     }
+    Err(NufftError::FineGridTooLarge {
+        requested: minimum,
+        maximum: MAX_FINE_GRID_LENGTH,
+    })
 }
 
 fn validate_tolerance(eps: f64) -> Result<()> {

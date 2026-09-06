@@ -538,6 +538,30 @@ fn custom_sigma_uses_general_width_beta_and_grid_formulas() {
 }
 
 #[test]
+#[cfg(target_pointer_width = "64")]
+fn oversized_fine_grids_fail_instead_of_scanning() {
+    let kernel = EsKernel::for_tolerance(1.0e-6, 2.0).unwrap();
+    // Factorable lengths are so sparse near 1e18 that an unbounded search
+    // for the next one never finished.
+    for (modes, sigma, requested) in [
+        (1000, 1.0e15, 1_000_000_000_000_000_000),
+        (1 << 31, 2.0, 1 << 32),
+    ] {
+        assert_eq!(
+            select_fine_grid_size(modes, sigma, kernel.width()),
+            Err(NufftError::FineGridTooLarge {
+                requested,
+                maximum: u32::MAX as usize,
+            })
+        );
+    }
+    assert!(matches!(
+        NufftPlan::type1(NufftConfig::new([1000], 1.0e-6).with_sigma(1.0e15)),
+        Err(NufftError::FineGridTooLarge { .. })
+    ));
+}
+
+#[test]
 fn plan_is_reusable_and_exposes_type_specific_cpu_fallback() {
     let config = NufftConfig::new([8], 1.0e-5)
         .with_isign(-9)
