@@ -1,4 +1,4 @@
-use crate::config::{NufftSign, DEFAULT_EPS, DEFAULT_SIGMA};
+use crate::config::{validate_gpu_dimensions, NufftSign, DEFAULT_EPS, DEFAULT_SIGMA};
 use crate::error::{NufftError, Result};
 use crate::gpu_recorder::GpuRecorder;
 use crate::gpu_type3::GpuType3Plan;
@@ -343,7 +343,9 @@ impl NufftType3Plan {
         })
     }
 
-    /// Builds reusable GPU resources for a precision-configured type-3 NUFFT.
+    /// Builds reusable GPU resources for a precision-configured type-3 NUFFT of
+    /// up to [`MAX_GPU_NUFFT_DIMENSIONS`](crate::MAX_GPU_NUFFT_DIMENSIONS)
+    /// dimensions.
     ///
     /// Source and target coordinates remain caller-owned and GPU-resident.
     /// Their values must stay within the conservative intervals supplied in
@@ -362,6 +364,7 @@ impl NufftType3Plan {
             });
         }
         let mut plan = Self::new(config)?;
+        validate_gpu_dimensions("type-3", plan.config.dimensions())?;
         let gpu = GpuType3Plan::new(device, queue, &plan)?;
         debug_assert_eq!(gpu.dimensions(), plan.config.dimensions());
         plan.gpu = Some(Box::new(gpu));
@@ -458,8 +461,8 @@ impl NufftType3Plan {
         )
     }
 
-    /// Records a 1D, 2D, or 3D type-3 NUFFT into `encoder` without submission
-    /// or host readback.
+    /// Records a type-3 NUFFT into `encoder` without submission or host
+    /// readback.
     ///
     /// Coordinates are point-major scalars and strengths/output are complex
     /// values in the configured precision. Every buffer must include `STORAGE`

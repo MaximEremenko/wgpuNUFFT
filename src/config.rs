@@ -4,9 +4,13 @@ use wgpu_fft::FftPrecision;
 
 pub const DEFAULT_EPS: f64 = 1.0e-6;
 pub const DEFAULT_SIGMA: f64 = 2.0;
-/// Maximum supported transform dimensionality. Ranks 1-3 use hand-tuned GPU
-/// paths; higher ranks route to the rank-generic implementation.
+/// Maximum transform dimensionality of a plan and of the CPU reference
+/// transforms.
 pub const MAX_NUFFT_DIMENSIONS: usize = 8;
+/// Maximum dimensionality of a GPU plan. Ranks 1-3 use hand-tuned GPU paths;
+/// ranks 4 and 5 use the rank-generic implementation, which has not been
+/// validated above that.
+pub const MAX_GPU_NUFFT_DIMENSIONS: usize = 5;
 
 /// Sign in the NUFFT exponential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -230,6 +234,18 @@ impl Default for NufftConfig {
     fn default() -> Self {
         Self::new([1], DEFAULT_EPS)
     }
+}
+
+/// Rejects ranks above [`MAX_GPU_NUFFT_DIMENSIONS`] for a GPU plan of `kind`.
+pub(crate) fn validate_gpu_dimensions(kind: &'static str, dimensions: usize) -> Result<()> {
+    if dimensions > MAX_GPU_NUFFT_DIMENSIONS {
+        return Err(NufftError::GpuDimensionsUnsupported {
+            kind,
+            actual: dimensions,
+            supported: MAX_GPU_NUFFT_DIMENSIONS,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -12,7 +12,8 @@ use std::sync::mpsc;
 use wgpu::util::DeviceExt;
 use wgpu_nufft::{
     reference_type1_f64, reference_type2_f64, Complex64, ComplexDoubleFloat, DoubleFloat,
-    FftPrecision, ModeOrder, NufftConfig, NufftPlan, NufftSign,
+    FftPrecision, ModeOrder, NufftConfig, NufftError, NufftPlan, NufftSign,
+    MAX_GPU_NUFFT_DIMENSIONS,
 };
 
 #[test]
@@ -141,6 +142,23 @@ async fn run_cases() {
         .await;
     } else {
         eprintln!("skipping ND F64 case; the adapter lacks SHADER_F64");
+    }
+
+    // Higher ranks stay on the CPU reference path.
+    let rank = MAX_GPU_NUFFT_DIMENSIONS + 1;
+    let config = NufftConfig::new(vec![2; rank], 1.0e-3);
+    for result in [
+        NufftPlan::type1_gpu(&context.device, &context.queue, config.clone()),
+        NufftPlan::type2_gpu(&context.device, &context.queue, config),
+    ] {
+        assert!(matches!(
+            result,
+            Err(NufftError::GpuDimensionsUnsupported {
+                actual,
+                supported: MAX_GPU_NUFFT_DIMENSIONS,
+                ..
+            }) if actual == rank
+        ));
     }
 
     #[cfg(windows)]

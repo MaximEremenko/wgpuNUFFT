@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use crate::config::NufftConfig;
+use crate::config::{validate_gpu_dimensions, NufftConfig};
 use crate::direct::{reference_type1_f64, reference_type2_f64};
 use crate::error::{NufftError, Result};
 use crate::gpu::Type2GpuPlan;
@@ -476,7 +476,8 @@ impl NufftPlan {
         Self::new(NufftKind::Type2, config)
     }
 
-    /// Builds a reusable one-, two-, or three-dimensional type-1 GPU plan.
+    /// Builds a reusable type-1 GPU plan of up to
+    /// [`MAX_GPU_NUFFT_DIMENSIONS`](crate::MAX_GPU_NUFFT_DIMENSIONS) dimensions.
     ///
     /// Execution is entirely GPU-resident and records commands into a caller
     /// supplied encoder. The plan is device-specific and may be reused with
@@ -607,6 +608,7 @@ impl NufftPlan {
     ) -> Result<Self> {
         validate_device_precision(device, config.precision(), "type-1 GPU plan")?;
         let mut plan = Self::new(NufftKind::Type1, config)?;
+        validate_gpu_dimensions("type-1", plan.config.dimensions())?;
         let gpu = match plan.config.dimensions() {
             1 => Type1GpuExecution::OneD(Type1GpuPlan::new(
                 device,
@@ -659,7 +661,8 @@ impl NufftPlan {
         Ok(plan)
     }
 
-    /// Builds a reusable one-, two-, or three-dimensional type-2 GPU plan.
+    /// Builds a reusable type-2 GPU plan of up to
+    /// [`MAX_GPU_NUFFT_DIMENSIONS`](crate::MAX_GPU_NUFFT_DIMENSIONS) dimensions.
     ///
     /// Execution is entirely GPU-resident and records commands into a caller
     /// supplied encoder. The plan is device-specific and may be reused with
@@ -673,6 +676,7 @@ impl NufftPlan {
     ) -> Result<Self> {
         validate_device_precision(device, config.precision(), "type-2 GPU plan")?;
         let mut plan = Self::new(NufftKind::Type2, config)?;
+        validate_gpu_dimensions("type-2", plan.config.dimensions())?;
         let gpu = match plan.config.dimensions() {
             1 => Type2GpuExecution::OneD(Type2GpuPlan::new(
                 device,

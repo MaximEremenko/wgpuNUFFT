@@ -3,9 +3,10 @@
 //!
 //! The crate provides reusable planning metadata, direct
 //! `f64` reference transforms, and exponential-of-semicircle kernel tables for
-//! all three transform types. GPU execution supports arbitrary rank up to
-//! [`MAX_NUFFT_DIMENSIONS`]: dedicated 1D, 2D, and 3D paths are complemented by
-//! a rank-generic path for every supported dimension `d >= 4`. Plans support
+//! all three transform types. GPU execution supports rank up to
+//! [`MAX_GPU_NUFFT_DIMENSIONS`]: dedicated 1D, 2D, and 3D paths are
+//! complemented by a rank-generic path for 4D and 5D, while the CPU reference
+//! transforms reach [`MAX_NUFFT_DIMENSIONS`]. Plans support
 //! `f32`, native `f64`, and portable double-float precision, and encode
 //! spreading or interpolation around a fine-grid C2C transform using
 //! caller-owned input and output buffers.
@@ -40,7 +41,8 @@ mod type3;
 mod wgsl_validation;
 
 pub use config::{
-    ModeOrder, NufftConfig, NufftSign, DEFAULT_EPS, DEFAULT_SIGMA, MAX_NUFFT_DIMENSIONS,
+    ModeOrder, NufftConfig, NufftSign, DEFAULT_EPS, DEFAULT_SIGMA, MAX_GPU_NUFFT_DIMENSIONS,
+    MAX_NUFFT_DIMENSIONS,
 };
 pub use direct::{reference_type1_f64, reference_type2_f64};
 pub use error::{NufftError, Result};

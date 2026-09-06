@@ -110,10 +110,11 @@ batch contract and the command that builds a local wheel.
 
 The current implementation provides:
 
-- Type-1, type-2, and type-3 definitions in arbitrary
-  supported dimension: hand-tuned 1D, 2D, and 3D paths plus a rank-generic GPU
-  path that serves every supported rank `d >= 4` for all three transform types
-  in F32, native F64, and portable double-float;
+- Type-1, type-2, and type-3 definitions: GPU plans use
+  hand-tuned 1D, 2D, and 3D paths plus a rank-generic path for 4D and 5D
+  (`MAX_GPU_NUFFT_DIMENSIONS`) for all three transform types in F32, native
+  F64, and portable double-float, and the CPU reference transforms accept up to
+  8 dimensions (`MAX_NUFFT_DIMENSIONS`);
 - direct `f64` NDFT execution for every transform kind as the correctness oracle
   and tiny-problem fallback;
 - `sigma = 2` default exponential-of-semicircle kernel planning;

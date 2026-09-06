@@ -6,7 +6,8 @@ use std::sync::mpsc;
 
 use wgpu::util::DeviceExt;
 use wgpu_nufft::{
-    reference_type3_f64, Complex64, NufftInterval, NufftSign, NufftType3Config, NufftType3Plan,
+    reference_type3_f64, Complex64, NufftError, NufftInterval, NufftSign, NufftType3Config,
+    NufftType3Plan, MAX_GPU_NUFFT_DIMENSIONS,
 };
 
 const FLOAT_TOLERANCE_FACTOR: f64 = 100.0;
@@ -36,6 +37,7 @@ async fn run_gpu_type3_cases() {
     validate_zero_source_and_target_counts(&context.device, &context.queue);
     validate_adjoint_consistency(&context.device, &context.queue);
     validate_repeat_determinism(&context.device, &context.queue);
+    validate_rank_cap(&context.device, &context.queue);
 
     #[cfg(windows)]
     std::mem::forget(context);
@@ -317,6 +319,20 @@ impl PointClass {
         }
         coordinates
     }
+}
+
+fn validate_rank_cap(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let rank = MAX_GPU_NUFFT_DIMENSIONS + 1;
+    let bounds = vec![NufftInterval::new(-1.0, 1.0); rank];
+    let config = NufftType3Config::new(bounds.clone(), bounds, 1.0e-2);
+    assert!(matches!(
+        NufftType3Plan::new_gpu(device, queue, config),
+        Err(NufftError::GpuDimensionsUnsupported {
+            actual,
+            supported: MAX_GPU_NUFFT_DIMENSIONS,
+            ..
+        }) if actual == rank
+    ));
 }
 
 fn planned_bounds(dimensions: usize) -> (Vec<NufftInterval>, Vec<NufftInterval>) {
