@@ -54,5 +54,10 @@ pub use type3::{
     es_kernel_fourier_transform, reference_type3_f64, NufftInterval, NufftType3AxisMetadata,
     NufftType3Config, NufftType3Plan,
 };
+/// The `wgpu` version whose devices, queues, and buffers the plans take; using
+/// this re-export avoids a mismatched second copy.
+pub use wgpu;
+/// The `wgpu-fft` version behind the fine-grid transforms.
+pub use wgpu_fft;
 pub use wgpu_fft::math::{Complex64, ComplexDoubleFloat, DoubleFloat};
 pub use wgpu_fft::FftPrecision;
