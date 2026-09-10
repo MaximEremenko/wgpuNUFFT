@@ -63,6 +63,17 @@ complex `[re, im]` values become
 `[re_hi, re_lo, im_hi, im_lo]`. Df64 plan creation is available only after the
 browser compiler passes all 96 arithmetic canary words.
 
+## Releasing GPU memory
+
+JavaScript garbage collection does not see GPU memory, so call `free()` on
+objects you no longer need. Freeing a buffer destroys its GPU allocation at
+once. A freed plan's internal buffers wait for garbage collection, but once the
+context and every plan and buffer created from it have been freed, the WebGPU
+device itself is destroyed and all of its memory is released.
+
+Rust panics are reported through `console.error` before the browser raises its
+`unreachable` trap.
+
 ## License
 
 Licensed under the Apache License, Version 2.0 ([LICENSE](../LICENSE) or

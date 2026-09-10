@@ -33,10 +33,44 @@ struct Runtime {
     backend: String,
 }
 
+// wgpu's WebGPU backend leaves dropped objects to the JavaScript garbage
+// collector, which cannot see GPU memory pressure. Destroying them releases
+// that memory as soon as JavaScript calls `free()`.
+
 impl Drop for Runtime {
     fn drop(&mut self) {
         clear_thread_local_pipeline_cache(&self.device);
+        // Every plan and buffer holds this runtime, so nothing can use the
+        // device any more.
+        self.device.destroy();
     }
+}
+
+impl Drop for WgpuFftBuffer {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = error)]
+    fn console_error(message: &str);
+}
+
+/// Sends Rust panic messages to `console.error`; the browser otherwise reports
+/// only an `unreachable` trap. A previously installed hook still runs.
+#[cfg(target_arch = "wasm32")]
+fn install_panic_hook() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            console_error(&info.to_string());
+            previous(info);
+        }));
+    });
 }
 
 /// Browser scalar precision requested for a C2C plan.
@@ -116,7 +150,8 @@ pub struct WgpuNufftType3Plan {
     output_bytes: u64,
 }
 
-/// GPU-resident caller-owned byte buffer.
+/// GPU-resident caller-owned byte buffer. `free()` releases its GPU memory
+/// immediately.
 #[wasm_bindgen]
 pub struct WgpuFftBuffer {
     runtime: Rc<Runtime>,
@@ -128,6 +163,8 @@ async fn initialize(
     request_adapter_maximums: bool,
     force_fallback: bool,
 ) -> Result<WgpuFft, JsValue> {
+    #[cfg(target_arch = "wasm32")]
+    install_panic_hook();
     let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     instance_descriptor.backends = wgpu::Backends::BROWSER_WEBGPU;
     let instance = wgpu::Instance::new(instance_descriptor);
@@ -597,6 +634,7 @@ impl WgpuFft {
         let bytes = mapped.to_vec();
         drop(mapped);
         readback.unmap();
+        readback.destroy();
         Ok(bytes)
     }
 
