@@ -854,15 +854,16 @@ impl NufftPlan {
         )
     }
 
-    /// Records a one-, two-, or three-dimensional type-1 NUFFT into `encoder` without
-    /// submitting or reading data back to the host.
+    /// Records a type-1 NUFFT into `encoder` without submitting or reading
+    /// data back to the host.
     ///
     /// `points` stores point-major coordinates (one scalar per configured
     /// dimension). `strengths` and `output` store the configured number of
     /// transform-major complex vectors in the configured precision. All
     /// buffers used by a nonempty transform require `STORAGE` usage and must
     /// belong to the plan's device. Coordinates must be finite and lie in
-    /// the documented `[-3*pi, 3*pi]` interval. For zero points, the
+    /// the documented `[-3*pi, 3*pi]` interval; one that does not makes
+    /// the output undefined without corrupting memory. For zero points, the
     /// point and strength buffers are ignored while every output mode is
     /// overwritten with zero.
     pub fn encode_type1_gpu(
@@ -1137,15 +1138,16 @@ impl NufftPlan {
         )
     }
 
-    /// Records a one-, two-, or three-dimensional type-2 NUFFT into `encoder` without
-    /// submitting or reading data back to the host.
+    /// Records a type-2 NUFFT into `encoder` without submitting or reading
+    /// data back to the host.
     ///
     /// `points` stores point-major coordinates (one scalar per configured
     /// dimension). `coefficients` and `output` store the configured number of
     /// transform-major complex vectors in the configured precision.
     /// All three buffers require `STORAGE` usage and must belong to the
     /// same device used to construct the plan. Coordinates must be finite and
-    /// lie in the documented `[-3*pi, 3*pi]` interval.
+    /// lie in the documented `[-3*pi, 3*pi]` interval; one that does not
+    /// makes only its own output value undefined.
     pub fn encode_type2_gpu(
         &self,
         device: &wgpu::Device,

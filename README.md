@@ -328,7 +328,11 @@ negative values select the negative sign. Centered mode order is the default,
 and dimension zero is stored fastest. Type 3 has no integer-mode ordering.
 Type-1/type-2 coordinates follow the documented `|x| <= 3*pi` contract
 and are periodic modulo `2*pi`; type-3 source and target domains are instead
-the explicit intervals supplied at planning. With the conventional Hermitian
+the explicit intervals supplied at planning. GPU plans cannot check device
+buffers, so a coordinate that breaks the contract, including NaN or an
+infinity, is not reported: it makes the type-1 or type-3 result that contains
+it undefined, but it never corrupts memory or other points' type-2 outputs,
+and a plan's later executions are unaffected. With the conventional Hermitian
 inner product, type-2 with sign `s` is adjoint to type-1 with sign `-s`; a
 type-3 plan's adjoint swaps source and target sets and reverses the sign.
 

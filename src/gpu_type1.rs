@@ -1226,7 +1226,7 @@ fn main(
     if (point_index >= total) {{ return; }}
 
     let position = fold_position(points[point_index]);
-    let bin = u32(floor_df64_to_i32(position));
+    let bin = min(u32(max(floor_df64_to_i32(position), 0)), FINE_LENGTH - 1u);
     atomicAdd(&bin_counts[bin], 1u);
 }}
 "#,
@@ -1255,7 +1255,7 @@ fn main(
     if (point_index >= total) {{ return; }}
 
     let position = fold_position(points[point_index]);
-    atomicAdd(&bin_counts[u32(floor(position))], 1u);
+    atomicAdd(&bin_counts[min(u32(max(floor(position), 0.0lf)), FINE_LENGTH - 1u)], 1u);
 }}
 "#,
     );
@@ -1283,7 +1283,7 @@ fn main(
     if (point_index >= total) {{ return; }}
 
     let position = fold_position(points[point_index]);
-    let bin = u32(floor_df64_to_i32(position));
+    let bin = min(u32(max(floor_df64_to_i32(position), 0)), FINE_LENGTH - 1u);
     atomicAdd(&bin_counts[bin], 1u);
 }}
 "#,
@@ -1328,7 +1328,7 @@ fn main(
     if (point_index >= total) {{ return; }}
 
     let position = fold_position(points[point_index]);
-    let bin = u32(floor_df64_to_i32(position));
+    let bin = min(u32(max(floor_df64_to_i32(position), 0)), FINE_LENGTH - 1u);
     let slot = bin_offsets[bin] + atomicAdd(&bin_cursors[bin], 1u);
     sorted_indices[slot] = point_index;
 }}
@@ -1368,7 +1368,7 @@ fn main(
     if (point_index >= total) {{ return; }}
 
     let position = fold_position(points[point_index]);
-    let bin = u32(floor_df64_to_i32(position));
+    let bin = min(u32(max(floor_df64_to_i32(position), 0)), FINE_LENGTH - 1u);
     let slot = bin_offsets[bin] + atomicAdd(&bin_cursors[bin], 1u);
     sorted_indices[slot] = point_index;
 }}
@@ -1399,7 +1399,7 @@ fn main(
     let point_index = wg_flat * WORKGROUP_SIZE + lid.x;
     if (point_index >= total) {{ return; }}
 
-    let bin = u32(floor(fold_position(points[point_index])));
+    let bin = min(u32(max(floor(fold_position(points[point_index])), 0.0lf)), FINE_LENGTH - 1u);
     let slot = bin_offsets[bin] + atomicAdd(&bin_cursors[bin], 1u);
     sorted_indices[slot] = point_index;
 }}

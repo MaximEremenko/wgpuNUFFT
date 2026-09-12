@@ -1398,8 +1398,8 @@ fn main(
     let point_base = point_index * 2u;
     let position_0 = fold_position_0(points[point_base]);
     let position_1 = fold_position_1(points[point_base + 1u]);
-    let bin_0 = u32(floor_df64_to_i32(position_0));
-    let bin_1 = u32(floor_df64_to_i32(position_1));
+    let bin_0 = min(u32(max(floor_df64_to_i32(position_0), 0)), FINE_0 - 1u);
+    let bin_1 = min(u32(max(floor_df64_to_i32(position_1), 0)), FINE_1 - 1u);
     atomicAdd(&bin_counts[bin_0 + FINE_0 * bin_1], 1u);
 }}
 "#,
@@ -1427,8 +1427,8 @@ fn main(
     let point_index = wg_flat * WORKGROUP_SIZE + lid.x;
     if (point_index >= total) {{ return; }}
     let point_base = point_index * 2u;
-    let bin_0 = u32(floor(fold_position_0(points[point_base])));
-    let bin_1 = u32(floor(fold_position_1(points[point_base + 1u])));
+    let bin_0 = min(u32(max(floor(fold_position_0(points[point_base])), 0.0lf)), FINE_0 - 1u);
+    let bin_1 = min(u32(max(floor(fold_position_1(points[point_base + 1u])), 0.0lf)), FINE_1 - 1u);
     atomicAdd(&bin_counts[bin_0 + FINE_0 * bin_1], 1u);
 }}
 "#,
@@ -1459,8 +1459,8 @@ fn main(
     let point_base = point_index * 2u;
     let position_0 = fold_position_0(points[point_base]);
     let position_1 = fold_position_1(points[point_base + 1u]);
-    let bin_0 = u32(floor_df64_to_i32(position_0));
-    let bin_1 = u32(floor_df64_to_i32(position_1));
+    let bin_0 = min(u32(max(floor_df64_to_i32(position_0), 0)), FINE_0 - 1u);
+    let bin_1 = min(u32(max(floor_df64_to_i32(position_1), 0)), FINE_1 - 1u);
     let bin = bin_0 + FINE_0 * bin_1;
     atomicAdd(&bin_counts[bin], 1u);
 }}
@@ -1508,8 +1508,8 @@ fn main(
     let point_base = point_index * 2u;
     let position_0 = fold_position_0(points[point_base]);
     let position_1 = fold_position_1(points[point_base + 1u]);
-    let bin_0 = u32(floor_df64_to_i32(position_0));
-    let bin_1 = u32(floor_df64_to_i32(position_1));
+    let bin_0 = min(u32(max(floor_df64_to_i32(position_0), 0)), FINE_0 - 1u);
+    let bin_1 = min(u32(max(floor_df64_to_i32(position_1), 0)), FINE_1 - 1u);
     let bin = bin_0 + FINE_0 * bin_1;
     let slot = bin_offsets[bin] + atomicAdd(&bin_cursors[bin], 1u);
     sorted_indices[slot] = point_index;
@@ -1555,8 +1555,8 @@ fn main(
     let point_base = point_index * 2u;
     let position_0 = fold_position_0(points[point_base]);
     let position_1 = fold_position_1(points[point_base + 1u]);
-    let bin_0 = u32(floor_df64_to_i32(position_0));
-    let bin_1 = u32(floor_df64_to_i32(position_1));
+    let bin_0 = min(u32(max(floor_df64_to_i32(position_0), 0)), FINE_0 - 1u);
+    let bin_1 = min(u32(max(floor_df64_to_i32(position_1), 0)), FINE_1 - 1u);
     let bin = bin_0 + FINE_0 * bin_1;
     let slot = bin_offsets[bin] + atomicAdd(&bin_cursors[bin], 1u);
     sorted_indices[slot] = point_index;
@@ -1588,8 +1588,8 @@ fn main(
     let point_index = wg_flat * WORKGROUP_SIZE + lid.x;
     if (point_index >= total) {{ return; }}
     let point_base = point_index * 2u;
-    let bin_0 = u32(floor(fold_position_0(points[point_base])));
-    let bin_1 = u32(floor(fold_position_1(points[point_base + 1u])));
+    let bin_0 = min(u32(max(floor(fold_position_0(points[point_base])), 0.0lf)), FINE_0 - 1u);
+    let bin_1 = min(u32(max(floor(fold_position_1(points[point_base + 1u])), 0.0lf)), FINE_1 - 1u);
     let bin = bin_0 + FINE_0 * bin_1;
     let slot = bin_offsets[bin] + atomicAdd(&bin_cursors[bin], 1u);
     sorted_indices[slot] = point_index;

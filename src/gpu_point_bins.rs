@@ -508,11 +508,14 @@ fn generate_bin_count_wgsl(
                 .map(|(axis, count)| format!("const BINS_{axis}: u32 = {count}u;\n")),
         )
         .collect();
+    // A coordinate the fold cannot bring onto the grid, NaN included, would
+    // otherwise index past the counts: clamping keeps every point in one bin,
+    // and preparation gives such a point zero weight.
     let cells: String = (0..dimensions)
         .map(|axis| {
             if exact {
                 format!(
-                    "    let cell_{axis} = u32(floor_df64_to_i32(fold_position_{axis}(points[point_base + {axis}u])));\n"
+                    "    let cell_{axis} = min(u32(max(floor_df64_to_i32(fold_position_{axis}(points[point_base + {axis}u])), 0)), FINE_{axis} - 1u);\n"
                 )
             } else {
                 format!(
@@ -603,12 +606,17 @@ fn main(
 }
 
 /// Shared declarations of the preparing shaders: constants, the output
-/// bindings at `binding` and `binding + 1`, and `ceil_df64_to_i32`.
+/// bindings at `binding` and `binding + 1`, `ceil_df64_to_i32`, and
+/// `coordinate_in_reach`.
 fn prepare_header(kernel: EsKernel, dimensions: usize, binding: u32) -> String {
     format!(
         r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
 const POINT_DIMENSIONS: u32 = {dimensions}u;
 const HALF_WIDTH: f32 = {half_width};
+// Bits of 4*pi, a magnitude the fold's two periods bring onto the grid.
+const FOLD_REACH_BITS: u32 = {fold_reach_bits}u;
+// An offset past the support of every kernel width, so every weight is zero.
+const OUTSIDE_SUPPORT: f32 = 1024.0;
 
 @group(0) @binding({binding}) var<storage, read_write> prepared_starts: array<vec4<i32>>;
 @group(0) @binding({offsets_binding}) var<storage, read_write> prepared_offsets: array<vec2<f32>>;
@@ -620,26 +628,47 @@ fn ceil_df64_to_i32(value: Df64) -> i32 {{
         (remainder.hi == 0.0 && remainder.lo > 0.0);
     return i32(base) + select(0, 1, has_positive_remainder);
 }}
+
+// Compares the magnitude's bits, so NaN and infinities fail even where the
+// compiler assumes they never occur.
+fn coordinate_in_reach(coordinate: f32) -> bool {{
+    return (bitcast<u32>(coordinate) & 0x7fffffffu) <= FOLD_REACH_BITS;
+}}
 "#,
         half_width = format_wgsl_f32(kernel.half_width() as f32),
+        fold_reach_bits = (4.0 * std::f32::consts::PI).to_bits(),
         offsets_binding = binding + 1,
     )
 }
 
 /// WGSL statements preparing `point_index` (with coordinates at
 /// `point_base`) into `slot`.
+///
+/// A point with a coordinate out of the fold's reach, NaN included, gets
+/// start zero and offsets past the kernel support: every consumer then reads
+/// inside the grid and weighs the point by zero, so type-1 spreading skips it
+/// and type-2 interpolation returns zero for it.
 fn prepare_statements(dimensions: usize) -> String {
+    let in_reach = (0..dimensions)
+        .map(|axis| format!("coordinate_in_reach(points[point_base + {axis}u])"))
+        .collect::<Vec<_>>()
+        .join(" && ");
     let axes: String = (0..dimensions)
         .map(|axis| {
             format!(
                 "    let position_{axis} = fold_position_{axis}(points[point_base + {axis}u]);
-    let start_{axis} = ceil_df64_to_i32(df64_sub(position_{axis}, Df64(HALF_WIDTH, 0.0)));
-    let offset_{axis} = df64_sub(Df64(f32(start_{axis}), 0.0), position_{axis});
+    var start_{axis} = ceil_df64_to_i32(df64_sub(position_{axis}, Df64(HALF_WIDTH, 0.0)));
+    var offset_{axis} = df64_sub(Df64(f32(start_{axis}), 0.0), position_{axis});
+    if (!in_reach) {{
+        start_{axis} = 0;
+        offset_{axis} = Df64(OUTSIDE_SUPPORT, 0.0);
+    }}
     prepared_offsets[POINT_DIMENSIONS * slot + {axis}u] = vec2<f32>(offset_{axis}.hi, offset_{axis}.lo);
 "
             )
         })
         .collect();
+    let axes = format!("    let in_reach = {in_reach};\n{axes}");
     let starts = (0..3)
         .map(|axis| {
             if axis < dimensions {
@@ -766,6 +795,7 @@ mod tests {
             generate_scatter_prepare_wgsl(kernel, 1, &position),
         ] {
             assert!(source.contains("vec4<i32>(start_0, 0, 0, bitcast<i32>(point_index))"));
+            assert!(source.contains("let in_reach = coordinate_in_reach(points[point_base + 0u]);"));
             assert_valid_wgsl(&source);
         }
     }
@@ -796,6 +826,9 @@ mod tests {
         assert!(
             prepare_3d.contains("vec4<i32>(start_0, start_1, start_2, bitcast<i32>(point_index))")
         );
+        assert!(prepare_3d.contains(
+            "coordinate_in_reach(points[point_base + 1u]) && coordinate_in_reach(points[point_base + 2u]);"
+        ));
         assert!(prepare_3d.contains("let slot = bin_offsets[bin_slot.x] + bin_slot.y;"));
         for source in [
             prepare_2d,

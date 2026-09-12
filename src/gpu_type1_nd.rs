@@ -777,7 +777,7 @@ fn per_axis_bin_statements(dimensions: usize, indent: &str) -> String {
             source,
             "{indent}let position{axis} = fold_position(points[base + {axis}u], \
              vec2<f32>(POSITION_SCALE_HI{axis}, POSITION_SCALE_LO{axis}), GRID_ORIGIN{axis}, FINE_LENGTH_F32_{axis});\n\
-             {indent}let bin{axis} = u32(floor_df64_to_i32(position{axis}));"
+             {indent}let bin{axis} = min(u32(max(floor_df64_to_i32(position{axis}), 0)), FINE_LENGTH{axis} - 1u);"
         );
     }
     // axis-0-fast flat bin index
@@ -798,7 +798,7 @@ fn per_axis_bin_statements_f64(dimensions: usize, indent: &str) -> String {
             source,
             "{indent}let position{axis} = fold_position(points[base + {axis}u], \
              FINE_LENGTH_F64_{axis}, POSITION_SCALE{axis}, GRID_ORIGIN{axis});\n\
-             {indent}let bin{axis} = u32(floor(position{axis}));"
+             {indent}let bin{axis} = min(u32(max(floor(position{axis}), 0.0lf)), FINE_LENGTH{axis} - 1u);"
         );
     }
     let mut fold = format!("bin{}", dimensions - 1);
@@ -1592,7 +1592,9 @@ mod tests {
     fn nd_count_and_scatter_shaders_fold_per_axis_bins() {
         let source = generate_count_wgsl(&[16, 12, 10, 10], FftPrecision::F32);
         assert!(source.contains("atomicAdd(&bin_counts[bin], 1u);"));
-        assert!(source.contains("let bin3 = u32(floor_df64_to_i32(position3));"));
+        assert!(source.contains(
+            "let bin3 = min(u32(max(floor_df64_to_i32(position3), 0)), FINE_LENGTH3 - 1u);"
+        ));
         assert!(source.contains("let bin = bin0 + FINE_LENGTH0 * (bin1 + FINE_LENGTH1 * (bin2 + FINE_LENGTH2 * (bin3)));"));
         let scatter = generate_scatter_wgsl(&[16, 12, 10, 10], FftPrecision::F32);
         assert!(scatter.contains("atomicAdd(&bin_cursors[bin], 1u)"));
@@ -1604,7 +1606,8 @@ mod tests {
         let count_f64 = generate_count_wgsl(&[16, 12, 10, 10], FftPrecision::F64);
         assert!(count_f64.contains("var<storage, read> points: array<f64>;"));
         assert!(count_f64.contains("fn fold_position(point: f64"));
-        assert!(count_f64.contains("let bin3 = u32(floor(position3));"));
+        assert!(count_f64
+            .contains("let bin3 = min(u32(max(floor(position3), 0.0lf)), FINE_LENGTH3 - 1u);"));
         assert!(!count_f64.contains("struct Df64"));
         assert!(!count_f64.contains("enable f64"));
         let count_df64 = generate_count_wgsl(&[16, 12, 10, 10], FftPrecision::Df64);
