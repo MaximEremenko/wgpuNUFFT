@@ -61,3 +61,8 @@ pub use wgpu;
 pub use wgpu_fft;
 pub use wgpu_fft::math::{Complex64, ComplexDoubleFloat, DoubleFloat};
 pub use wgpu_fft::FftPrecision;
+
+/// Compiles the README's Rust examples as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

@@ -38,8 +38,13 @@ cargo test --locked
 cargo test --manifest-path wgpuFFT/Cargo.toml --locked
 ```
 
-Rust 1.92 or newer is required. GPU suites remain opt-in as documented by the
-individual test targets.
+Rust 1.92 or newer is required. The GPU suites are opt-in: set
+`WGPU_FFT_RUN_GPU_TESTS=1` to run them on the default adapter, optionally with
+`WGPU_BACKEND=vulkan`, `dx12`, or `metal` to pick a backend.
+`WGPU_NUFFT_RUN_LARGE_GPU_TESTS=1` adds a 256^3 case, which needs the
+`gpu-profiling` feature. That feature also adds timestamp-query stage profiling
+(`NufftPlan::encode_type1_gpu_profiled` and friends); the other features only
+build benchmark prototypes.
 
 ## Local dependency and quick start
 
@@ -67,6 +72,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+A GPU plan records its work into a caller's command encoder and reads and
+writes caller-owned buffers, so results can stay on the GPU. This 2D type-1
+transform spreads 1,000 points onto 64 x 64 Fourier modes:
+
+```rust,no_run
+use wgpu_nufft::wgpu::{self, util::DeviceExt};
+use wgpu_nufft::{NufftConfig, NufftPlan};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Any wgpu device works; wgpu-fft can pick the default adapter.
+    let context = pollster::block_on(wgpu_nufft::wgpu_fft::device::request_default_device())
+        .ok_or("no GPU adapter")?;
+    let (device, queue) = (&context.device, &context.queue);
+    let plan = NufftPlan::type1_gpu(device, queue, NufftConfig::new([64, 64], 1.0e-6))?;
+
+    // Point-major coordinates [x0, y0, x1, y1, ...] in [-pi, pi) and
+    // interleaved complex strengths [re0, im0, re1, im1, ...].
+    let point_count = 1000;
+    let points: Vec<f32> = (0..2 * point_count)
+        .map(|i| (i as f32 * 0.618).fract() * 6.28 - 3.14)
+        .collect();
+    let strengths = vec![1.0f32; 2 * point_count];
+    let storage = |contents: &[f32]| {
+        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: None,
+            contents: bytemuck::cast_slice(contents),
+            usage: wgpu::BufferUsages::STORAGE,
+        })
+    };
+    let (points, strengths) = (storage(&points), storage(&strengths));
+    let modes = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("modes"),
+        size: plan.required_type1_output_buffer_size_bytes()?,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&Default::default());
+    plan.encode_type1_gpu(device, &mut encoder, point_count, &points, &strengths, &modes)?;
+    queue.submit([encoder.finish()]);
+    // `modes` now holds 64 * 64 interleaved complex values, axis zero fastest.
+    Ok(())
+}
+```
+
+Type-2 and type-3 plans follow the same pattern. `wgpu_nufft::wgpu` re-exports
+the `wgpu` release the plans are built on (currently 30), so a consumer that
+uses it cannot end up with a second, incompatible copy.
 
 ## Python binding
 
