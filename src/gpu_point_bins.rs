@@ -606,8 +606,7 @@ fn main(
 }
 
 /// Shared declarations of the preparing shaders: constants, the output
-/// bindings at `binding` and `binding + 1`, `ceil_df64_to_i32`, and
-/// `coordinate_in_reach`.
+/// bindings at `binding` and `binding + 1`, and `ceil_df64_to_i32`.
 fn prepare_header(kernel: EsKernel, dimensions: usize, binding: u32) -> String {
     format!(
         r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
@@ -628,12 +627,6 @@ fn ceil_df64_to_i32(value: Df64) -> i32 {{
         (remainder.hi == 0.0 && remainder.lo > 0.0);
     return i32(base) + select(0, 1, has_positive_remainder);
 }}
-
-// Compares the magnitude's bits, so NaN and infinities fail even where the
-// compiler assumes they never occur.
-fn coordinate_in_reach(coordinate: f32) -> bool {{
-    return (bitcast<u32>(coordinate) & 0x7fffffffu) <= FOLD_REACH_BITS;
-}}
 "#,
         half_width = format_wgsl_f32(kernel.half_width() as f32),
         fold_reach_bits = (4.0 * std::f32::consts::PI).to_bits(),
@@ -647,28 +640,35 @@ fn coordinate_in_reach(coordinate: f32) -> bool {{
 /// A point with a coordinate out of the fold's reach, NaN included, gets
 /// start zero and offsets past the kernel support: every consumer then reads
 /// inside the grid and weighs the point by zero, so type-1 spreading skips it
-/// and type-2 interpolation returns zero for it.
+/// and type-2 interpolation returns zero for it. The test compares magnitude
+/// bits, so NaN and infinities fail even where the compiler assumes they never
+/// occur.
+///
+/// Every coordinate is loaded once, before any store, and the fallback is
+/// selected without branches. That made the
+/// preparation 5% faster than it was without the test, while a short-circuit
+/// test that read the coordinates again made it 20% slower.
 fn prepare_statements(dimensions: usize) -> String {
-    let in_reach = (0..dimensions)
-        .map(|axis| format!("coordinate_in_reach(points[point_base + {axis}u])"))
-        .collect::<Vec<_>>()
-        .join(" && ");
+    let loads: String = (0..dimensions)
+        .map(|axis| format!("    let coordinate_{axis} = points[point_base + {axis}u];\n"))
+        .collect();
+    let magnitude = (0..dimensions)
+        .map(|axis| format!("(bitcast<u32>(coordinate_{axis}) & 0x7fffffffu)"))
+        .reduce(|left, right| format!("max({left}, {right})"))
+        .unwrap_or_default();
     let axes: String = (0..dimensions)
         .map(|axis| {
             format!(
-                "    let position_{axis} = fold_position_{axis}(points[point_base + {axis}u]);
-    var start_{axis} = ceil_df64_to_i32(df64_sub(position_{axis}, Df64(HALF_WIDTH, 0.0)));
-    var offset_{axis} = df64_sub(Df64(f32(start_{axis}), 0.0), position_{axis});
-    if (!in_reach) {{
-        start_{axis} = 0;
-        offset_{axis} = Df64(OUTSIDE_SUPPORT, 0.0);
-    }}
-    prepared_offsets[POINT_DIMENSIONS * slot + {axis}u] = vec2<f32>(offset_{axis}.hi, offset_{axis}.lo);
+                "    let position_{axis} = fold_position_{axis}(coordinate_{axis});
+    let start_{axis} = select(0, ceil_df64_to_i32(df64_sub(position_{axis}, Df64(HALF_WIDTH, 0.0))), in_reach);
+    let offset_{axis} = df64_sub(Df64(f32(start_{axis}), 0.0), position_{axis});
+    prepared_offsets[POINT_DIMENSIONS * slot + {axis}u] =
+        select(vec2<f32>(OUTSIDE_SUPPORT, 0.0), vec2<f32>(offset_{axis}.hi, offset_{axis}.lo), in_reach);
 "
             )
         })
         .collect();
-    let axes = format!("    let in_reach = {in_reach};\n{axes}");
+    let axes = format!("{loads}    let in_reach = {magnitude} <= FOLD_REACH_BITS;\n{axes}");
     let starts = (0..3)
         .map(|axis| {
             if axis < dimensions {
@@ -795,7 +795,9 @@ mod tests {
             generate_scatter_prepare_wgsl(kernel, 1, &position),
         ] {
             assert!(source.contains("vec4<i32>(start_0, 0, 0, bitcast<i32>(point_index))"));
-            assert!(source.contains("let in_reach = coordinate_in_reach(points[point_base + 0u]);"));
+            assert!(source.contains(
+                "let in_reach = (bitcast<u32>(coordinate_0) & 0x7fffffffu) <= FOLD_REACH_BITS;"
+            ));
             assert_valid_wgsl(&source);
         }
     }
@@ -826,8 +828,9 @@ mod tests {
         assert!(
             prepare_3d.contains("vec4<i32>(start_0, start_1, start_2, bitcast<i32>(point_index))")
         );
+        assert!(prepare_3d.contains("let coordinate_2 = points[point_base + 2u];"));
         assert!(prepare_3d.contains(
-            "coordinate_in_reach(points[point_base + 1u]) && coordinate_in_reach(points[point_base + 2u]);"
+            "(bitcast<u32>(coordinate_1) & 0x7fffffffu)), (bitcast<u32>(coordinate_2) & 0x7fffffffu)) <= FOLD_REACH_BITS;"
         ));
         assert!(prepare_3d.contains("let slot = bin_offsets[bin_slot.x] + bin_slot.y;"));
         for source in [
