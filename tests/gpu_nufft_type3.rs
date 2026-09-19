@@ -474,7 +474,9 @@ fn f32_to_f64(values: &[f32]) -> Vec<f64> {
 
 fn interleaved_to_complex64(values: &[f32]) -> Vec<Complex64> {
     values
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
         .collect()
 }

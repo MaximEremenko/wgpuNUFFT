@@ -3097,22 +3097,25 @@ mod tests {
                 .map(|&value| f64::from(value))
                 .collect::<Vec<_>>();
             let strengths_f64 = strengths
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|value| crate::Complex64::new(f64::from(value[0]), f64::from(value[1])))
                 .collect::<Vec<_>>();
             let reference =
                 crate::direct::reference_type1_f64(&config, &coordinates, &strengths_f64).unwrap();
-            let (error_squared, norm_squared) = actual.chunks_exact(2).zip(&reference).fold(
-                (0.0, 0.0),
-                |(error, norm), (value, reference)| {
-                    let delta_re = f64::from(value[0]) - reference.re;
-                    let delta_im = f64::from(value[1]) - reference.im;
-                    (
-                        error + delta_re * delta_re + delta_im * delta_im,
-                        norm + reference.re * reference.re + reference.im * reference.im,
-                    )
-                },
-            );
+            let (error_squared, norm_squared) =
+                actual.as_chunks::<2>().0.iter().zip(&reference).fold(
+                    (0.0, 0.0),
+                    |(error, norm), (value, reference)| {
+                        let delta_re = f64::from(value[0]) - reference.re;
+                        let delta_im = f64::from(value[1]) - reference.im;
+                        (
+                            error + delta_re * delta_re + delta_im * delta_im,
+                            norm + reference.re * reference.re + reference.im * reference.im,
+                        )
+                    },
+                );
             let relative_l2 = (error_squared / norm_squared.max(f64::MIN_POSITIVE)).sqrt();
             assert!(
                 relative_l2 <= 8.0 * config.eps(),

@@ -498,7 +498,9 @@ fn validate_large_256_cubed_type2(device: &wgpu::Device, queue: &wgpu::Queue) {
     let actual =
         interleaved_to_complex64(&execute_type2(device, queue, &plan, &points, &coefficients));
     let expected = points
-        .chunks_exact(DIMENSIONS)
+        .as_chunks::<DIMENSIONS>()
+        .0
+        .iter()
         .map(|point| {
             let phase = f64::from(point[0]) + 2.0 * f64::from(point[1]) + 3.0 * f64::from(point[2]);
             rotate(coefficient, phase)
@@ -1319,7 +1321,9 @@ fn points_f64(points: &[f32]) -> Vec<f64> {
 
 fn interleaved_to_complex64(values: &[f32]) -> Vec<Complex64> {
     values
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|value| Complex64::new(f64::from(value[0]), f64::from(value[1])))
         .collect()
 }

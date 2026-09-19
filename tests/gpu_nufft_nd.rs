@@ -357,7 +357,7 @@ async fn adjoint_case(context: &wgpu_fft::device::GpuContext) {
     let vdot = |a: &[f32], b: &[f32]| -> (f64, f64) {
         let mut re = 0.0f64;
         let mut im = 0.0f64;
-        for (pa, pb) in a.chunks_exact(2).zip(b.chunks_exact(2)) {
+        for (pa, pb) in a.as_chunks::<2>().0.iter().zip(b.as_chunks::<2>().0.iter()) {
             let (ar, ai) = (f64::from(pa[0]), -f64::from(pa[1]));
             let (br, bi) = (f64::from(pb[0]), f64::from(pb[1]));
             re += ar * br - ai * bi;
@@ -449,13 +449,17 @@ async fn run_case(
             &config,
             &points.iter().map(|&x| f64::from(x)).collect::<Vec<_>>(),
             &coefficients
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
                 .collect::<Vec<_>>(),
         )
         .unwrap();
         let actual_complex = actual
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
             .collect::<Vec<_>>();
         let error = relative_l2(&actual_complex, &reference);
@@ -486,13 +490,17 @@ async fn run_case(
             &config,
             &points.iter().map(|&x| f64::from(x)).collect::<Vec<_>>(),
             &strengths
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
                 .collect::<Vec<_>>(),
         )
         .unwrap();
         let t1_actual_complex = t1_actual
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
             .collect::<Vec<_>>();
         let t1_error = relative_l2(&t1_actual_complex, &t1_reference);

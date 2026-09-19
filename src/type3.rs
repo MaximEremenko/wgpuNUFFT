@@ -1029,7 +1029,9 @@ mod tests {
                 0.13, -0.57, 0.82, 0.61, //
                 0.64, 0.38, -0.29, -0.87,
             ]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|point| point[..dimensions].iter().copied())
             .collect::<Vec<_>>();
             let target_frequencies = [
@@ -1038,7 +1040,9 @@ mod tests {
                 1.09, 0.31, -0.58, 0.42, //
                 -0.43, 0.88, 0.14, -1.37,
             ]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|point| point[..dimensions].iter().copied())
             .collect::<Vec<_>>();
             let source_bounds = (0..dimensions)

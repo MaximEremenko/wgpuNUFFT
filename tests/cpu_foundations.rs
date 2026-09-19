@@ -136,7 +136,7 @@ fn approximate_type1_2d(
     let modes = plan.config().n_modes();
     let kernel = plan.kernel();
     let mut grid = vec![Complex64::default(); fine[0] * fine[1]];
-    for (point, &strength) in coordinates.chunks_exact(2).zip(strengths) {
+    for (point, &strength) in coordinates.as_chunks::<2>().0.iter().zip(strengths) {
         let position = [
             fold_to_grid(point[0], fine[0]),
             fold_to_grid(point[1], fine[1]),
@@ -201,7 +201,9 @@ fn approximate_type2_2d(
     }
     let transformed = fft_nd_for_sign(&grid, fine, plan.config().sign());
     coordinates
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|point| {
             let position = [
                 fold_to_grid(point[0], fine[0]),
@@ -261,7 +263,9 @@ fn approximate_type2_3d(
     }
     let transformed = fft_nd_for_sign(&grid, fine, plan.config().sign());
     coordinates
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|point| {
             let position = [
                 fold_to_grid(point[0], fine[0]),
@@ -719,7 +723,9 @@ fn tensor_product_es_host_path_meets_acceptance_in_two_dimensions() {
         -PI, PI, -2.71, -1.93, -0.37, 0.11, 0.0, 0.0, 0.0, 0.0, 0.43, -0.82, 2.63, 2.91,
     ];
     let strengths = coordinates
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .enumerate()
         .map(|(index, point)| {
             Complex64::new(
@@ -807,7 +813,9 @@ fn many_vector_direct_references_are_transform_major_and_match_single_loops() {
         .collect::<Vec<_>>();
     let type1 = reference_type1_f64(&batched, &points, &strengths).unwrap();
     let expected_type1 = strengths
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .flat_map(|vector| reference_type1_f64(&single, &points, vector).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(type1, expected_type1);
@@ -828,7 +836,9 @@ fn many_vector_direct_references_are_transform_major_and_match_single_loops() {
         .collect::<Vec<_>>();
     let type2 = reference_type2_f64(&batched, &points, &coefficients).unwrap();
     let expected_type2 = coefficients
-        .chunks_exact(6)
+        .as_chunks::<6>()
+        .0
+        .iter()
         .flat_map(|vector| reference_type2_f64(&single, &points, vector).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(type2, expected_type2);

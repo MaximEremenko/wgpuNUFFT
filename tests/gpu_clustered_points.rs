@@ -112,13 +112,17 @@ fn check(device: &wgpu::Device, queue: &wgpu::Queue, shape: &[usize], points: &[
     for vector in 0..BATCH {
         let vector_strengths: Vec<Complex64> = strengths
             [2 * vector * point_count..2 * (vector + 1) * point_count]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
             .collect();
         let reference = reference_type1_f64(&single, &points_f64, &vector_strengths).unwrap();
         let actual: Vec<Complex64> = encoded
             [2 * vector * mode_count..2 * (vector + 1) * mode_count]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
             .collect();
         let error = relative_l2(&actual, &reference);

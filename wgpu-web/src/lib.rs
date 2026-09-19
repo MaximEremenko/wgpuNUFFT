@@ -1199,7 +1199,9 @@ fn parse_intervals(values: Vec<f64>, set: &'static str) -> Result<Vec<NufftInter
         )));
     }
     Ok(values
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|bounds| NufftInterval::new(bounds[0], bounds[1]))
         .collect())
 }

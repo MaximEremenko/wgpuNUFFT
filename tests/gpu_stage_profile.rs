@@ -522,8 +522,10 @@ fn finish_case(
     let output = read_buffer(device, &output_readback, output_readback_bytes);
     let output_word_count = usize::try_from(output_bytes / 4).unwrap();
     let output_words = output
-        .chunks_exact(4)
-        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&bytes| u32::from_le_bytes(bytes))
         .collect::<Vec<_>>();
     assert_eq!(output_words.len(), output_word_count * 2);
     assert_eq!(
@@ -534,8 +536,10 @@ fn finish_case(
 
     let timestamp_data = read_buffer(device, &timestamp_readback, timestamp_bytes);
     let timestamps = timestamp_data
-        .chunks_exact(8)
-        .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&bytes| u64::from_le_bytes(bytes))
         .collect::<Vec<_>>();
     assert_eq!(
         timestamps.len(),

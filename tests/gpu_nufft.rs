@@ -61,7 +61,9 @@ async fn run_gpu_nufft_cases() {
                 }
                 let point_f64 = points.iter().map(|&x| f64::from(x)).collect::<Vec<_>>();
                 let coefficient_f64 = coefficients
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
                     .collect::<Vec<_>>();
                 let reference = reference_type2_f64(&config, &point_f64, &coefficient_f64).unwrap();
@@ -145,7 +147,9 @@ async fn run_gpu_nufft_cases() {
         &odd_config,
         &odd_points.iter().map(|&x| f64::from(x)).collect::<Vec<_>>(),
         &odd_coefficients
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
             .collect::<Vec<_>>(),
     )
@@ -842,7 +846,9 @@ fn validate_structured_gpu_errors(device: &wgpu::Device, queue: &wgpu::Queue) {
 
 fn interleaved_to_complex64(values: &[f32]) -> Vec<Complex64> {
     values
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| Complex64::new(f64::from(pair[0]), f64::from(pair[1])))
         .collect()
 }

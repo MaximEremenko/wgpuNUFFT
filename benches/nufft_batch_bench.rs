@@ -769,7 +769,7 @@ fn transform_vector(base: &[f32], vector: usize) -> Vec<f32> {
     let factor_re = 1.0 + vector as f32 * (1.0 / 32.0);
     let factor_im = -(vector as f32) * (1.0 / 64.0);
     let mut values = Vec::with_capacity(base.len());
-    for pair in base.chunks_exact(2) {
+    for pair in base.as_chunks::<2>().0 {
         values.push(pair[0] * factor_re - pair[1] * factor_im);
         values.push(pair[0] * factor_im + pair[1] * factor_re);
     }
