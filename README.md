@@ -29,9 +29,9 @@ from [wgpu-fft](https://github.com/MaximEremenko/wgpuFFT), pinned here as the
   your buffers, so data never has to leave the GPU.
 - **Batches and point reuse**: many vectors over one point set, and a point
   set prepared once for repeated transforms.
-- **CPU backend**: `CpuNufftPlan` runs type 1 and type 2 on the CPU in one to
-  eight dimensions, with the same configuration and layouts and the same
-  bitwise repeatability, for any thread count.
+- **CPU backend**: `CpuNufftPlan` and `CpuNufftType3Plan` run all three types
+  on the CPU in one to eight dimensions, with the same configuration and
+  layouts and the same bitwise repeatability, for any thread count.
 - **Python and JavaScript**: a PyO3 + NumPy binding and a `wasm-bindgen`
   browser package.
 
@@ -134,9 +134,9 @@ follow the same pattern. Run `cargo doc --open` for the full API.
 
 ## CPU backend
 
-`CpuNufftPlan` runs type-1 and type-2 transforms in host memory, for machines
-without a usable GPU or for checking GPU results. It takes the same
-`NufftConfig` and the same layouts as the GPU buffers, in one to eight
+`CpuNufftPlan` (types 1 and 2) and `CpuNufftType3Plan` run in host memory,
+for machines without a usable GPU or for checking GPU results. They take the
+same configurations and the same layouts as the GPU buffers, in one to eight
 dimensions. `F32` plans compute in `f32`; `F64` and `Df64` plans compute in
 `f64` and take `f64` words or `Df64` word pairs.
 
@@ -165,8 +165,8 @@ check every coordinate and return an error for one outside
 `[-3*pi, 3*pi]`. The kernel is evaluated from the same piecewise
 polynomials as the GPU `F64` and `Df64` paths, and the fine-grid FFT runs on
 wgpu-fft's CPU backend. A plan keeps its fine-grid buffers between
-executions. Type-3 plans have only the direct CPU reference
-(`NufftType3Plan::execute_cpu`) so far.
+executions. Type-3 plans compose these steps as on the GPU and check every
+source and target against the plan's intervals.
 
 ## Data layout
 
@@ -360,7 +360,7 @@ $env:WGPU_FFT_RUN_GPU_TESTS = '1'; cargo test --release
 | `gpu_clustered_points` | Tightly clustered points, the large-bin sort, and the heavy passes. |
 | `gpu_invalid_points` | Coordinates outside the contract, NaN and infinities included. |
 | `gpu_device_mismatch` | Buffers and devices from another `wgpu` device. |
-| `cpu_nufft` | The CPU plans against the reference in 1D to 5D in all three precisions, clustered and boundary points, and bitwise repeatability across thread counts. It runs without a GPU. |
+| `cpu_nufft`, `cpu_nufft_type3` | The CPU plans against the reference (types 1 and 2 in 1D to 5D, type 3 in 1D to 4D) in all three precisions, clustered and boundary points, and bitwise repeatability across thread counts. They run without a GPU. |
 
 `WGPU_NUFFT_RUN_LARGE_GPU_TESTS=1` adds a 256^3 case, which needs
 `--features gpu-profiling`. Browser tests are described in
@@ -370,7 +370,7 @@ $env:WGPU_FFT_RUN_GPU_TESTS = '1'; cargo test --release
 
 | Feature | Effect |
 |---|---|
-| `cpu` (default) | The CPU backend, `CpuNufftPlan`. |
+| `cpu` (default) | The CPU backend, `CpuNufftPlan` and `CpuNufftType3Plan`. |
 | `gpu-profiling` | Timestamp-query stage profiling (`NufftPlan::encode_type1_gpu_profiled` and friends). |
 | `type1-2d-tile-prototype`, `type1-3d-tile-prototype` | Benchmark-only variants of the type-1 gather. |
 

@@ -10,8 +10,8 @@
 //! `f32`, native `f64`, and portable double-float precision, and encode
 //! spreading or interpolation around a fine-grid C2C transform using
 //! caller-owned input and output buffers. With the default `cpu` feature,
-//! [`CpuNufftPlan`] runs type-1 and type-2 transforms in host memory, with
-//! the same configuration and layouts.
+//! [`CpuNufftPlan`] and [`CpuNufftType3Plan`] run all three transform types
+//! in host memory, with the same configurations and layouts.
 
 #![forbid(unsafe_code)]
 
@@ -49,7 +49,7 @@ pub use config::{
     MAX_NUFFT_DIMENSIONS,
 };
 #[cfg(feature = "cpu")]
-pub use cpu::CpuNufftPlan;
+pub use cpu::{CpuNufftPlan, CpuNufftType3Plan};
 pub use direct::{reference_type1_f64, reference_type2_f64};
 pub use error::{NufftError, Result};
 #[cfg(feature = "gpu-profiling")]

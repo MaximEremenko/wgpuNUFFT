@@ -8,10 +8,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `CpuNufftPlan`: type-1 and type-2 plans in host memory, behind the default
-  `cpu` feature. They take the same `NufftConfig` and layouts as the GPU
-  plans, support one to eight dimensions and all three precisions, check
-  every coordinate, and give bitwise-identical results for any thread count.
+- `CpuNufftPlan` (types 1 and 2) and `CpuNufftType3Plan`: plans in host
+  memory, behind the default `cpu` feature. They take the same
+  configurations and layouts as the GPU plans, support one to eight
+  dimensions and all three precisions, check every coordinate, and give
+  bitwise-identical results for any thread count.
 
 ## [0.1.0] - 2026-09-28
 

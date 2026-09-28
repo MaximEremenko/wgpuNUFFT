@@ -370,3 +370,35 @@ fn cpu_plans_reject_invalid_inputs() {
         Err(NufftError::PrecisionUnsupported { .. })
     ));
 }
+
+#[test]
+fn cpu_dense_grids_match_the_reference_and_repeat() {
+    // Small grids holding many points spread through private grid copies.
+    for shape in [&[1000][..], &[16, 16], &[8, 8, 8]] {
+        let dimensions = shape.len();
+        let config = NufftConfig::new(shape, 1.0e-9).with_precision(FftPrecision::F64);
+        let mut rng = Lcg(21);
+        let point_count = 40_000;
+        let coordinates = rng.coordinates(point_count * dimensions);
+        let strengths = interleave(&rng.values(point_count));
+        let plan = CpuNufftPlan::type1(config.clone()).unwrap();
+        let modes = execute(&plan, &coordinates, &strengths).unwrap();
+        let expected =
+            reference_type1_f64(&config, &coordinates, &deinterleave(&strengths)).unwrap();
+        let error = relative_l2(&deinterleave(&modes), &expected);
+        assert!(error <= 1.0e-8, "{shape:?} dense type 1: {error:.3e}");
+        for threads in [1, 5] {
+            let plan = CpuNufftPlan::type1(config.clone())
+                .unwrap()
+                .with_threads(threads);
+            let repeat = execute(&plan, &coordinates, &strengths).unwrap();
+            assert!(
+                repeat
+                    .iter()
+                    .zip(&modes)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{shape:?}: {threads} threads changed the dense result"
+            );
+        }
+    }
+}

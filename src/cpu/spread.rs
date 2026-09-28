@@ -10,12 +10,23 @@ use super::grid::{FineGrid, Weights, MAX_WIDTH};
 use super::points::{Slabs, SortedPoints};
 use super::real::{Coordinate, Real};
 use super::workers::{for_each_chunk_group, run_tasks};
+use super::zeroed;
+use crate::error::Result;
 
 /// Points gathered together before their supports are computed, so that
 /// their scattered loads overlap.
 const BLOCK: usize = 64;
 /// Points per thread below which interpolation stays on one thread.
 const MIN_POINTS_PER_THREAD: usize = 1 << 11;
+/// Grids with fewer slabs than this may spread through private copies.
+const DENSE_MAX_SLABS: usize = 32;
+/// Points per private copy of a dense grid.
+const DENSE_POINTS_PER_GROUP: usize = 1 << 14;
+const DENSE_MAX_GROUPS: usize = 64;
+/// Cells that all private copies may hold together.
+const DENSE_MAX_CELLS: usize = 1 << 24;
+/// Cells per thread below which the copies are summed on one thread.
+const MIN_CELLS_PER_THREAD: usize = 1 << 15;
 
 /// A complex value, real part first.
 type Cell<T> = [T; 2];
@@ -129,14 +140,7 @@ pub(crate) fn spread<T: Real, P: Coordinate, const D: usize, const RUN: usize>(
             for list in [incoming, sorted.slab(slab)] {
                 for chunk in list.chunks(BLOCK) {
                     points.gather(chunk, block);
-                    for (&point, targets) in chunk
-                        .iter()
-                        .zip(block.strengths.chunks_exact_mut(points.batch))
-                    {
-                        for (transform, target) in targets.iter_mut().enumerate() {
-                            *target = strengths[transform * points.count + point as usize];
-                        }
-                    }
+                    gather_strengths(points, strengths, chunk, block);
                     for index in 0..chunk.len() {
                         spread_point::<T, P, D, RUN>(points, block, index, low, high, &mut grids);
                     }
@@ -225,6 +229,94 @@ fn spread_point<T: Real, P: Coordinate, const D: usize, const RUN: usize>(
                     }
                 }
             });
+        }
+    }
+}
+
+/// The number of private grid copies to spread through, if the grid has too
+/// few slabs to keep threads busy, at least as many points as cells, and
+/// room for more copies than it has slabs.
+///
+/// It depends on the problem alone, never on the thread count, because it
+/// fixes the order in which every cell sums its points.
+pub(crate) fn dense_groups(slab_count: usize, point_count: usize, cells: usize) -> Option<usize> {
+    if slab_count >= DENSE_MAX_SLABS || point_count < cells {
+        return None;
+    }
+    let groups = (point_count / DENSE_POINTS_PER_GROUP)
+        .min(DENSE_MAX_GROUPS)
+        .min(DENSE_MAX_CELLS / cells.max(1));
+    (groups >= 2 && groups > slab_count).then_some(groups)
+}
+
+/// Spreads like [`spread`] onto a small grid that holds many points: the
+/// points, in sorted order, are cut into `groups` fixed runs, each spread
+/// onto its own zeroed copy of the grid, and the copies are added in group
+/// order.
+pub(crate) fn spread_dense<T: Real, P: Coordinate, const D: usize, const RUN: usize>(
+    points: &Points<'_, T, P, D>,
+    strengths: &[Cell<T>],
+    sorted: &SortedPoints,
+    groups: usize,
+    fine: &mut [Cell<T>],
+    threads: usize,
+) -> Result<()> {
+    let grid = points.grid;
+    let copy_cells = grid.cells() * points.batch;
+    let mut copies = zeroed::<Cell<T>>("CPU private fine-grid copies", copy_cells * groups)?;
+    let order = &sorted.order;
+    let per_group = order.len().div_ceil(groups);
+    let tasks = copies
+        .chunks_mut(copy_cells)
+        .enumerate()
+        .collect::<Vec<_>>();
+    let length = grid.shape[D - 1];
+    run_tasks(
+        threads,
+        tasks,
+        || points.block(),
+        |block, (group, copy)| {
+            let mut grids = copy.chunks_mut(grid.cells()).collect::<Vec<_>>();
+            let first = (group * per_group).min(order.len());
+            let last = ((group + 1) * per_group).min(order.len());
+            for chunk in order[first..last].chunks(BLOCK) {
+                points.gather(chunk, block);
+                gather_strengths(points, strengths, chunk, block);
+                for index in 0..chunk.len() {
+                    spread_point::<T, P, D, RUN>(points, block, index, 0, length, &mut grids);
+                }
+            }
+        },
+    );
+    let copies = &copies;
+    for_each_chunk_group(threads, fine, 1, MIN_CELLS_PER_THREAD, |first, cells| {
+        let len = cells.len();
+        cells.copy_from_slice(&copies[first..first + len]);
+        for group in 1..groups {
+            let start = group * copy_cells + first;
+            for (cell, copy) in cells.iter_mut().zip(&copies[start..start + len]) {
+                cell[0] += copy[0];
+                cell[1] += copy[1];
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Copies the strengths of `chunk`'s points for every transform into
+/// `block`.
+fn gather_strengths<T: Real, P: Coordinate, const D: usize>(
+    points: &Points<'_, T, P, D>,
+    strengths: &[Cell<T>],
+    chunk: &[u32],
+    block: &mut Block<T>,
+) {
+    for (&point, targets) in chunk
+        .iter()
+        .zip(block.strengths.chunks_exact_mut(points.batch))
+    {
+        for (transform, target) in targets.iter_mut().enumerate() {
+            *target = strengths[transform * points.count + point as usize];
         }
     }
 }

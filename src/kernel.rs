@@ -364,7 +364,7 @@ fn validate_sigma(sigma: f64) -> Result<()> {
     Ok(())
 }
 
-fn gauss_legendre(order: usize) -> (Vec<f64>, Vec<f64>) {
+pub(crate) fn gauss_legendre(order: usize) -> (Vec<f64>, Vec<f64>) {
     let mut nodes = vec![0.0; order];
     let mut weights = vec![0.0; order];
     let pairs = order.div_ceil(2);

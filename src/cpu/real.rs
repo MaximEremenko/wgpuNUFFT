@@ -23,6 +23,8 @@ pub(crate) trait Real:
 
     fn from_f64(value: f64) -> Self;
 
+    fn to_f64(self) -> f64;
+
     fn is_finite(self) -> bool;
 
     /// Transforms `input` into `output` with `plan`, whose precision
@@ -36,6 +38,10 @@ impl Real for f32 {
 
     fn from_f64(value: f64) -> Self {
         value as f32
+    }
+
+    fn to_f64(self) -> f64 {
+        f64::from(self)
     }
 
     fn is_finite(self) -> bool {
@@ -53,6 +59,10 @@ impl Real for f64 {
 
     fn from_f64(value: f64) -> Self {
         value
+    }
+
+    fn to_f64(self) -> f64 {
+        self
     }
 
     fn is_finite(self) -> bool {

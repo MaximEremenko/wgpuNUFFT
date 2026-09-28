@@ -1,10 +1,11 @@
-//! Host-memory type-1 and type-2 plans; see [`CpuNufftPlan`].
+//! Host-memory plans; see [`CpuNufftPlan`] and [`CpuNufftType3Plan`].
 
 mod grid;
 mod modes;
 mod points;
 mod real;
 mod spread;
+mod type3;
 mod workers;
 
 use std::sync::atomic::Ordering;
@@ -20,8 +21,10 @@ use grid::{FineGrid, Weights};
 use modes::{deconvolve, predeconvolve, AxisModes};
 use points::{Slabs, SortedPoints};
 use real::{Coordinate, Real};
-use spread::{interpolate, spread, Points};
+use spread::{dense_groups, interpolate, spread, spread_dense, Points};
 use workers::{available_threads, for_each_chunk_group};
+
+pub use type3::CpuNufftType3Plan;
 
 /// Largest coordinate magnitude of the type-1 and type-2 contract.
 const MAX_COORDINATE_MAGNITUDE: f64 = 3.0 * std::f64::consts::PI;
@@ -244,8 +247,8 @@ impl CpuNufftPlan {
             }
             (Engine::F64(engine), FftPrecision::Df64) => {
                 let point_count = self.validate_lengths(points.len(), input.len(), output.len())?;
-                let points = join_df64(points)?;
-                let input = join_df64(input)?;
+                let points = join_df64(points, self.threads)?;
+                let input = join_df64(input, self.threads)?;
                 let mut result = filled("CPU Df64 output values", output.len() / 2, 0.0f64)?;
                 self.run(engine, &points, &input, &mut result, point_count)?;
                 split_df64(&result, output, self.threads);
@@ -417,15 +420,12 @@ impl<T: Real, P: Coordinate> Job<'_, T, P> {
             count: self.point_count,
             batch,
         };
-        // The slabs fix every cell's summation order, so they depend on the
-        // grid alone, never on the thread count.
         let last_length = grid.shape[D - 1];
-        let slab_thickness = if D == 1 {
-            SLAB_CELLS_1D
-        } else {
-            (last_length / MIN_SLABS).clamp(1, SLAB_PLANES)
-        };
-        let slabs = Slabs::new(last_length, plan.kernel.width(), slab_thickness)?;
+        let slabs = Slabs::new(
+            last_length,
+            plan.kernel.width(),
+            slab_thickness::<D>(last_length),
+        )?;
         // Sorting also validates the coordinates, before any other work.
         let sorted = match self.point_count {
             0 => None,
@@ -453,14 +453,14 @@ impl<T: Real, P: Coordinate> Job<'_, T, P> {
         match plan.kind {
             NufftKind::Type1 => {
                 match &sorted {
-                    Some(sorted) => spread::<T, P, D, RUN>(
+                    Some(sorted) => spread_points::<T, P, D, RUN>(
                         &points,
                         bytemuck::cast_slice(self.input),
                         &slabs,
                         sorted,
                         bytemuck::cast_slice_mut(&mut fine),
                         threads,
-                    ),
+                    )?,
                     None => fine.fill(T::ZERO),
                 }
                 fft(&fine, &mut transformed, "CPU type-1 fine-grid FFT")?;
@@ -514,6 +514,40 @@ impl<T: Real, P: Coordinate> Job<'_, T, P> {
     }
 }
 
+/// Preferred slab thickness for a last fine-grid axis of `length` cells.
+///
+/// The slabs fix every cell's summation order, so they depend on the grid
+/// alone, never on the thread count.
+fn slab_thickness<const D: usize>(length: usize) -> usize {
+    if D == 1 {
+        SLAB_CELLS_1D
+    } else {
+        (length / MIN_SLABS).clamp(1, SLAB_PLANES)
+    }
+}
+
+/// Spreads through private grid copies when the grid is small for its
+/// points, and slab by slab otherwise.
+fn spread_points<T: Real, P: Coordinate, const D: usize, const RUN: usize>(
+    points: &Points<'_, T, P, D>,
+    strengths: &[[T; 2]],
+    slabs: &Slabs,
+    sorted: &SortedPoints,
+    fine: &mut [[T; 2]],
+    threads: usize,
+) -> Result<()> {
+    let cells = points.grid.cells() * points.batch;
+    match dense_groups(slabs.count(), points.count, cells) {
+        Some(groups) => {
+            spread_dense::<T, P, D, RUN>(points, strengths, sorted, groups, fine, threads)
+        }
+        None => {
+            spread::<T, P, D, RUN>(points, strengths, slabs, sorted, fine, threads);
+            Ok(())
+        }
+    }
+}
+
 /// Copies point-major `values` in sorted order into transform-major
 /// `output` in input order.
 fn unsort<T: Real>(
@@ -542,11 +576,37 @@ fn unsort<T: Real>(
 }
 
 /// `Df64` `hi + lo` word pairs as `f64` values.
-fn join_df64(words: &[f32]) -> Result<Vec<f64>> {
-    let mut values = filled("CPU Df64 input values", words.len() / 2, 0.0f64)?;
-    for (value, &[hi, lo]) in values.iter_mut().zip(words.as_chunks::<2>().0) {
-        *value = f64::from(hi) + f64::from(lo);
-    }
+fn join_df64(words: &[f32], threads: usize) -> Result<Vec<f64>> {
+    let mut values = zeroed::<f64>("CPU Df64 input values", words.len() / 2)?;
+    for_each_chunk_group(
+        threads,
+        &mut values,
+        1,
+        MIN_VALUES_PER_THREAD,
+        |first, values| {
+            let pairs = &words.as_chunks::<2>().0[first..first + values.len()];
+            for (value, &[hi, lo]) in values.iter_mut().zip(pairs) {
+                *value = f64::from(hi) + f64::from(lo);
+            }
+        },
+    );
+    Ok(values)
+}
+
+/// `f32` words as `f64` values.
+fn widen(words: &[f32], threads: usize) -> Result<Vec<f64>> {
+    let mut values = zeroed::<f64>("CPU widened values", words.len())?;
+    for_each_chunk_group(
+        threads,
+        &mut values,
+        1,
+        MIN_VALUES_PER_THREAD,
+        |first, values| {
+            for (value, &word) in values.iter_mut().zip(&words[first..]) {
+                *value = f64::from(word);
+            }
+        },
+    );
     Ok(values)
 }
 
