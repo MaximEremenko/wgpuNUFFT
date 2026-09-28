@@ -17,7 +17,9 @@ keywords = ["nufft", "fft", "wgpu", "webgpu", "gpu"]
 categories = ["mathematics", "algorithms", "wasm"]
 
 [features]
-default = []
+default = ["cpu"]
+# Host-memory plans (`CpuNufftPlan`) on wgpu-fft's CPU FFT.
+cpu = ["wgpu-fft/cpu"]
 gpu-profiling = []
 type1-2d-tile-prototype = []
 type1-3d-tile-prototype = []
@@ -27,9 +29,9 @@ name = "wgpu_nufft"
 path = "src/lib.rs"
 
 [dependencies]
-bytemuck = "1.22"
+bytemuck = { version = "1.22", features = ["extern_crate_alloc"] }
 wgpu = "30.0.1"
-wgpu-fft = { path = "wgpuFFT", version = "0.1.0" }
+wgpu-fft = { path = "wgpuFFT", version = "0.1.0", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 pollster = "0.4"
@@ -58,3 +60,8 @@ harness = false
 name = "nufft_stage_profile"
 harness = false
 required-features = ["gpu-profiling"]
+
+[[bench]]
+name = "nufft_cpu_bench"
+harness = false
+required-features = ["cpu"]

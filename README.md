@@ -29,6 +29,9 @@ from [wgpu-fft](https://github.com/MaximEremenko/wgpuFFT), pinned here as the
   your buffers, so data never has to leave the GPU.
 - **Batches and point reuse**: many vectors over one point set, and a point
   set prepared once for repeated transforms.
+- **CPU backend**: `CpuNufftPlan` runs type 1 and type 2 on the CPU in one to
+  eight dimensions, with the same configuration and layouts and the same
+  bitwise repeatability, for any thread count.
 - **Python and JavaScript**: a PyO3 + NumPy binding and a `wasm-bindgen`
   browser package.
 
@@ -41,7 +44,9 @@ from [wgpu-fft](https://github.com/MaximEremenko/wgpuFFT), pinned here as the
 wgpu-nufft = { git = "https://github.com/MaximEremenko/wgpuNUFFT", tag = "v0.1.0" }
 ```
 
-Cargo checks out the `wgpuFFT` submodule automatically. Use the re-exported
+Cargo checks out the `wgpuFFT` submodule automatically. The default `cpu`
+feature adds the [CPU backend](#cpu-backend); `default-features = false`
+leaves it out. Use the re-exported
 `wgpu_nufft::wgpu` and `wgpu_nufft::wgpu_fft` crates (or `wgpu = "30"`), so
 your types match the ones the plans take. A separate Git dependency on
 `wgpu-fft` would add a second, incompatible copy. Rust 1.92 or newer is
@@ -126,6 +131,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Type-2 plans (`NufftPlan::type2_gpu`) and type-3 plans (`NufftType3Plan`)
 follow the same pattern. Run `cargo doc --open` for the full API.
+
+## CPU backend
+
+`CpuNufftPlan` runs type-1 and type-2 transforms in host memory, for machines
+without a usable GPU or for checking GPU results. It takes the same
+`NufftConfig` and the same layouts as the GPU buffers, in one to eight
+dimensions. `F32` plans compute in `f32`; `F64` and `Df64` plans compute in
+`f64` and take `f64` words or `Df64` word pairs.
+
+```rust
+use wgpu_nufft::{CpuNufftPlan, NufftConfig};
+
+fn main() -> Result<(), wgpu_nufft::NufftError> {
+    // Type 2 on the CPU: 32 x 32 Fourier coefficients at 1,000 points.
+    let plan = CpuNufftPlan::type2(NufftConfig::new([32, 32], 1.0e-6))?;
+    let point_count = 1000;
+    let points: Vec<f32> = (0..2 * point_count)
+        .map(|i| (i as f32 * 0.618).fract() * 6.28 - 3.14)
+        .collect();
+    let coefficients = vec![1.0f32; plan.required_input_len(point_count)?];
+    let mut values = vec![0.0f32; plan.required_output_len(point_count)?];
+    plan.execute(&points, &coefficients, &mut values)?;
+    Ok(())
+}
+```
+
+The CPU plans sort the points into bins and split the fine grid into slabs
+along its last axis. Each slab adds the points that reach it in a fixed
+order, so results are bitwise identical for any thread count
+(`with_threads` sets it; the default is the machine's parallelism). They
+check every coordinate and return an error for one outside
+`[-3*pi, 3*pi]`. The kernel is evaluated from the same piecewise
+polynomials as the GPU `F64` and `Df64` paths, and the fine-grid FFT runs on
+wgpu-fft's CPU backend. A plan keeps its fine-grid buffers between
+executions. Type-3 plans have only the direct CPU reference
+(`NufftType3Plan::execute_cpu`) so far.
 
 ## Data layout
 
@@ -319,6 +360,7 @@ $env:WGPU_FFT_RUN_GPU_TESTS = '1'; cargo test --release
 | `gpu_clustered_points` | Tightly clustered points, the large-bin sort, and the heavy passes. |
 | `gpu_invalid_points` | Coordinates outside the contract, NaN and infinities included. |
 | `gpu_device_mismatch` | Buffers and devices from another `wgpu` device. |
+| `cpu_nufft` | The CPU plans against the reference in 1D to 5D in all three precisions, clustered and boundary points, and bitwise repeatability across thread counts. It runs without a GPU. |
 
 `WGPU_NUFFT_RUN_LARGE_GPU_TESTS=1` adds a 256^3 case, which needs
 `--features gpu-profiling`. Browser tests are described in
@@ -328,12 +370,14 @@ $env:WGPU_FFT_RUN_GPU_TESTS = '1'; cargo test --release
 
 | Feature | Effect |
 |---|---|
+| `cpu` (default) | The CPU backend, `CpuNufftPlan`. |
 | `gpu-profiling` | Timestamp-query stage profiling (`NufftPlan::encode_type1_gpu_profiled` and friends). |
 | `type1-2d-tile-prototype`, `type1-3d-tile-prototype` | Benchmark-only variants of the type-1 gather. |
 
 The benchmarks in `benches/` list their options with `--help`, for example
 `cargo bench --bench nufft_bench -- --help`. With `--reuse-points`,
-`nufft_bench` times the execute-only path of a prepared point set.
+`nufft_bench` times the execute-only path of a prepared point set, and
+`nufft_cpu_bench` times the CPU plans.
 
 ## Conventions
 

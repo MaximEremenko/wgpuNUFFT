@@ -9,11 +9,15 @@
 //! transforms reach [`MAX_NUFFT_DIMENSIONS`]. Plans support
 //! `f32`, native `f64`, and portable double-float precision, and encode
 //! spreading or interpolation around a fine-grid C2C transform using
-//! caller-owned input and output buffers.
+//! caller-owned input and output buffers. With the default `cpu` feature,
+//! [`CpuNufftPlan`] runs type-1 and type-2 transforms in host memory, with
+//! the same configuration and layouts.
 
 #![forbid(unsafe_code)]
 
 mod config;
+#[cfg(feature = "cpu")]
+mod cpu;
 mod direct;
 mod error;
 mod gpu;
@@ -44,6 +48,8 @@ pub use config::{
     ModeOrder, NufftConfig, NufftSign, DEFAULT_EPS, DEFAULT_SIGMA, MAX_GPU_NUFFT_DIMENSIONS,
     MAX_NUFFT_DIMENSIONS,
 };
+#[cfg(feature = "cpu")]
+pub use cpu::CpuNufftPlan;
 pub use direct::{reference_type1_f64, reference_type2_f64};
 pub use error::{NufftError, Result};
 #[cfg(feature = "gpu-profiling")]

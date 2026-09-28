@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the
 project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `CpuNufftPlan`: type-1 and type-2 plans in host memory, behind the default
+  `cpu` feature. They take the same `NufftConfig` and layouts as the GPU
+  plans, support one to eight dimensions and all three precisions, check
+  every coordinate, and give bitwise-identical results for any thread count.
+
 ## [0.1.0] - 2026-09-28
 
 First tagged release of `wgpu-nufft`, its Python binding, and the `wgpu-web`
@@ -68,4 +77,5 @@ These affect code written against earlier development snapshots.
   device once every object of its context is freed, and Rust panics are
   reported through `console.error`.
 
+[Unreleased]: https://github.com/MaximEremenko/wgpuNUFFT/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/MaximEremenko/wgpuNUFFT/releases/tag/v0.1.0
