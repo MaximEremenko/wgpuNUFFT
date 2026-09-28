@@ -184,6 +184,10 @@ pub enum NufftError {
         mode: i64,
         value: f64,
     },
+    /// A CPU plan received a prepared point set that does not fit it.
+    PointSetMismatch {
+        reason: &'static str,
+    },
 }
 
 impl fmt::Display for NufftError {
@@ -422,6 +426,9 @@ impl fmt::Display for NufftError {
                 f,
                 "ES kernel Fourier coefficient for mode {mode} cannot be represented and inverted at the selected precision: {value}"
             ),
+            Self::PointSetMismatch { reason } => {
+                write!(f, "the prepared point set does not fit this plan: {reason}")
+            }
         }
     }
 }

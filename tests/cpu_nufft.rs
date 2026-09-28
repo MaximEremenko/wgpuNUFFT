@@ -6,8 +6,8 @@
 use std::f64::consts::PI;
 
 use wgpu_nufft::{
-    reference_type1_f64, reference_type2_f64, Complex64, CpuNufftPlan, FftPrecision, ModeOrder,
-    NufftConfig, NufftError, NufftKind,
+    reference_type1_f64, reference_type2_f64, Complex64, CpuNufftPlan, CpuNufftPoints,
+    FftPrecision, ModeOrder, NufftConfig, NufftError, NufftKind,
 };
 
 /// Deterministic uniform values in `[0, 1)`.
@@ -107,6 +107,63 @@ fn execute(
                 .collect())
         }
     }
+}
+
+/// Prepares `f64` coordinates with `plan`, converted to its storage
+/// precision.
+fn prepare(plan: &CpuNufftPlan, coordinates: &[f64]) -> Result<CpuNufftPoints, NufftError> {
+    match plan.config().precision() {
+        FftPrecision::F32 => {
+            let points = coordinates.iter().map(|&v| v as f32).collect::<Vec<_>>();
+            plan.prepare_points(&points)
+        }
+        FftPrecision::F64 => plan.prepare_points_f64(coordinates),
+        FftPrecision::Df64 => {
+            let points = coordinates
+                .iter()
+                .flat_map(|&v| split(v))
+                .collect::<Vec<_>>();
+            plan.prepare_points(&points)
+        }
+    }
+}
+
+/// Runs `plan` on prepared `points` with `f64` data converted to its storage
+/// precision.
+fn execute_prepared(
+    plan: &CpuNufftPlan,
+    points: &CpuNufftPoints,
+    input: &[f64],
+) -> Result<Vec<f64>, NufftError> {
+    let output_len = plan.required_output_len(points.len())?;
+    match plan.config().precision() {
+        FftPrecision::F32 => {
+            let input = input.iter().map(|&v| v as f32).collect::<Vec<_>>();
+            let mut output = vec![0.0f32; output_len];
+            plan.execute_prepared(points, &input, &mut output)?;
+            Ok(output.into_iter().map(f64::from).collect())
+        }
+        FftPrecision::F64 => {
+            let mut output = vec![0.0f64; output_len];
+            plan.execute_prepared_f64(points, input, &mut output)?;
+            Ok(output)
+        }
+        FftPrecision::Df64 => {
+            let input = input.iter().flat_map(|&v| split(v)).collect::<Vec<_>>();
+            let mut output = vec![0.0f32; output_len];
+            plan.execute_prepared(points, &input, &mut output)?;
+            Ok(output
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[hi, lo]| f64::from(hi) + f64::from(lo))
+                .collect())
+        }
+    }
+}
+
+fn same_bits(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits())
 }
 
 fn relative_l2(actual: &[Complex64], expected: &[Complex64]) -> f64 {
@@ -437,4 +494,130 @@ fn cpu_plans_reuse_their_buffers_across_point_counts() {
             }
         }
     }
+}
+
+#[test]
+fn cpu_prepared_points_repeat_one_shot_results_bitwise() {
+    // One point set, prepared by a single-threaded type-1 plan, serves the
+    // type-1 and type-2 plans of its configuration at any thread count. The
+    // long 1D grid interpolates prepared points in sorted order, the short
+    // one in input order.
+    for (shape, point_count) in [
+        (&[20_000][..], 12_000),
+        (&[64][..], 5_000),
+        (&[96, 80], 12_000),
+        (&[24, 20, 28], 6_000),
+        (&[8, 6, 10, 6], 2_000),
+    ] {
+        let dimensions = shape.len();
+        let mode_count = shape.iter().product::<usize>();
+        let mut rng = Lcg(41);
+        let mut coordinates = rng.coordinates(point_count / 2 * dimensions);
+        coordinates.extend((0..point_count / 2 * dimensions).map(|_| 0.3 + 0.01 * rng.next()));
+        for precision in [FftPrecision::F32, FftPrecision::F64, FftPrecision::Df64] {
+            let config = NufftConfig::new(shape, 1.0e-7)
+                .with_precision(precision)
+                .with_batch(2);
+            let coordinates = stored(precision, &coordinates);
+            let strengths = stored(precision, &interleave(&rng.values(point_count * 2)));
+            let coefficients = stored(precision, &interleave(&rng.values(mode_count * 2)));
+            let preparer = CpuNufftPlan::type1(config.clone()).unwrap().with_threads(1);
+            let points = prepare(&preparer, &coordinates).unwrap();
+            assert_eq!(points.len(), point_count);
+            assert_eq!(points.dimensions(), dimensions);
+            for threads in [1, 4] {
+                let type1 = CpuNufftPlan::type1(config.clone())
+                    .unwrap()
+                    .with_threads(threads);
+                let type2 = CpuNufftPlan::type2(config.clone())
+                    .unwrap()
+                    .with_threads(threads);
+                let label = format!("{shape:?} {precision:?} with {threads} threads");
+                let modes = execute(&type1, &coordinates, &strengths).unwrap();
+                let values = execute(&type2, &coordinates, &coefficients).unwrap();
+                for _ in 0..2 {
+                    let prepared = execute_prepared(&type1, &points, &strengths).unwrap();
+                    assert!(same_bits(&prepared, &modes), "type 1 {label}");
+                    let prepared = execute_prepared(&type2, &points, &coefficients).unwrap();
+                    assert!(same_bits(&prepared, &values), "type 2 {label}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cpu_prepared_points_fit_only_matching_plans() {
+    let config = NufftConfig::new([16, 12], 1.0e-6);
+    let plan = CpuNufftPlan::type1(config.clone()).unwrap();
+    let points = plan.prepare_points(&[0.5, -1.0, 2.0, 0.25]).unwrap();
+    let strengths = [1.0f32, 0.0, 0.5, -0.5];
+    let mut modes = vec![0.0f32; plan.required_output_len(2).unwrap()];
+    plan.execute_prepared(&points, &strengths, &mut modes)
+        .unwrap();
+
+    let other_grid = CpuNufftPlan::type1(NufftConfig::new([16, 14], 1.0e-6)).unwrap();
+    let other_width = CpuNufftPlan::type1(NufftConfig::new([16, 12], 1.0e-3)).unwrap();
+    for other in [&other_grid, &other_width] {
+        let mut modes = vec![0.0f32; other.required_output_len(2).unwrap()];
+        assert!(matches!(
+            other.execute_prepared(&points, &strengths, &mut modes),
+            Err(NufftError::PointSetMismatch { .. })
+        ));
+    }
+    let df64 = CpuNufftPlan::type1(config.clone().with_precision(FftPrecision::Df64)).unwrap();
+    let mut words = vec![0.0f32; df64.required_output_len(2).unwrap()];
+    assert!(matches!(
+        df64.execute_prepared(&points, &[0.0; 8], &mut words),
+        Err(NufftError::PointSetMismatch { .. })
+    ));
+
+    // Lengths, coordinates, and precisions are checked as in `execute`.
+    assert!(matches!(
+        plan.execute_prepared(&points, &strengths[..2], &mut modes),
+        Err(NufftError::InputLength { .. })
+    ));
+    assert!(matches!(
+        plan.prepare_points(&[0.0, 0.1, f32::NAN, 0.2]),
+        Err(NufftError::NonFiniteCoordinate {
+            point: 1,
+            axis: 0,
+            ..
+        })
+    ));
+    assert!(matches!(
+        plan.prepare_points(&[0.0, 0.1, 0.2]),
+        Err(NufftError::CoordinateLength { .. })
+    ));
+    assert!(matches!(
+        plan.prepare_points_f64(&[0.0, 0.1]),
+        Err(NufftError::PrecisionUnsupported { .. })
+    ));
+    let f64_plan = CpuNufftPlan::type2(config.with_precision(FftPrecision::F64)).unwrap();
+    assert!(matches!(
+        f64_plan.prepare_points(&[0.0, 0.1]),
+        Err(NufftError::PrecisionUnsupported { .. })
+    ));
+    let f64_points = f64_plan.prepare_points_f64(&[0.0, 0.1]).unwrap();
+    assert!(matches!(
+        f64_plan.execute_prepared(&f64_points, &[0.0; 384], &mut [0.0; 2]),
+        Err(NufftError::PrecisionUnsupported { .. })
+    ));
+
+    // An empty set gives zero modes and no values.
+    let empty = plan.prepare_points(&[]).unwrap();
+    assert!(empty.is_empty());
+    let mut zeros = vec![1.0f32; modes.len()];
+    plan.execute_prepared(&empty, &[], &mut zeros).unwrap();
+    assert!(zeros.iter().all(|&value| value == 0.0));
+    let type2 = CpuNufftPlan::type2(NufftConfig::new([16, 12], 1.0e-6)).unwrap();
+    type2
+        .execute_prepared(&empty, &vec![1.0; modes.len()], &mut [])
+        .unwrap();
+}
+
+#[test]
+fn cpu_point_sets_can_be_shared_between_threads() {
+    fn shareable<T: Send + Sync>() {}
+    shareable::<CpuNufftPoints>();
 }

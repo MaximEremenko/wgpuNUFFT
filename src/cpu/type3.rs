@@ -3,13 +3,12 @@
 use std::f64::consts::PI;
 
 use super::grid::FineGrid;
-use super::points::{Slabs, SortBuffers, SortedPoints};
 use super::real::Real;
 use super::spread::Points;
 use super::workers::{for_each_chunk_group, map_ranges, ranges};
 use super::{
-    checked_product, join_df64, slab_thickness, split_df64, spread_points, widen, zeroed,
-    CpuNufftPlan, Engine, TypedEngine,
+    checked_product, grid_slabs, join_df64, split_df64, spread_points, widen, zeroed, Coordinates,
+    CpuNufftPlan, CpuNufftPoints, Engine, TypedEngine, Usage,
 };
 use crate::config::{ModeOrder, NufftConfig};
 use crate::error::{NufftError, Result};
@@ -33,6 +32,11 @@ const CHEBYSHEV_SAMPLES: usize = 64;
 /// repeatable for any thread count, and every source and target coordinate
 /// is checked against the plan's intervals.
 ///
+/// [`Self::prepare_points`] does the point work once: it checks, rescales,
+/// and sorts a source and a target set and computes their phases. Then
+/// [`Self::execute_prepared`] transforms any number of strength vectors
+/// between them, with results bitwise identical to [`Self::execute`].
+///
 /// ```
 /// use wgpu_nufft::{CpuNufftType3Plan, NufftInterval, NufftType3Config};
 ///
@@ -47,6 +51,10 @@ const CHEBYSHEV_SAMPLES: usize = 64;
 /// let targets = [-30.0f32, 0.0, 12.5, 39.0];
 /// let mut values = vec![0.0f32; plan.required_output_len(targets.len())?];
 /// plan.execute(&sources, &strengths, &targets, &mut values)?;
+///
+/// // The same transform, with the point work done once.
+/// let points = plan.prepare_points(&sources, &targets)?;
+/// plan.execute_prepared(&points, &strengths, &mut values)?;
 /// # Ok::<(), wgpu_nufft::NufftError>(())
 /// ```
 #[derive(Debug)]
@@ -58,6 +66,53 @@ pub struct CpuNufftType3Plan {
     /// targets; it shares the kernel and the thread count.
     inner: CpuNufftPlan,
     correction: KernelTransform,
+}
+
+/// Source and target sets of a [`CpuNufftType3Plan`], checked, rescaled,
+/// and sorted once for repeated executions; see
+/// [`CpuNufftType3Plan::prepare_points`].
+///
+/// It serves every type-3 plan with the configuration of the plan that
+/// prepared it, whatever their batch sizes, and executions on several
+/// threads can share it.
+pub struct CpuNufftType3Points {
+    /// The preparing plan's configuration, with a batch of one.
+    config: NufftType3Config,
+    source_count: usize,
+    target_count: usize,
+    /// Rescaled sources, sorted on the outer grid.
+    sources: CpuNufftPoints,
+    /// `exp(isign i D.x)` of every source, as `[cos, sin]`.
+    source_phases: Vec<[f64; 2]>,
+    /// Rescaled targets, prepared for the inner type-2 plan.
+    targets: CpuNufftPoints,
+    /// The post-phase and kernel correction of every target, as
+    /// `[cos, sin, scale]`.
+    target_factors: Vec<[f64; 3]>,
+}
+
+impl CpuNufftType3Points {
+    pub fn source_count(&self) -> usize {
+        self.source_count
+    }
+
+    pub fn target_count(&self) -> usize {
+        self.target_count
+    }
+
+    pub fn dimensions(&self) -> usize {
+        self.config.dimensions()
+    }
+}
+
+impl std::fmt::Debug for CpuNufftType3Points {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CpuNufftType3Points")
+            .field("config", &self.config)
+            .field("source_count", &self.source_count)
+            .field("target_count", &self.target_count)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CpuNufftType3Plan {
@@ -154,46 +209,13 @@ impl CpuNufftType3Plan {
         targets: &[f32],
         output: &mut [f32],
     ) -> Result<()> {
-        let precision = self.config().precision();
-        let threads = self.threads();
-        let (sources, targets) = match precision {
-            FftPrecision::Df64 => {
-                self.validate_word_lengths(sources.len(), targets.len())?;
-                (join_df64(sources, threads)?, join_df64(targets, threads)?)
-            }
-            _ => (widen(sources, threads)?, widen(targets, threads)?),
-        };
-        match (&self.inner.engine, precision) {
-            (Engine::F32(engine), _) => {
-                self.validate(&sources, strengths.len(), &targets, output.len())?;
-                self.run(
-                    engine,
-                    &sources,
-                    bytemuck::cast_slice(strengths),
-                    &targets,
-                    bytemuck::cast_slice_mut(output),
-                )
-            }
-            (Engine::F64(engine), FftPrecision::Df64) => {
-                self.validate(&sources, strengths.len(), &targets, output.len())?;
-                let strengths = join_df64(strengths, threads)?;
-                let mut result = zeroed::<f64>("CPU Df64 type-3 output values", output.len() / 2)?;
-                self.run(
-                    engine,
-                    &sources,
-                    bytemuck::cast_slice(&strengths),
-                    &targets,
-                    bytemuck::cast_slice_mut(&mut result),
-                )?;
-                split_df64(&result, output, self.threads());
-                Ok(())
-            }
-            (Engine::F64(_), requested) => Err(NufftError::PrecisionUnsupported {
-                requested,
-                stage: "CPU type-3 NUFFT execution",
-                reason: "f64-plans-execute-with-execute_f64",
-            }),
-        }
+        let points = self.prepare_words(
+            sources,
+            targets,
+            "CPU type-3 NUFFT execution",
+            "f64-plans-execute-with-execute_f64",
+        )?;
+        self.execute_prepared(&points, strengths, output)
     }
 
     /// Executes an `F64` plan on `f64` words. The source and target counts
@@ -205,27 +227,112 @@ impl CpuNufftType3Plan {
         targets: &[f64],
         output: &mut [f64],
     ) -> Result<()> {
-        match (&self.inner.engine, self.config().precision()) {
-            (Engine::F64(engine), FftPrecision::F64) => {
-                self.validate(sources, strengths.len(), targets, output.len())?;
+        self.require_f64(
+            "CPU type-3 NUFFT execution",
+            "execute_f64-requires-an-f64-plan",
+        )?;
+        let points = self.prepare(sources, targets)?;
+        self.execute_prepared_f64(&points, strengths, output)
+    }
+
+    /// Checks, rescales, and sorts the source and target points of an `F32`
+    /// or `Df64` plan once, for any number of executions with
+    /// [`Self::execute_prepared`]. `sources` and `targets` hold the same
+    /// words as in [`Self::execute`].
+    pub fn prepare_points(&self, sources: &[f32], targets: &[f32]) -> Result<CpuNufftType3Points> {
+        self.prepare_words(
+            sources,
+            targets,
+            "CPU type-3 point preparation",
+            "f64-plans-prepare-points-with-prepare_points_f64",
+        )
+    }
+
+    /// Prepares the `f64` source and target points of an `F64` plan once;
+    /// see [`Self::prepare_points`].
+    pub fn prepare_points_f64(
+        &self,
+        sources: &[f64],
+        targets: &[f64],
+    ) -> Result<CpuNufftType3Points> {
+        self.require_f64(
+            "CPU type-3 point preparation",
+            "prepare_points_f64-requires-an-f64-plan",
+        )?;
+        self.prepare(sources, targets)
+    }
+
+    /// Executes an `F32` or `Df64` plan on points from
+    /// [`Self::prepare_points`]. `strengths` and `output` are as in
+    /// [`Self::execute`].
+    pub fn execute_prepared(
+        &self,
+        points: &CpuNufftType3Points,
+        strengths: &[f32],
+        output: &mut [f32],
+    ) -> Result<()> {
+        self.check_prepared(points)?;
+        let threads = self.threads();
+        match (&self.inner.engine, self.config.precision()) {
+            (Engine::F32(engine), _) => {
+                self.validate_values(points, strengths.len(), output.len())?;
                 self.run(
                     engine,
-                    sources,
+                    points,
                     bytemuck::cast_slice(strengths),
-                    targets,
+                    bytemuck::cast_slice_mut(output),
+                )
+            }
+            (Engine::F64(engine), FftPrecision::Df64) => {
+                self.validate_values(points, strengths.len(), output.len())?;
+                let strengths = join_df64(strengths, threads)?;
+                let mut result = zeroed::<f64>("CPU Df64 type-3 output values", output.len() / 2)?;
+                self.run(
+                    engine,
+                    points,
+                    bytemuck::cast_slice(&strengths),
+                    bytemuck::cast_slice_mut(&mut result),
+                )?;
+                split_df64(&result, output, threads);
+                Ok(())
+            }
+            (Engine::F64(_), requested) => Err(NufftError::PrecisionUnsupported {
+                requested,
+                stage: "CPU type-3 NUFFT execution",
+                reason: "f64-plans-execute-with-execute_prepared_f64",
+            }),
+        }
+    }
+
+    /// Executes an `F64` plan on points from [`Self::prepare_points_f64`].
+    /// `strengths` and `output` are as in [`Self::execute_f64`].
+    pub fn execute_prepared_f64(
+        &self,
+        points: &CpuNufftType3Points,
+        strengths: &[f64],
+        output: &mut [f64],
+    ) -> Result<()> {
+        self.check_prepared(points)?;
+        match (&self.inner.engine, self.config.precision()) {
+            (Engine::F64(engine), FftPrecision::F64) => {
+                self.validate_values(points, strengths.len(), output.len())?;
+                self.run(
+                    engine,
+                    points,
+                    bytemuck::cast_slice(strengths),
                     bytemuck::cast_slice_mut(output),
                 )
             }
             (_, requested) => Err(NufftError::PrecisionUnsupported {
                 requested,
                 stage: "CPU type-3 NUFFT execution",
-                reason: "execute_f64-requires-an-f64-plan",
+                reason: "execute_prepared_f64-requires-an-f64-plan",
             }),
         }
     }
 
     fn scalar_words(&self) -> usize {
-        match self.config().precision() {
+        match self.config.precision() {
             FftPrecision::Df64 => 2,
             FftPrecision::F32 | FftPrecision::F64 => 1,
         }
@@ -234,20 +341,57 @@ impl CpuNufftType3Plan {
     fn coordinate_words(&self, context: &'static str, count: usize) -> Result<usize> {
         checked_product(
             context,
-            &[count, self.config().dimensions(), self.scalar_words()],
+            &[count, self.config.dimensions(), self.scalar_words()],
         )
     }
 
     fn complex_words(&self, context: &'static str, count: usize) -> Result<usize> {
         checked_product(
             context,
-            &[count, self.config().batch(), 2 * self.scalar_words()],
+            &[count, self.config.batch(), 2 * self.scalar_words()],
         )
+    }
+
+    fn require_f64(&self, stage: &'static str, reason: &'static str) -> Result<()> {
+        match self.config.precision() {
+            FftPrecision::F64 => Ok(()),
+            requested => Err(NufftError::PrecisionUnsupported {
+                requested,
+                stage,
+                reason,
+            }),
+        }
+    }
+
+    /// Prepares the `f32` words of an `F32` or `Df64` plan.
+    fn prepare_words(
+        &self,
+        sources: &[f32],
+        targets: &[f32],
+        stage: &'static str,
+        reason: &'static str,
+    ) -> Result<CpuNufftType3Points> {
+        let threads = self.threads();
+        let (sources, targets) = match self.config.precision() {
+            FftPrecision::F32 => (widen(sources, threads)?, widen(targets, threads)?),
+            FftPrecision::Df64 => {
+                self.validate_word_lengths(sources.len(), targets.len())?;
+                (join_df64(sources, threads)?, join_df64(targets, threads)?)
+            }
+            requested => {
+                return Err(NufftError::PrecisionUnsupported {
+                    requested,
+                    stage,
+                    reason,
+                })
+            }
+        };
+        self.prepare(&sources, &targets)
     }
 
     /// Checks that `Df64` coordinate slices hold whole word pairs.
     fn validate_word_lengths(&self, sources: usize, targets: usize) -> Result<()> {
-        let dimensions = self.config().dimensions();
+        let dimensions = self.config.dimensions();
         for (set, words) in [("source", sources), ("target", targets)] {
             if !words.is_multiple_of(2 * dimensions) {
                 return Err(NufftError::Type3CoordinateLength {
@@ -260,28 +404,32 @@ impl CpuNufftType3Plan {
         Ok(())
     }
 
-    /// Checks the coordinates against the plan's intervals and the slice
-    /// lengths, given in storage words.
-    fn validate(
+    /// Checks that `points` came from a plan with this plan's configuration.
+    fn check_prepared(&self, points: &CpuNufftType3Points) -> Result<()> {
+        if points.config != self.config.clone().with_batch(1) {
+            return Err(NufftError::PointSetMismatch {
+                reason: "it was prepared by a type-3 plan with another configuration",
+            });
+        }
+        Ok(())
+    }
+
+    /// Checks the strength and output lengths, given in storage words.
+    fn validate_values(
         &self,
-        sources: &[f64],
+        points: &CpuNufftType3Points,
         strengths: usize,
-        targets: &[f64],
         output: usize,
     ) -> Result<()> {
-        let config = self.config();
-        let threads = self.threads();
-        let source_count = check_points("source", sources, config.source_bounds(), threads)?;
-        let target_count = check_points("target", targets, config.target_bounds(), threads)?;
         for (input, expected, actual) in [
             (
                 "CPU type-3 strengths",
-                self.required_strengths_len(source_count)?,
+                self.required_strengths_len(points.source_count)?,
                 strengths,
             ),
             (
                 "CPU type-3 output values",
-                self.required_output_len(target_count)?,
+                self.required_output_len(points.target_count)?,
                 output,
             ),
         ] {
@@ -293,174 +441,99 @@ impl CpuNufftType3Plan {
                 });
             }
         }
-        for (set, count) in [("source", source_count), ("target", target_count)] {
-            if u32::try_from(count).is_err() {
-                return Err(NufftError::LengthOverflow {
-                    context: if set == "source" {
-                        "CPU type-3 source count"
-                    } else {
-                        "CPU type-3 target count"
-                    },
-                });
-            }
-        }
         Ok(())
     }
 
-    fn run<T: Real>(
-        &self,
-        engine: &TypedEngine<T>,
-        sources: &[f64],
-        strengths: &[[T; 2]],
-        targets: &[f64],
-        output: &mut [[T; 2]],
-    ) -> Result<()> {
-        match self.config().dimensions() {
-            1 => self.run_rank::<T, 1>(engine, sources, strengths, targets, output),
-            2 => self.run_rank::<T, 2>(engine, sources, strengths, targets, output),
-            3 => self.run_rank::<T, 3>(engine, sources, strengths, targets, output),
-            4 => self.run_rank::<T, 4>(engine, sources, strengths, targets, output),
-            5 => self.run_rank::<T, 5>(engine, sources, strengths, targets, output),
-            6 => self.run_rank::<T, 6>(engine, sources, strengths, targets, output),
-            7 => self.run_rank::<T, 7>(engine, sources, strengths, targets, output),
-            8 => self.run_rank::<T, 8>(engine, sources, strengths, targets, output),
+    /// Checks the coordinates against the plan's intervals, then rescales,
+    /// sorts, and phases them.
+    fn prepare(&self, sources: &[f64], targets: &[f64]) -> Result<CpuNufftType3Points> {
+        let config = &self.config;
+        let threads = self.threads();
+        let source_count = check_points("source", sources, config.source_bounds(), threads)?;
+        let target_count = check_points("target", targets, config.target_bounds(), threads)?;
+        for (context, count) in [
+            ("CPU type-3 source count", source_count),
+            ("CPU type-3 target count", target_count),
+        ] {
+            if u32::try_from(count).is_err() {
+                return Err(NufftError::LengthOverflow { context });
+            }
+        }
+        match config.dimensions() {
+            1 => self.prepare_rank::<1>(sources, targets),
+            2 => self.prepare_rank::<2>(sources, targets),
+            3 => self.prepare_rank::<3>(sources, targets),
+            4 => self.prepare_rank::<4>(sources, targets),
+            5 => self.prepare_rank::<5>(sources, targets),
+            6 => self.prepare_rank::<6>(sources, targets),
+            7 => self.prepare_rank::<7>(sources, targets),
+            8 => self.prepare_rank::<8>(sources, targets),
             dimensions => unreachable!("validated dimension count {dimensions}"),
         }
     }
 
-    fn run_rank<T: Real, const D: usize>(
+    fn prepare_rank<const D: usize>(
         &self,
-        engine: &TypedEngine<T>,
         sources: &[f64],
-        strengths: &[[T; 2]],
         targets: &[f64],
-        output: &mut [[T; 2]],
-    ) -> Result<()> {
-        match self.kernel().width() {
-            0..=4 => self.run_with::<T, D, 4>(engine, sources, strengths, targets, output),
-            5..=8 => self.run_with::<T, D, 8>(engine, sources, strengths, targets, output),
-            _ => self.run_with::<T, D, 16>(engine, sources, strengths, targets, output),
-        }
-    }
-
-    fn run_with<T: Real, const D: usize, const RUN: usize>(
-        &self,
-        engine: &TypedEngine<T>,
-        sources: &[f64],
-        strengths: &[[T; 2]],
-        targets: &[f64],
-        output: &mut [[T; 2]],
-    ) -> Result<()> {
-        let config = self.config();
-        let batch = config.batch();
+    ) -> Result<CpuNufftType3Points> {
         let threads = self.threads();
-        let sign = config.sign().multiplier();
+        let sign = self.config.sign().multiplier();
         let axes = &self.axes;
-        let source_count = sources.len() / D;
-        let target_count = targets.len() / D;
-        if target_count == 0 {
-            return Ok(());
-        }
+        let (source_count, target_count) = (sources.len() / D, targets.len() / D);
 
-        // Pre-phase the strengths by exp(isign i D.x) and spread them at the
-        // rescaled sources (x - C) / gamma onto the outer grid.
-        let grid = FineGrid::<D>::new(&self.outer_grid_shape(), self.kernel);
-        let mut outer = zeroed::<[T; 2]>("CPU type-3 outer grid", grid.cells() * batch)?;
-        if source_count > 0 {
-            let mut rescaled = zeroed::<f64>("CPU type-3 rescaled sources", sources.len())?;
-            for_each_chunk_group(
-                threads,
-                &mut rescaled,
-                D,
-                MIN_VALUES_PER_THREAD,
-                |first, chunk| {
-                    let sources = &sources[first * D..first * D + chunk.len()];
-                    for (point, source) in chunk
-                        .as_chunks_mut::<D>()
-                        .0
-                        .iter_mut()
-                        .zip(sources.as_chunks::<D>().0)
-                    {
-                        for ((value, &coordinate), axis) in point.iter_mut().zip(source).zip(axes) {
-                            *value = axis.rescale_source(coordinate);
-                        }
-                    }
-                },
-            );
-            let mut phased = zeroed::<[T; 2]>("CPU type-3 phased strengths", strengths.len())?;
-            for_each_chunk_group(
-                threads,
-                &mut phased,
-                1,
-                MIN_VALUES_PER_THREAD,
-                |first, chunk| {
-                    for (offset, value) in chunk.iter_mut().enumerate() {
-                        let flat = first + offset;
-                        let source =
-                            &sources[(flat % source_count) * D..(flat % source_count + 1) * D];
-                        let angle = source
-                            .iter()
-                            .zip(axes)
-                            .map(|(&x, axis)| axis.target_center() * x)
-                            .sum::<f64>();
-                        *value = rotate(strengths[flat], sign * angle, 1.0);
-                    }
-                },
-            );
-            let slabs = Slabs::new(
-                grid.shape[D - 1],
-                self.kernel().width(),
-                slab_thickness::<D>(grid.shape[D - 1]),
-            )?;
-            let sorted =
-                SortedPoints::new(&grid, &slabs, &rescaled, threads, SortBuffers::default())?;
-            let points = Points {
-                grid: &grid,
-                weights: &engine.weights,
-                coordinates: &rescaled,
-                count: source_count,
-                batch,
-            };
-            spread_points::<T, f64, D, RUN>(
-                &points, &phased, &slabs, &sorted, &mut outer, threads,
-            )?;
-        }
-
-        // Evaluate the outer grid at the rescaled targets h*gamma*(s - D).
-        let mut rescaled = zeroed::<f64>("CPU type-3 rescaled targets", targets.len())?;
+        // Sources rescale to (x - C) / gamma, sorted on the outer grid, and
+        // pre-phase by exp(isign i D.x).
+        let rescaled = rescale::<D>(
+            "CPU type-3 rescaled sources",
+            sources,
+            axes,
+            threads,
+            |axis, coordinate| axis.rescale_source(coordinate),
+        )?;
+        let mut source_phases = zeroed::<[f64; 2]>("CPU type-3 source phases", source_count)?;
         for_each_chunk_group(
             threads,
-            &mut rescaled,
-            D,
+            &mut source_phases,
+            1,
             MIN_VALUES_PER_THREAD,
             |first, chunk| {
-                let targets = &targets[first * D..first * D + chunk.len()];
-                for (point, target) in chunk
-                    .as_chunks_mut::<D>()
-                    .0
-                    .iter_mut()
-                    .zip(targets.as_chunks::<D>().0)
-                {
-                    for ((value, &frequency), axis) in point.iter_mut().zip(target).zip(axes) {
-                        *value = axis.rescale_target(frequency);
-                    }
+                for (offset, phase) in chunk.iter_mut().enumerate() {
+                    let source = &sources[(first + offset) * D..(first + offset + 1) * D];
+                    let angle = source
+                        .iter()
+                        .zip(axes)
+                        .map(|(&x, axis)| axis.target_center() * x)
+                        .sum::<f64>();
+                    let (sin, cos) = (sign * angle).sin_cos();
+                    *phase = [cos, sin];
                 }
             },
         );
-        self.inner.run(
-            engine,
-            &rescaled,
-            bytemuck::cast_slice(&outer),
-            bytemuck::cast_slice_mut(output),
-            target_count,
+        let sorted_sources = CpuNufftPoints::new(
+            self.config.precision(),
+            &self.outer_grid_shape(),
+            self.kernel,
+            Coordinates::F64(rescaled),
+            source_count,
+            threads,
+            Usage::Spread,
         )?;
 
-        // Post-phase by exp(isign i C.(s - D)) and divide by the kernel's
-        // Fourier transform at the rescaled target.
-        let mut factors = zeroed::<[f64; 3]>("CPU type-3 target corrections", target_count)?;
+        // Targets rescale to h gamma (s - D) for the inner type-2 plan, and
+        // post-phase by exp(isign i C.(s - D)) over the kernel's Fourier
+        // transform at the rescaled target.
+        let rescaled = rescale::<D>(
+            "CPU type-3 rescaled targets",
+            targets,
+            axes,
+            threads,
+            |axis, frequency| axis.rescale_target(frequency),
+        )?;
+        let mut target_factors = zeroed::<[f64; 3]>("CPU type-3 target corrections", target_count)?;
         for_each_chunk_group(
             threads,
-            &mut factors,
+            &mut target_factors,
             1,
             MIN_VALUES_PER_THREAD,
             |first, chunk| {
@@ -481,14 +554,155 @@ impl CpuNufftType3Plan {
                 }
             },
         );
+        let inner = &self.inner;
+        let prepared_targets = CpuNufftPoints::new(
+            inner.config.precision(),
+            &inner.fine_grid_shape,
+            inner.kernel,
+            Coordinates::F64(rescaled),
+            target_count,
+            threads,
+            if D == 1 {
+                Usage::InputOrder
+            } else {
+                Usage::Any
+            },
+        )?;
+        Ok(CpuNufftType3Points {
+            config: self.config.clone().with_batch(1),
+            source_count,
+            target_count,
+            sources: sorted_sources,
+            source_phases,
+            targets: prepared_targets,
+            target_factors,
+        })
+    }
+
+    fn run<T: Real>(
+        &self,
+        engine: &TypedEngine<T>,
+        points: &CpuNufftType3Points,
+        strengths: &[[T; 2]],
+        output: &mut [[T; 2]],
+    ) -> Result<()> {
+        match self.config.dimensions() {
+            1 => self.run_rank::<T, 1>(engine, points, strengths, output),
+            2 => self.run_rank::<T, 2>(engine, points, strengths, output),
+            3 => self.run_rank::<T, 3>(engine, points, strengths, output),
+            4 => self.run_rank::<T, 4>(engine, points, strengths, output),
+            5 => self.run_rank::<T, 5>(engine, points, strengths, output),
+            6 => self.run_rank::<T, 6>(engine, points, strengths, output),
+            7 => self.run_rank::<T, 7>(engine, points, strengths, output),
+            8 => self.run_rank::<T, 8>(engine, points, strengths, output),
+            dimensions => unreachable!("validated dimension count {dimensions}"),
+        }
+    }
+
+    fn run_rank<T: Real, const D: usize>(
+        &self,
+        engine: &TypedEngine<T>,
+        points: &CpuNufftType3Points,
+        strengths: &[[T; 2]],
+        output: &mut [[T; 2]],
+    ) -> Result<()> {
+        match self.kernel.width() {
+            0..=4 => self.run_with::<T, D, 4>(engine, points, strengths, output),
+            5..=8 => self.run_with::<T, D, 8>(engine, points, strengths, output),
+            _ => self.run_with::<T, D, 16>(engine, points, strengths, output),
+        }
+    }
+
+    fn run_with<T: Real, const D: usize, const RUN: usize>(
+        &self,
+        engine: &TypedEngine<T>,
+        points: &CpuNufftType3Points,
+        strengths: &[[T; 2]],
+        output: &mut [[T; 2]],
+    ) -> Result<()> {
+        let batch = self.config.batch();
+        let threads = self.threads();
+        let (source_count, target_count) = (points.source_count, points.target_count);
+        if target_count == 0 {
+            return Ok(());
+        }
+
+        // Pre-phase the strengths and spread them at the rescaled sources
+        // onto the outer grid.
+        let grid = FineGrid::<D>::new(&self.outer_grid_shape(), self.kernel);
+        let mut outer = zeroed::<[T; 2]>("CPU type-3 outer grid", grid.cells() * batch)?;
+        if let (Some(sorted), Coordinates::F64(coordinates)) =
+            (&points.sources.sorted, &points.sources.coordinates)
+        {
+            let mut phased = zeroed::<[T; 2]>("CPU type-3 phased strengths", strengths.len())?;
+            for_each_chunk_group(
+                threads,
+                &mut phased,
+                1,
+                MIN_VALUES_PER_THREAD,
+                |first, chunk| {
+                    for (offset, value) in chunk.iter_mut().enumerate() {
+                        let flat = first + offset;
+                        let [cos, sin] = points.source_phases[flat % source_count];
+                        *value = rotate_by(strengths[flat], cos, sin, 1.0);
+                    }
+                },
+            );
+            let slabs = grid_slabs(&grid, self.kernel.width())?;
+            let sources = Points {
+                grid: &grid,
+                weights: &engine.weights,
+                coordinates: coordinates.as_slice(),
+                count: source_count,
+                batch,
+            };
+            spread_points::<T, f64, D, RUN>(
+                &sources, &phased, &slabs, sorted, &mut outer, threads,
+            )?;
+        }
+
+        // Evaluate the outer grid at the rescaled targets, then post-phase
+        // and correct.
+        self.inner.run_prepared(
+            engine,
+            &points.targets,
+            bytemuck::cast_slice(&outer),
+            bytemuck::cast_slice_mut(output),
+        )?;
         for_each_chunk_group(threads, output, 1, MIN_VALUES_PER_THREAD, |first, chunk| {
             for (offset, value) in chunk.iter_mut().enumerate() {
-                let [cos, sin, scale] = factors[(first + offset) % target_count];
+                let [cos, sin, scale] = points.target_factors[(first + offset) % target_count];
                 *value = rotate_by(*value, cos, sin, scale);
             }
         });
         Ok(())
     }
+}
+
+/// `rescale(axis, coordinate)` for every coordinate of point-major `points`.
+fn rescale<const D: usize>(
+    buffer: &'static str,
+    points: &[f64],
+    axes: &[NufftType3AxisMetadata],
+    threads: usize,
+    rescale: impl Fn(NufftType3AxisMetadata, f64) -> f64 + Sync,
+) -> Result<Vec<f64>> {
+    let mut values = zeroed::<f64>(buffer, points.len())?;
+    for_each_chunk_group(
+        threads,
+        &mut values,
+        D,
+        MIN_VALUES_PER_THREAD,
+        |first, chunk| {
+            let points = &points[first * D..first * D + chunk.len()];
+            for (value, (&coordinate, &axis)) in
+                chunk.iter_mut().zip(points.iter().zip(axes.iter().cycle()))
+            {
+                *value = rescale(axis, coordinate);
+            }
+        },
+    );
+    Ok(values)
 }
 
 /// Checks every coordinate of a point set against its intervals, in
@@ -542,12 +756,7 @@ fn check_points(
     Ok(count)
 }
 
-/// `value * exp(i * angle) * scale`, computed in `f64`.
-fn rotate<T: Real>(value: [T; 2], angle: f64, scale: f64) -> [T; 2] {
-    let (sin, cos) = angle.sin_cos();
-    rotate_by(value, cos, sin, scale)
-}
-
+/// `value * (cos + i sin) * scale`, computed in `f64`.
 fn rotate_by<T: Real>(value: [T; 2], cos: f64, sin: f64, scale: f64) -> [T; 2] {
     let (re, im) = (value[0].to_f64(), value[1].to_f64());
     [

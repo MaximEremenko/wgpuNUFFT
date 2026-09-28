@@ -4,8 +4,8 @@
 //! repeatability across thread counts, and the interval contract.
 
 use wgpu_nufft::{
-    reference_type3_f64, Complex64, CpuNufftType3Plan, FftPrecision, NufftError, NufftInterval,
-    NufftType3Config,
+    reference_type3_f64, Complex64, CpuNufftType3Plan, CpuNufftType3Points, FftPrecision,
+    NufftError, NufftInterval, NufftType3Config,
 };
 
 struct Lcg(u64);
@@ -96,6 +96,58 @@ fn execute(
         .iter()
         .map(|&[re, im]| Complex64::new(re, im))
         .collect())
+}
+
+fn pairs(values: &[f64]) -> Vec<f32> {
+    values.iter().flat_map(|&v| split(v)).collect()
+}
+
+fn narrow(values: &[f64]) -> Vec<f32> {
+    values.iter().map(|&v| v as f32).collect()
+}
+
+/// Prepares `f64` sources and targets with `plan`, in its storage precision.
+fn prepare(
+    plan: &CpuNufftType3Plan,
+    sources: &[f64],
+    targets: &[f64],
+) -> Result<CpuNufftType3Points, NufftError> {
+    match plan.config().precision() {
+        FftPrecision::F32 => plan.prepare_points(&narrow(sources), &narrow(targets)),
+        FftPrecision::F64 => plan.prepare_points_f64(sources, targets),
+        FftPrecision::Df64 => plan.prepare_points(&pairs(sources), &pairs(targets)),
+    }
+}
+
+/// Runs `plan` on prepared points, returning its output words as `f64`.
+fn execute_prepared(
+    plan: &CpuNufftType3Plan,
+    points: &CpuNufftType3Points,
+    strengths: &[f64],
+) -> Result<Vec<f64>, NufftError> {
+    let output_len = plan.required_output_len(points.target_count())?;
+    match plan.config().precision() {
+        FftPrecision::F32 => {
+            let mut output = vec![0.0f32; output_len];
+            plan.execute_prepared(points, &narrow(strengths), &mut output)?;
+            Ok(output.into_iter().map(f64::from).collect())
+        }
+        FftPrecision::F64 => {
+            let mut output = vec![0.0f64; output_len];
+            plan.execute_prepared_f64(points, strengths, &mut output)?;
+            Ok(output)
+        }
+        FftPrecision::Df64 => {
+            let mut output = vec![0.0f32; output_len];
+            plan.execute_prepared(points, &pairs(strengths), &mut output)?;
+            Ok(output
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[hi, lo]| f64::from(hi) + f64::from(lo))
+                .collect())
+        }
+    }
 }
 
 fn relative_l2(actual: &[Complex64], expected: &[Complex64]) -> f64 {
@@ -292,8 +344,100 @@ fn cpu_type3_rejects_points_outside_the_intervals() {
 }
 
 #[test]
+fn cpu_type3_prepared_points_repeat_one_shot_results_bitwise() {
+    for dimensions in [1, 2, 3] {
+        let (source_bounds, target_bounds) = bounds(dimensions);
+        let mut rng = Lcg(17);
+        let (source_count, target_count) = (6_000, 4_000);
+        let sources = rng.points(source_count, &source_bounds);
+        let targets = rng.points(target_count, &target_bounds);
+        for precision in [FftPrecision::F32, FftPrecision::F64, FftPrecision::Df64] {
+            let config =
+                NufftType3Config::new(source_bounds.clone(), target_bounds.clone(), 1.0e-7)
+                    .with_isign(-1)
+                    .with_precision(precision);
+            let (sources, targets) = (stored(precision, &sources), stored(precision, &targets));
+            // Prepared by a single-transform plan, used by a batched one.
+            let preparer = CpuNufftType3Plan::new(config.clone())
+                .unwrap()
+                .with_threads(1);
+            let points = prepare(&preparer, &sources, &targets).unwrap();
+            assert_eq!(
+                (
+                    points.source_count(),
+                    points.target_count(),
+                    points.dimensions()
+                ),
+                (source_count, target_count, dimensions)
+            );
+            let plan = CpuNufftType3Plan::new(config.with_batch(2))
+                .unwrap()
+                .with_threads(5);
+            let strengths = stored(
+                precision,
+                &(0..4 * source_count)
+                    .map(|_| rng.next() - 0.5)
+                    .collect::<Vec<_>>(),
+            );
+            let expected = execute(&plan, &sources, &strengths, &targets)
+                .unwrap()
+                .iter()
+                .flat_map(|value| [value.re, value.im])
+                .collect::<Vec<_>>();
+            for _ in 0..2 {
+                let actual = execute_prepared(&plan, &points, &strengths).unwrap();
+                assert!(
+                    actual.len() == expected.len()
+                        && actual
+                            .iter()
+                            .zip(&expected)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{dimensions}D {precision:?}: prepared points changed the result"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cpu_type3_prepared_points_fit_only_matching_plans() {
+    let config = |half: f64| {
+        NufftType3Config::new(
+            vec![NufftInterval::new(-1.0, 1.0)],
+            vec![NufftInterval::new(-half, half)],
+            1.0e-6,
+        )
+    };
+    let plan = CpuNufftType3Plan::new(config(5.0)).unwrap();
+    let points = plan.prepare_points(&[0.5, -0.25], &[1.0]).unwrap();
+    let mut output = vec![0.0f32; plan.required_output_len(1).unwrap()];
+    plan.execute_prepared(&points, &[1.0, 0.0, 0.5, 0.5], &mut output)
+        .unwrap();
+    assert!(matches!(
+        plan.execute_prepared(&points, &[1.0, 0.0], &mut output),
+        Err(NufftError::InputLength { .. })
+    ));
+    for other in [config(6.0), config(5.0).with_isign(-1)] {
+        let other = CpuNufftType3Plan::new(other).unwrap();
+        assert!(matches!(
+            other.execute_prepared(&points, &[1.0, 0.0, 0.5, 0.5], &mut output),
+            Err(NufftError::PointSetMismatch { .. })
+        ));
+    }
+    assert!(matches!(
+        plan.prepare_points(&[1.5], &[0.0]),
+        Err(NufftError::Type3CoordinateOutOfBounds { .. })
+    ));
+    assert!(matches!(
+        plan.prepare_points_f64(&[0.5], &[0.0]),
+        Err(NufftError::PrecisionUnsupported { .. })
+    ));
+}
+
+#[test]
 fn cpu_plans_can_be_shared_between_threads() {
     fn shareable<T: Send + Sync>() {}
     shareable::<wgpu_nufft::CpuNufftPlan>();
     shareable::<CpuNufftType3Plan>();
+    shareable::<CpuNufftType3Points>();
 }

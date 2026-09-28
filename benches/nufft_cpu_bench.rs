@@ -1,7 +1,8 @@
-//! Wall-clock timings of the CPU plans.
+//! Wall-clock timings of the CPU plans: one-shot executions, point
+//! preparation, and executions on prepared points.
 //!
 //! ```text
-//! cargo bench --bench nufft_cpu_bench -- [--threads N] [--runs N] [--f64]
+//! cargo bench --bench nufft_cpu_bench -- [--threads N] [--runs N] [--f64] [--only TEXT]
 //! ```
 
 use std::f64::consts::PI;
@@ -15,6 +16,36 @@ struct Options {
     threads: Option<usize>,
     runs: usize,
     precision: FftPrecision,
+    /// Runs only the cases whose label contains this text.
+    only: Option<String>,
+}
+
+impl Options {
+    fn runs_case(&self, label: &str) -> bool {
+        self.only
+            .as_ref()
+            .is_none_or(|text| label.contains(text.as_str()))
+    }
+}
+
+/// Median times of one case.
+struct Timings {
+    execute: Duration,
+    prepare: Duration,
+    prepared: Duration,
+}
+
+impl Timings {
+    fn report(&self, point_count: usize) -> String {
+        let ms = |time: Duration| time.as_secs_f64() * 1.0e3;
+        format!(
+            "execute={:.1} ms ({:.1} Mpts/s) prepare={:.1} ms prepared={:.1} ms",
+            ms(self.execute),
+            point_count as f64 / self.execute.as_secs_f64() / 1.0e6,
+            ms(self.prepare),
+            ms(self.prepared),
+        )
+    }
 }
 
 fn main() {
@@ -29,6 +60,9 @@ fn main() {
     ];
     for (shape, point_count) in cases {
         for kind in ["type1", "type2"] {
+            if !options.runs_case(&format!("{kind} modes={shape:?}")) {
+                continue;
+            }
             let config = NufftConfig::new(shape, 1.0e-6).with_precision(options.precision);
             let plan = match kind {
                 "type1" => CpuNufftPlan::type1(config),
@@ -39,13 +73,12 @@ fn main() {
                 Some(threads) => plan.with_threads(threads),
                 None => plan,
             };
-            let median = time_plan(&plan, point_count, options.runs);
+            let timings = time_plan(&plan, point_count, options.runs);
             println!(
-                "CPU_NUFFT {kind} modes={shape:?} points={point_count} {:?} threads={} median={:.1} ms ({:.1} Mpts/s)",
+                "CPU_NUFFT {kind} modes={shape:?} points={point_count} {:?} threads={} {}",
                 options.precision,
                 plan.threads(),
-                median.as_secs_f64() * 1.0e3,
-                point_count as f64 / median.as_secs_f64() / 1.0e6,
+                timings.report(point_count),
             );
         }
     }
@@ -56,6 +89,9 @@ fn main() {
         (3, 32.0, 10_000_000),
     ];
     for (dimensions, half_band, point_count) in type3_cases {
+        if !options.runs_case(&format!("type3 dims={dimensions}")) {
+            continue;
+        }
         let config = NufftType3Config::new(
             vec![NufftInterval::new(-PI, PI); dimensions],
             vec![NufftInterval::new(-half_band, half_band); dimensions],
@@ -67,27 +103,47 @@ fn main() {
             Some(threads) => plan.with_threads(threads),
             None => plan,
         };
-        let median = time_type3(&plan, point_count, half_band, options.runs);
+        let timings = time_type3(&plan, point_count, half_band, options.runs);
         println!(
-            "CPU_NUFFT type3 dims={dimensions} band={half_band} sources=targets={point_count} outer={:?} {:?} threads={} median={:.1} ms ({:.1} Mpts/s)",
+            "CPU_NUFFT type3 dims={dimensions} band={half_band} sources=targets={point_count} outer={:?} {:?} threads={} {}",
             plan.outer_grid_shape(),
             options.precision,
             plan.threads(),
-            median.as_secs_f64() * 1.0e3,
-            point_count as f64 / median.as_secs_f64() / 1.0e6,
+            timings.report(point_count),
         );
     }
 }
 
-fn time_type3(plan: &CpuNufftType3Plan, count: usize, half_band: f64, runs: usize) -> Duration {
-    let dimensions = plan.config().dimensions();
-    let mut state = 0x2545_f491_4f6c_dd1du64;
-    let mut next = move || {
+/// Median of `runs` timings of `work`.
+fn median(runs: usize, mut work: impl FnMut()) -> Duration {
+    let mut times = (0..runs)
+        .map(|_| {
+            let start = Instant::now();
+            work();
+            start.elapsed()
+        })
+        .collect::<Vec<_>>();
+    times.sort();
+    times[times.len() / 2]
+}
+
+fn uniform(seed: u64) -> impl FnMut() -> f64 {
+    let mut state = seed;
+    move || {
         state = state
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
         (state >> 11) as f64 / (1u64 << 53) as f64
-    };
+    }
+}
+
+fn narrow(values: &[f64]) -> Vec<f32> {
+    values.iter().map(|&v| v as f32).collect()
+}
+
+fn time_type3(plan: &CpuNufftType3Plan, count: usize, half_band: f64, runs: usize) -> Timings {
+    let dimensions = plan.config().dimensions();
+    let mut next = uniform(0x2545_f491_4f6c_dd1d);
     let sources = (0..count * dimensions)
         .map(|_| (2.0 * next() - 1.0) * PI)
         .collect::<Vec<_>>();
@@ -97,43 +153,52 @@ fn time_type3(plan: &CpuNufftType3Plan, count: usize, half_band: f64, runs: usiz
     let strengths_len = plan.required_strengths_len(count).expect("strength length");
     let strengths = (0..strengths_len).map(|_| next() - 0.5).collect::<Vec<_>>();
     let output_len = plan.required_output_len(count).expect("output length");
-    let mut times = Vec::with_capacity(runs);
     match plan.config().precision() {
         FftPrecision::F64 => {
             let mut output = vec![0.0f64; output_len];
-            for _ in 0..runs {
-                let start = Instant::now();
-                plan.execute_f64(&sources, &strengths, &targets, &mut output)
-                    .expect("execute");
-                times.push(start.elapsed());
+            let points = plan
+                .prepare_points_f64(&sources, &targets)
+                .expect("prepare");
+            Timings {
+                execute: median(runs, || {
+                    plan.execute_f64(&sources, &strengths, &targets, &mut output)
+                        .expect("execute")
+                }),
+                prepare: median(runs, || {
+                    plan.prepare_points_f64(&sources, &targets)
+                        .expect("prepare");
+                }),
+                prepared: median(runs, || {
+                    plan.execute_prepared_f64(&points, &strengths, &mut output)
+                        .expect("execute prepared")
+                }),
             }
         }
         _ => {
-            let narrow = |values: &[f64]| values.iter().map(|&v| v as f32).collect::<Vec<_>>();
             let (sources, strengths, targets) =
                 (narrow(&sources), narrow(&strengths), narrow(&targets));
             let mut output = vec![0.0f32; output_len];
-            for _ in 0..runs {
-                let start = Instant::now();
-                plan.execute(&sources, &strengths, &targets, &mut output)
-                    .expect("execute");
-                times.push(start.elapsed());
+            let points = plan.prepare_points(&sources, &targets).expect("prepare");
+            Timings {
+                execute: median(runs, || {
+                    plan.execute(&sources, &strengths, &targets, &mut output)
+                        .expect("execute")
+                }),
+                prepare: median(runs, || {
+                    plan.prepare_points(&sources, &targets).expect("prepare");
+                }),
+                prepared: median(runs, || {
+                    plan.execute_prepared(&points, &strengths, &mut output)
+                        .expect("execute prepared")
+                }),
             }
         }
     }
-    times.sort();
-    times[times.len() / 2]
 }
 
-fn time_plan(plan: &CpuNufftPlan, point_count: usize, runs: usize) -> Duration {
+fn time_plan(plan: &CpuNufftPlan, point_count: usize, runs: usize) -> Timings {
     let dimensions = plan.config().dimensions();
-    let mut state = 0x9e37_79b9_7f4a_7c15u64;
-    let mut next = move || {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1_442_695_040_888_963_407);
-        (state >> 11) as f64 / (1u64 << 53) as f64
-    };
+    let mut next = uniform(0x9e37_79b9_7f4a_7c15);
     let coordinates = (0..point_count * dimensions)
         .map(|_| (2.0 * next() - 1.0) * PI)
         .collect::<Vec<_>>();
@@ -142,30 +207,42 @@ fn time_plan(plan: &CpuNufftPlan, point_count: usize, runs: usize) -> Duration {
     let output_len = plan
         .required_output_len(point_count)
         .expect("output length");
-    let mut times = Vec::with_capacity(runs);
     match plan.config().precision() {
         FftPrecision::F64 => {
             let mut output = vec![0.0f64; output_len];
-            for _ in 0..runs {
-                let start = Instant::now();
-                plan.execute_f64(&coordinates, &input, &mut output)
-                    .expect("execute");
-                times.push(start.elapsed());
+            let points = plan.prepare_points_f64(&coordinates).expect("prepare");
+            Timings {
+                execute: median(runs, || {
+                    plan.execute_f64(&coordinates, &input, &mut output)
+                        .expect("execute")
+                }),
+                prepare: median(runs, || {
+                    plan.prepare_points_f64(&coordinates).expect("prepare");
+                }),
+                prepared: median(runs, || {
+                    plan.execute_prepared_f64(&points, &input, &mut output)
+                        .expect("execute prepared")
+                }),
             }
         }
         _ => {
-            let points = coordinates.iter().map(|&v| v as f32).collect::<Vec<_>>();
-            let input = input.iter().map(|&v| v as f32).collect::<Vec<_>>();
+            let (points, input) = (narrow(&coordinates), narrow(&input));
             let mut output = vec![0.0f32; output_len];
-            for _ in 0..runs {
-                let start = Instant::now();
-                plan.execute(&points, &input, &mut output).expect("execute");
-                times.push(start.elapsed());
+            let prepared = plan.prepare_points(&points).expect("prepare");
+            Timings {
+                execute: median(runs, || {
+                    plan.execute(&points, &input, &mut output).expect("execute")
+                }),
+                prepare: median(runs, || {
+                    plan.prepare_points(&points).expect("prepare");
+                }),
+                prepared: median(runs, || {
+                    plan.execute_prepared(&prepared, &input, &mut output)
+                        .expect("execute prepared")
+                }),
             }
         }
     }
-    times.sort();
-    times[times.len() / 2]
 }
 
 fn parse_options() -> Options {
@@ -173,6 +250,7 @@ fn parse_options() -> Options {
         threads: None,
         runs: 3,
         precision: FftPrecision::F32,
+        only: None,
     };
     // Cargo passes `--bench` to harness-free benchmarks.
     let mut arguments = std::env::args().skip(1).filter(|arg| arg != "--bench");
@@ -187,9 +265,10 @@ fn parse_options() -> Options {
                     .expect("--runs takes a positive count");
             }
             "--f64" => options.precision = FftPrecision::F64,
+            "--only" => options.only = arguments.next(),
             "--help" | "-h" => {
                 println!(
-                    "usage: cargo bench --bench nufft_cpu_bench -- [--threads N] [--runs N] [--f64]"
+                    "usage: cargo bench --bench nufft_cpu_bench -- [--threads N] [--runs N] [--f64] [--only TEXT]"
                 );
                 std::process::exit(0);
             }

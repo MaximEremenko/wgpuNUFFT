@@ -31,7 +31,8 @@ from [wgpu-fft](https://github.com/MaximEremenko/wgpuFFT), pinned here as the
   set prepared once for repeated transforms.
 - **CPU backend**: `CpuNufftPlan` and `CpuNufftType3Plan` run all three types
   on the CPU in one to eight dimensions, with the same configuration and
-  layouts and the same bitwise repeatability, for any thread count.
+  layouts and the same bitwise repeatability, for any thread count, and
+  prepare point sets once for repeated transforms.
 - **Python and JavaScript**: a PyO3 + NumPy binding and a `wasm-bindgen`
   browser package.
 
@@ -153,6 +154,34 @@ fn main() -> Result<(), wgpu_nufft::NufftError> {
     let coefficients = vec![1.0f32; plan.required_input_len(point_count)?];
     let mut values = vec![0.0f32; plan.required_output_len(point_count)?];
     plan.execute(&points, &coefficients, &mut values)?;
+    Ok(())
+}
+```
+
+`execute` checks and sorts its points on every call. To run many transforms
+on one point set, as iterative solvers do, prepare the points once with
+`prepare_points` and run `execute_prepared`. A prepared set serves the
+type-1 and type-2 plans of one configuration, and gives results bitwise
+identical to `execute`. `CpuNufftType3Plan::prepare_points` does the same
+for a source and a target set, including their phases.
+
+```rust
+use wgpu_nufft::{CpuNufftPlan, NufftConfig};
+
+fn main() -> Result<(), wgpu_nufft::NufftError> {
+    let config = NufftConfig::new([32, 32], 1.0e-6);
+    let forward = CpuNufftPlan::type2(config.clone())?;
+    let adjoint = CpuNufftPlan::type1(config)?;
+    let points: Vec<f32> = (0..2000)
+        .map(|i| (i as f32 * 0.618).fract() * 6.28 - 3.14)
+        .collect();
+    let prepared = forward.prepare_points(&points)?;
+    let mut image = vec![1.0f32; forward.required_input_len(prepared.len())?];
+    let mut values = vec![0.0f32; forward.required_output_len(prepared.len())?];
+    for _ in 0..10 {
+        forward.execute_prepared(&prepared, &image, &mut values)?;
+        adjoint.execute_prepared(&prepared, &values, &mut image)?;
+    }
     Ok(())
 }
 ```
@@ -360,7 +389,7 @@ $env:WGPU_FFT_RUN_GPU_TESTS = '1'; cargo test --release
 | `gpu_clustered_points` | Tightly clustered points, the large-bin sort, and the heavy passes. |
 | `gpu_invalid_points` | Coordinates outside the contract, NaN and infinities included. |
 | `gpu_device_mismatch` | Buffers and devices from another `wgpu` device. |
-| `cpu_nufft`, `cpu_nufft_type3` | The CPU plans against the reference (types 1 and 2 in 1D to 5D, type 3 in 1D to 4D) in all three precisions, clustered and boundary points, and bitwise repeatability across thread counts. They run without a GPU. |
+| `cpu_nufft`, `cpu_nufft_type3` | The CPU plans against the reference (types 1 and 2 in 1D to 5D, type 3 in 1D to 4D) in all three precisions, clustered and boundary points, bitwise repeatability across thread counts, and prepared point sets against one-shot executions. They run without a GPU. |
 
 `WGPU_NUFFT_RUN_LARGE_GPU_TESTS=1` adds a 256^3 case, which needs
 `--features gpu-profiling`. Browser tests are described in
@@ -377,7 +406,7 @@ $env:WGPU_FFT_RUN_GPU_TESTS = '1'; cargo test --release
 The benchmarks in `benches/` list their options with `--help`, for example
 `cargo bench --bench nufft_bench -- --help`. With `--reuse-points`,
 `nufft_bench` times the execute-only path of a prepared point set, and
-`nufft_cpu_bench` times the CPU plans.
+`nufft_cpu_bench` times the CPU plans, with and without prepared points.
 
 ## Conventions
 

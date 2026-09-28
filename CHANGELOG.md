@@ -15,6 +15,15 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bitwise-identical results for any thread count. They transform their fine
   grid in place, on a `wgpu-fft` whose CPU backend runs strided axes in place
   and long lines as a parallel four-step decomposition.
+- Prepared CPU point sets: `prepare_points` checks and sorts a point set
+  once (`CpuNufftPoints`), and `execute_prepared` runs any number of
+  transforms on it with results bitwise identical to `execute`. One set
+  serves the type-1 and type-2 plans of a configuration. Type-3 plans
+  prepare a source and a target set together (`CpuNufftType3Points`),
+  including their rescaling and phases, which makes repeated type-3
+  transforms about twice as fast.
+- `NufftError::PointSetMismatch` for a prepared point set passed to a plan
+  it does not fit.
 
 ## [0.1.0] - 2026-09-28
 

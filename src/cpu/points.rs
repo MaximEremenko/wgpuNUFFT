@@ -86,6 +86,8 @@ impl Slabs {
 pub(crate) struct SortedPoints {
     buffers: SortBuffers,
     count: usize,
+    /// Whether `buffers.ranks` holds this order's ranks.
+    ranked: bool,
     /// Slab `s` holds `order[starts[s]..starts[s + 1]]`.
     starts: Vec<usize>,
     /// The points of slab `s` that reach into the next slab start at
@@ -197,6 +199,7 @@ impl SortedPoints {
         Ok(Self {
             buffers,
             count,
+            ranked: false,
             starts,
             crossing,
         })
@@ -223,8 +226,9 @@ impl SortedPoints {
         &self.buffers.order[self.crossing[slab]..self.starts[slab + 1]]
     }
 
-    /// Position of every point in the sorted order.
-    pub(crate) fn ranks(&mut self, threads: usize) -> Result<&[AtomicU32]> {
+    /// Records the position of every point in the sorted order, for
+    /// [`Self::ranks`].
+    pub(crate) fn rank(&mut self, threads: usize) -> Result<()> {
         let count = self.count;
         ensure(&mut self.buffers.ranks, count, "CPU point ranks")?;
         let (order, ranks) = (&self.buffers.order[..count], &self.buffers.ranks[..count]);
@@ -237,7 +241,19 @@ impl SortedPoints {
                 }
             },
         );
-        Ok(ranks)
+        self.ranked = true;
+        Ok(())
+    }
+
+    /// Position of every point in the sorted order, from [`Self::rank`].
+    pub(crate) fn ranks(&self) -> &[AtomicU32] {
+        assert!(self.ranked, "the sorted points were ranked");
+        &self.buffers.ranks[..self.count]
+    }
+
+    /// Frees the bin keys, which only the sort needs.
+    pub(crate) fn drop_keys(&mut self) {
+        self.buffers.keys = Vec::new();
     }
 }
 

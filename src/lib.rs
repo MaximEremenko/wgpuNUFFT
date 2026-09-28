@@ -11,7 +11,9 @@
 //! spreading or interpolation around a fine-grid C2C transform using
 //! caller-owned input and output buffers. With the default `cpu` feature,
 //! [`CpuNufftPlan`] and [`CpuNufftType3Plan`] run all three transform types
-//! in host memory, with the same configurations and layouts.
+//! in host memory, with the same configurations and layouts, and prepare
+//! point sets ([`CpuNufftPoints`], [`CpuNufftType3Points`]) once for
+//! repeated transforms.
 
 #![forbid(unsafe_code)]
 
@@ -49,7 +51,7 @@ pub use config::{
     MAX_NUFFT_DIMENSIONS,
 };
 #[cfg(feature = "cpu")]
-pub use cpu::{CpuNufftPlan, CpuNufftType3Plan};
+pub use cpu::{CpuNufftPlan, CpuNufftPoints, CpuNufftType3Plan, CpuNufftType3Points};
 pub use direct::{reference_type1_f64, reference_type2_f64};
 pub use error::{NufftError, Result};
 #[cfg(feature = "gpu-profiling")]
