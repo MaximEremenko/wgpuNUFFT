@@ -3,7 +3,7 @@
 use std::f64::consts::PI;
 
 use super::grid::FineGrid;
-use super::points::{Slabs, SortedPoints};
+use super::points::{Slabs, SortBuffers, SortedPoints};
 use super::real::Real;
 use super::spread::Points;
 use super::workers::{for_each_chunk_group, map_ranges, ranges};
@@ -412,7 +412,8 @@ impl CpuNufftType3Plan {
                 self.kernel().width(),
                 slab_thickness::<D>(grid.shape[D - 1]),
             )?;
-            let sorted = SortedPoints::new(&grid, &slabs, &rescaled, threads)?;
+            let sorted =
+                SortedPoints::new(&grid, &slabs, &rescaled, threads, SortBuffers::default())?;
             let points = Points {
                 grid: &grid,
                 weights: &engine.weights,

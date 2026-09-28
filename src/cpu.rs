@@ -19,9 +19,9 @@ use crate::kernel::{select_fine_grid_size, EsKernel};
 use crate::plan::NufftKind;
 use grid::{FineGrid, Weights};
 use modes::{deconvolve, predeconvolve, AxisModes};
-use points::{Slabs, SortedPoints};
+use points::{validate_points, Slabs, SortBuffers, SortedPoints};
 use real::{Coordinate, Real};
-use spread::{dense_groups, interpolate, spread, spread_dense, Points};
+use spread::{dense_groups, interpolate, interpolate_direct, spread, spread_dense, Points};
 use workers::{available_threads, for_each_chunk_group};
 
 pub use type3::CpuNufftType3Plan;
@@ -86,10 +86,31 @@ struct TypedEngine<T> {
     weights: Weights<T>,
     axes: Vec<AxisModes<T>>,
     fft: CpuFftPlan,
-    /// The fine grid and its transform, kept between executions. An
+    /// The large allocations of an execution, kept between executions. An
     /// execution takes them out, so concurrent executions of one plan
     /// allocate their own.
-    scratch: Mutex<Option<(Vec<T>, Vec<T>)>>,
+    scratch: Mutex<Option<Buffers<T>>>,
+}
+
+/// The large allocations of an execution. Large allocations go back to the
+/// operating system when freed, so reusing them saves both the allocation
+/// and the first touch of every page.
+struct Buffers<T> {
+    fine: Vec<T>,
+    transformed: Vec<T>,
+    sort: SortBuffers,
+    values: Vec<[T; 2]>,
+}
+
+impl<T> Default for Buffers<T> {
+    fn default() -> Self {
+        Self {
+            fine: Vec::new(),
+            transformed: Vec::new(),
+            sort: SortBuffers::default(),
+            values: Vec::new(),
+        }
+    }
 }
 
 impl std::fmt::Debug for CpuNufftPlan {
@@ -426,26 +447,42 @@ impl<T: Real, P: Coordinate> Job<'_, T, P> {
             plan.kernel.width(),
             slab_thickness::<D>(last_length),
         )?;
-        // Sorting also validates the coordinates, before any other work.
-        let sorted = match self.point_count {
-            0 => None,
-            _ => Some(SortedPoints::new(&grid, &slabs, self.points, threads)?),
-        };
-
-        let fine_words = checked_product("CPU fine-grid words", &[grid.cells(), batch, 2])?;
-        let taken = self
+        let mut buffers = self
             .engine
             .scratch
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        let (mut fine, mut transformed) = match taken {
-            Some(buffers) => buffers,
-            None => (
-                zeroed("CPU fine grid", fine_words)?,
-                zeroed("CPU transformed fine grid", fine_words)?,
-            ),
+            .take()
+            .unwrap_or_default();
+        // 1D type 2 interpolates in input order; everything else sorts the
+        // points first. Either way the coordinates are checked before any
+        // other work.
+        let direct = D == 1 && plan.kind == NufftKind::Type2;
+        let mut sorted = if self.point_count == 0 {
+            None
+        } else if direct {
+            validate_points::<P, D>(self.points, threads)?;
+            None
+        } else {
+            let buffers = std::mem::take(&mut buffers.sort);
+            Some(SortedPoints::new(
+                &grid,
+                &slabs,
+                self.points,
+                threads,
+                buffers,
+            )?)
         };
+
+        let fine_words = checked_product("CPU fine-grid words", &[grid.cells(), batch, 2])?;
+        ensure(&mut buffers.fine, fine_words, "CPU fine grid")?;
+        ensure(
+            &mut buffers.transformed,
+            fine_words,
+            "CPU transformed fine grid",
+        )?;
+        let fine = &mut buffers.fine[..fine_words];
+        let transformed = &mut buffers.transformed[..fine_words];
         let fft = |input: &[T], output: &mut [T], stage| {
             T::fft(&self.engine.fft, input, output)
                 .map_err(|source| NufftError::FftExecutionFailed { stage, source })
@@ -458,17 +495,17 @@ impl<T: Real, P: Coordinate> Job<'_, T, P> {
                         bytemuck::cast_slice(self.input),
                         &slabs,
                         sorted,
-                        bytemuck::cast_slice_mut(&mut fine),
+                        bytemuck::cast_slice_mut(fine),
                         threads,
                     )?,
                     None => fine.fill(T::ZERO),
                 }
-                fft(&fine, &mut transformed, "CPU type-1 fine-grid FFT")?;
+                fft(fine, transformed, "CPU type-1 fine-grid FFT")?;
                 deconvolve(
                     &self.engine.axes,
                     &grid,
                     config.n_modes(),
-                    &transformed,
+                    transformed,
                     output,
                     threads,
                 );
@@ -479,28 +516,41 @@ impl<T: Real, P: Coordinate> Job<'_, T, P> {
                     &grid,
                     config.n_modes(),
                     self.input,
-                    &mut fine,
+                    fine,
                     threads,
                 );
-                fft(&fine, &mut transformed, "CPU type-2 fine-grid FFT")?;
-                if let Some(sorted) = &sorted {
-                    let mut values = zeroed("CPU type-2 sorted values", output.len() / 2)?;
-                    interpolate::<T, P, D, RUN>(
+                fft(fine, transformed, "CPU type-2 fine-grid FFT")?;
+                if direct && self.point_count > 0 {
+                    interpolate_direct::<T, P, D, RUN>(
                         &points,
-                        bytemuck::cast_slice(&transformed),
-                        sorted,
-                        &mut values,
-                        threads,
-                    );
-                    unsort(
-                        sorted,
-                        &values,
-                        batch,
+                        bytemuck::cast_slice(transformed),
                         bytemuck::cast_slice_mut(output),
                         threads,
                     );
                 }
+                if let Some(sorted) = &mut sorted {
+                    let value_count = output.len() / 2;
+                    ensure(&mut buffers.values, value_count, "CPU type-2 sorted values")?;
+                    let values = &mut buffers.values[..value_count];
+                    interpolate::<T, P, D, RUN>(
+                        &points,
+                        bytemuck::cast_slice(transformed),
+                        sorted,
+                        values,
+                        threads,
+                    );
+                    unsort(
+                        sorted,
+                        values,
+                        batch,
+                        bytemuck::cast_slice_mut(output),
+                        threads,
+                    )?;
+                }
             }
+        }
+        if let Some(sorted) = sorted {
+            buffers.sort = sorted.into_buffers();
         }
         let mut scratch = self
             .engine
@@ -508,7 +558,7 @@ impl<T: Real, P: Coordinate> Job<'_, T, P> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if scratch.is_none() {
-            *scratch = Some((fine, transformed));
+            *scratch = Some(buffers);
         }
         Ok(())
     }
@@ -551,13 +601,13 @@ fn spread_points<T: Real, P: Coordinate, const D: usize, const RUN: usize>(
 /// Copies point-major `values` in sorted order into transform-major
 /// `output` in input order.
 fn unsort<T: Real>(
-    sorted: &SortedPoints,
+    sorted: &mut SortedPoints,
     values: &[[T; 2]],
     batch: usize,
     output: &mut [[T; 2]],
     threads: usize,
-) {
-    let ranks = sorted.ranks(threads);
+) -> Result<()> {
+    let ranks = sorted.ranks(threads)?;
     let count = ranks.len();
     for_each_chunk_group(
         threads,
@@ -573,6 +623,7 @@ fn unsort<T: Real>(
             }
         },
     );
+    Ok(())
 }
 
 /// `Df64` `hi + lo` word pairs as `f64` values.
@@ -639,6 +690,21 @@ fn zeroed<T: bytemuck::Zeroable>(buffer: &'static str, len: usize) -> Result<Vec
         buffer,
         elements: len,
     })
+}
+
+/// Makes `buffer` hold at least `len` elements, replacing it with a zeroed
+/// allocation when it is shorter. Callers use its first `len` elements as
+/// scratch, whatever they hold.
+fn ensure<T: bytemuck::Zeroable>(
+    buffer: &mut Vec<T>,
+    len: usize,
+    name: &'static str,
+) -> Result<()> {
+    if buffer.len() < len {
+        *buffer = Vec::new();
+        *buffer = zeroed(name, len)?;
+    }
+    Ok(())
 }
 
 /// A vector of `len` copies of `value`, or a structured error when the

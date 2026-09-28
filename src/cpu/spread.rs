@@ -6,10 +6,12 @@
 //! registers; a run that would wrap around the end of a row takes a slower
 //! cell-by-cell path.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use super::grid::{FineGrid, Weights, MAX_WIDTH};
 use super::points::{Slabs, SortedPoints};
 use super::real::{Coordinate, Real};
-use super::workers::{for_each_chunk_group, run_tasks};
+use super::workers::{for_each_chunk_group, ranges, run_tasks, split_ranges};
 use super::zeroed;
 use crate::error::Result;
 
@@ -68,12 +70,22 @@ impl<T: Real, P: Coordinate, const D: usize> Points<'_, T, P, D> {
     }
 
     /// Copies the coordinates of `points` into `block`, `D` per point.
-    fn gather(&self, points: &[u32], block: &mut Block<T>) {
-        for (&point, target) in points.iter().zip(block.coordinates.as_chunks_mut::<D>().0) {
-            let source = &self.coordinates[point as usize * D..(point as usize + 1) * D];
+    fn gather(&self, points: &[AtomicU32], block: &mut Block<T>) {
+        for (point, target) in points.iter().zip(block.coordinates.as_chunks_mut::<D>().0) {
+            let point = point.load(Ordering::Relaxed) as usize;
+            let source = &self.coordinates[point * D..(point + 1) * D];
             for (target, &coordinate) in target.iter_mut().zip(source) {
                 *target = coordinate.to_f64();
             }
+        }
+    }
+
+    /// Copies the coordinates of the points `first..first + count` into
+    /// `block`.
+    fn gather_range(&self, first: usize, count: usize, block: &mut Block<T>) {
+        let source = &self.coordinates[first * D..(first + count) * D];
+        for (target, &coordinate) in block.coordinates.iter_mut().zip(source) {
+            *target = coordinate.to_f64();
         }
     }
 
@@ -264,7 +276,7 @@ pub(crate) fn spread_dense<T: Real, P: Coordinate, const D: usize, const RUN: us
     let grid = points.grid;
     let copy_cells = grid.cells() * points.batch;
     let mut copies = zeroed::<Cell<T>>("CPU private fine-grid copies", copy_cells * groups)?;
-    let order = &sorted.order;
+    let order = sorted.all();
     let per_group = order.len().div_ceil(groups);
     let tasks = copies
         .chunks_mut(copy_cells)
@@ -308,15 +320,16 @@ pub(crate) fn spread_dense<T: Real, P: Coordinate, const D: usize, const RUN: us
 fn gather_strengths<T: Real, P: Coordinate, const D: usize>(
     points: &Points<'_, T, P, D>,
     strengths: &[Cell<T>],
-    chunk: &[u32],
+    chunk: &[AtomicU32],
     block: &mut Block<T>,
 ) {
-    for (&point, targets) in chunk
+    for (point, targets) in chunk
         .iter()
         .zip(block.strengths.chunks_exact_mut(points.batch))
     {
+        let point = point.load(Ordering::Relaxed) as usize;
         for (transform, target) in targets.iter_mut().enumerate() {
-            *target = strengths[transform * points.count + point as usize];
+            *target = strengths[transform * points.count + point];
         }
     }
 }
@@ -339,11 +352,58 @@ pub(crate) fn interpolate<T: Real, P: Coordinate, const D: usize, const RUN: usi
         MIN_POINTS_PER_THREAD,
         |first, values| {
             let mut block = points.block();
-            let order = &sorted.order[first..first + values.len() / batch];
+            let order = &sorted.all()[first..first + values.len() / batch];
             for (chunk, outputs) in order.chunks(BLOCK).zip(values.chunks_mut(BLOCK * batch)) {
                 points.gather(chunk, &mut block);
                 for (index, output) in outputs.chunks_exact_mut(batch).enumerate() {
                     interpolate_point::<T, P, D, RUN>(points, fine, &block, index, output);
+                }
+            }
+        },
+    );
+}
+
+/// Interpolates every transform's grid in `fine` at the points in input
+/// order, straight into the transform-major `output`, without sorting.
+///
+/// This suits 1D grids: a point reads a few neighbouring cells, and the
+/// grid stays in cache, so sorting and restoring the order would cost more
+/// than it saves.
+pub(crate) fn interpolate_direct<T: Real, P: Coordinate, const D: usize, const RUN: usize>(
+    points: &Points<'_, T, P, D>,
+    fine: &[Cell<T>],
+    output: &mut [Cell<T>],
+    threads: usize,
+) {
+    let point_ranges = ranges(points.count, threads, MIN_POINTS_PER_THREAD);
+    let mut transforms = output
+        .chunks_mut(points.count)
+        .map(|transform| split_ranges(transform, &point_ranges).into_iter())
+        .collect::<Vec<_>>();
+    let tasks = point_ranges
+        .iter()
+        .map(|range| {
+            let outputs = transforms
+                .iter_mut()
+                .map(|parts| parts.next().expect("every transform has every range"))
+                .collect::<Vec<_>>();
+            (range.clone(), outputs)
+        })
+        .collect::<Vec<_>>();
+    run_tasks(
+        threads,
+        tasks,
+        || (points.block(), vec![[T::ZERO; 2]; points.batch]),
+        |(block, values), (range, mut outputs)| {
+            for first in range.clone().step_by(BLOCK) {
+                let count = BLOCK.min(range.end - first);
+                points.gather_range(first, count, block);
+                for index in 0..count {
+                    interpolate_point::<T, P, D, RUN>(points, fine, block, index, values);
+                    let offset = first + index - range.start;
+                    for (output, &value) in outputs.iter_mut().zip(values.iter()) {
+                        output[offset] = value;
+                    }
                 }
             }
         },

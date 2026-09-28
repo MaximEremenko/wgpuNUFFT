@@ -22,6 +22,44 @@ pub(crate) fn ranges(len: usize, threads: usize, min_len: usize) -> Vec<Range<us
         .collect()
 }
 
+/// Splits `data` into consecutive parts of the lengths of `ranges`, which
+/// cover `0..data.len()` in order.
+pub(crate) fn split_ranges<'a, T>(
+    mut data: &'a mut [T],
+    ranges: &[Range<usize>],
+) -> Vec<&'a mut [T]> {
+    let mut parts = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let (part, rest) = std::mem::take(&mut data).split_at_mut(range.len());
+        parts.push(part);
+        data = rest;
+    }
+    parts
+}
+
+/// Runs `task` on every part, one thread each, and returns the results in
+/// part order.
+pub(crate) fn map_parts<I: Send, R: Send>(parts: Vec<I>, task: impl Fn(I) -> R + Sync) -> Vec<R> {
+    if parts.len() <= 1 {
+        return parts.into_iter().map(task).collect();
+    }
+    let task = &task;
+    std::thread::scope(|scope| {
+        let handles = parts
+            .into_iter()
+            .map(|part| scope.spawn(move || task(part)))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
+}
+
 /// Runs `task` for every range, one thread each, and returns the results in
 /// range order.
 pub(crate) fn map_ranges<R: Send>(

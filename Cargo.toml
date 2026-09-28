@@ -29,7 +29,7 @@ name = "wgpu_nufft"
 path = "src/lib.rs"
 
 [dependencies]
-bytemuck = { version = "1.22", features = ["extern_crate_alloc"] }
+bytemuck = { version = "1.22", features = ["extern_crate_alloc", "zeroable_atomics"] }
 wgpu = "30.0.1"
 wgpu-fft = { path = "wgpuFFT", version = "0.1.0", default-features = false }
 

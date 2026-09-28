@@ -402,3 +402,39 @@ fn cpu_dense_grids_match_the_reference_and_repeat() {
         }
     }
 }
+
+#[test]
+fn cpu_plans_reuse_their_buffers_across_point_counts() {
+    // One plan run on shrinking and growing point sets must match a fresh
+    // plan bit for bit, whatever its kept buffers hold.
+    for shape in [&[300][..], &[40, 36], &[12, 10, 14]] {
+        let dimensions = shape.len();
+        let mode_count = shape.iter().product::<usize>();
+        let config = NufftConfig::new(shape, 1.0e-6).with_batch(2);
+        for kind in [NufftKind::Type1, NufftKind::Type2] {
+            let make = || match kind {
+                NufftKind::Type1 => CpuNufftPlan::type1(config.clone()).unwrap(),
+                _ => CpuNufftPlan::type2(config.clone()).unwrap(),
+            };
+            let reused = make();
+            let mut rng = Lcg(31);
+            for point_count in [5_000, 700, 0, 9_000, 1] {
+                let coordinates = rng.coordinates(point_count * dimensions);
+                let input_count = match kind {
+                    NufftKind::Type1 => point_count,
+                    _ => mode_count,
+                };
+                let input = interleave(&rng.values(input_count * 2));
+                let expected = execute(&make(), &coordinates, &input).unwrap();
+                let actual = execute(&reused, &coordinates, &input).unwrap();
+                assert!(
+                    actual
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{shape:?} {kind:?} with {point_count} points differs after reuse"
+                );
+            }
+        }
+    }
+}

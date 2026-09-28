@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::grid::FineGrid;
 use super::real::Coordinate;
-use super::workers::{map_ranges, ranges};
-use super::{filled, MAX_COORDINATE_MAGNITUDE};
+use super::workers::{map_parts, map_ranges, ranges, split_ranges};
+use super::{ensure, filled, MAX_COORDINATE_MAGNITUDE};
 use crate::error::{NufftError, Result};
 
 /// Bin edge along axis zero, in cells.
@@ -80,8 +80,12 @@ impl Slabs {
 /// first, then those that reach into the next slab; each group runs over
 /// tiles of the other axes with axis zero fastest. Points keep their input
 /// order within a bin.
+///
+/// The indices are atomics only so that threads can scatter them without
+/// `unsafe`; every slot is written once, and relaxed loads are plain loads.
 pub(crate) struct SortedPoints {
-    pub(crate) order: Vec<u32>,
+    buffers: SortBuffers,
+    count: usize,
     /// Slab `s` holds `order[starts[s]..starts[s + 1]]`.
     starts: Vec<usize>,
     /// The points of slab `s` that reach into the next slab start at
@@ -89,16 +93,28 @@ pub(crate) struct SortedPoints {
     crossing: Vec<usize>,
 }
 
+/// The allocations of a sort, kept between executions so that they are
+/// made, and their pages first touched, once.
+#[derive(Default)]
+pub(crate) struct SortBuffers {
+    keys: Vec<u32>,
+    order: Vec<AtomicU32>,
+    ranks: Vec<AtomicU32>,
+}
+
 impl SortedPoints {
     /// Validates the coordinates and sorts the points by the bins of their
-    /// first support cells.
+    /// first support cells, in `buffers`.
     pub(crate) fn new<P: Coordinate, const D: usize>(
         grid: &FineGrid<D>,
         slabs: &Slabs,
         coordinates: &[P],
         threads: usize,
+        mut buffers: SortBuffers,
     ) -> Result<Self> {
         let count = coordinates.len() / D;
+        ensure(&mut buffers.keys, count, "CPU point bin keys")?;
+        ensure(&mut buffers.order, count, "CPU sorted point order")?;
         let mut tiles = [1usize; D];
         for (axis, tile_count) in tiles.iter_mut().enumerate().take(D - 1) {
             *tile_count = grid.shape[axis].div_ceil(bin_edge(axis));
@@ -124,30 +140,33 @@ impl SortedPoints {
         // Each range computes its keys and histogram, and reports its first
         // invalid coordinate.
         let point_ranges = ranges(count, threads, MIN_POINTS_PER_THREAD);
-        let parts = map_ranges(&point_ranges, |_, range| {
-            let mut histogram = vec![0u32; bin_count];
-            let mut keys = Vec::with_capacity(range.len());
-            for point in range {
-                let point_coordinates = &coordinates[point * D..(point + 1) * D];
-                if let Some(error) = invalid_coordinate(point, point_coordinates) {
-                    return Err(error);
+        let key_parts = split_ranges(&mut buffers.keys[..count], &point_ranges);
+        let histograms = map_parts(
+            key_parts
+                .into_iter()
+                .zip(point_ranges.iter().cloned())
+                .collect(),
+            |(keys, range)| {
+                let mut histogram = vec![0u32; bin_count];
+                for (point, slot) in range.zip(keys) {
+                    let point_coordinates = &coordinates[point * D..(point + 1) * D];
+                    if let Some(error) = invalid_coordinate(point, point_coordinates) {
+                        return Err(error);
+                    }
+                    let key = key(point_coordinates);
+                    histogram[key as usize] += 1;
+                    *slot = key;
                 }
-                let key = key(point_coordinates);
-                histogram[key as usize] += 1;
-                keys.push(key);
-            }
-            Ok((keys, histogram))
-        })
+                Ok(histogram)
+            },
+        )
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
 
         // Turn the histograms into each range's first slot in every bin, so
         // that the scatter keeps input order within a bin.
         let mut bin_starts = filled("CPU point bin offsets", bin_count + 1, 0usize)?;
-        let mut cursors = parts
-            .iter()
-            .map(|(_, histogram)| histogram.clone())
-            .collect::<Vec<_>>();
+        let mut cursors = histograms;
         let mut next = 0usize;
         for bin in 0..bin_count {
             bin_starts[bin] = next;
@@ -159,16 +178,15 @@ impl SortedPoints {
         }
         bin_starts[bin_count] = next;
 
-        let order = (0..count).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
+        let (keys, order) = (&buffers.keys[..count], &buffers.order[..count]);
         map_ranges(&point_ranges, |group, range| {
             let mut cursor = cursors[group].clone();
-            for (point, &key) in range.zip(&parts[group].0) {
-                let slot = &mut cursor[key as usize];
+            for point in range {
+                let slot = &mut cursor[keys[point] as usize];
                 order[*slot as usize].store(point as u32, Ordering::Relaxed);
                 *slot += 1;
             }
         });
-        let order = order.into_iter().map(AtomicU32::into_inner).collect();
 
         let starts = (0..=slabs.count())
             .map(|slab| bin_starts[2 * slab * tiles_per_group])
@@ -177,38 +195,75 @@ impl SortedPoints {
             .map(|slab| bin_starts[(2 * slab + 1) * tiles_per_group])
             .collect();
         Ok(Self {
-            order,
+            buffers,
+            count,
             starts,
             crossing,
         })
     }
 
+    /// Returns the allocations for the next sort.
+    pub(crate) fn into_buffers(self) -> SortBuffers {
+        self.buffers
+    }
+
+    /// Every point, in bin order.
+    pub(crate) fn all(&self) -> &[AtomicU32] {
+        &self.buffers.order[..self.count]
+    }
+
     /// Points whose support starts in `slab`, in bin order.
-    pub(crate) fn slab(&self, slab: usize) -> &[u32] {
-        &self.order[self.starts[slab]..self.starts[slab + 1]]
+    pub(crate) fn slab(&self, slab: usize) -> &[AtomicU32] {
+        &self.buffers.order[self.starts[slab]..self.starts[slab + 1]]
     }
 
     /// Points of `slab` whose support reaches into the next slab, in bin
     /// order.
-    pub(crate) fn crossing(&self, slab: usize) -> &[u32] {
-        &self.order[self.crossing[slab]..self.starts[slab + 1]]
+    pub(crate) fn crossing(&self, slab: usize) -> &[AtomicU32] {
+        &self.buffers.order[self.crossing[slab]..self.starts[slab + 1]]
     }
 
     /// Position of every point in the sorted order.
-    pub(crate) fn ranks(&self, threads: usize) -> Vec<AtomicU32> {
-        let ranks = (0..self.order.len())
-            .map(|_| AtomicU32::new(0))
-            .collect::<Vec<_>>();
+    pub(crate) fn ranks(&mut self, threads: usize) -> Result<&[AtomicU32]> {
+        let count = self.count;
+        ensure(&mut self.buffers.ranks, count, "CPU point ranks")?;
+        let (order, ranks) = (&self.buffers.order[..count], &self.buffers.ranks[..count]);
         map_ranges(
-            &ranges(self.order.len(), threads, MIN_POINTS_PER_THREAD),
+            &ranges(count, threads, MIN_POINTS_PER_THREAD),
             |_, range| {
                 for rank in range {
-                    ranks[self.order[rank] as usize].store(rank as u32, Ordering::Relaxed);
+                    let point = order[rank].load(Ordering::Relaxed) as usize;
+                    ranks[point].store(rank as u32, Ordering::Relaxed);
                 }
             },
         );
-        ranks
+        Ok(ranks)
     }
+}
+
+/// Checks every coordinate against the type-1 and type-2 contract, in
+/// parallel, reporting the first failure.
+pub(crate) fn validate_points<P: Coordinate, const D: usize>(
+    coordinates: &[P],
+    threads: usize,
+) -> Result<()> {
+    let count = coordinates.len() / D;
+    map_ranges(
+        &ranges(count, threads, MIN_POINTS_PER_THREAD),
+        |_, range| {
+            for point in range {
+                if let Some(error) =
+                    invalid_coordinate(point, &coordinates[point * D..(point + 1) * D])
+                {
+                    return Err(error);
+                }
+            }
+            Ok(())
+        },
+    )
+    .into_iter()
+    .collect::<Result<Vec<()>>>()?;
+    Ok(())
 }
 
 /// The error for the first coordinate of `point` outside the type-1 and
