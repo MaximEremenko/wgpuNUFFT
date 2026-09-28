@@ -262,8 +262,6 @@ impl WgpuFft {
         initialize(true, false).await
     }
 
-    /// Acquires a featureless browser device at the WebGPU default limits and
-    /// runs the same 96-word df64 invariant suite as [`Self::init`].
     /// Initializes on the browser's software fallback adapter (CPU execution
     /// of the same WGSL pipelines, e.g. SwiftShader). Useful where no hardware
     /// WebGPU adapter is available or for deterministic CPU runs.
@@ -272,6 +270,8 @@ impl WgpuFft {
         initialize(true, true).await
     }
 
+    /// Acquires a featureless browser device at the WebGPU default limits and
+    /// runs the same 96-word df64 invariant suite as [`Self::init`].
     #[wasm_bindgen(js_name = initWithDefaultLimits)]
     pub async fn init_with_default_limits() -> Result<WgpuFft, JsValue> {
         initialize(false, false).await
@@ -393,7 +393,7 @@ impl WgpuFft {
         })
     }
 
-    /// Builds a reusable one-, two-, or three-dimensional type-1 NUFFT plan.
+    /// Builds a reusable type-1 NUFFT plan.
     ///
     /// `nModes` is copied before this Rust future first awaits GPU work. Because
     /// JavaScript starts the future asynchronously, callers must retain the
@@ -440,7 +440,7 @@ impl WgpuFft {
         WgpuNufftPlan::from_plan(Rc::clone(&self.runtime), plan, point_count, batch_capacity)
     }
 
-    /// Builds a reusable one-, two-, or three-dimensional type-2 NUFFT plan.
+    /// Builds a reusable type-2 NUFFT plan.
     #[wasm_bindgen(js_name = createNufftType2Plan)]
     #[allow(clippy::too_many_arguments)]
     pub async fn create_nufft_type2_plan(
@@ -482,7 +482,7 @@ impl WgpuFft {
         WgpuNufftPlan::from_plan(Rc::clone(&self.runtime), plan, point_count, batch_capacity)
     }
 
-    /// Builds a reusable one-, two-, or three-dimensional type-3 NUFFT plan.
+    /// Builds a reusable type-3 NUFFT plan.
     ///
     /// Bounds are flattened `[lower0, upper0, lower1, upper1, ...]` arrays.
     /// They are copied before this Rust future first awaits GPU work, but JS

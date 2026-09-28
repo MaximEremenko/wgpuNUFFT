@@ -11,17 +11,17 @@ browser wrapper, built on `wgpu` 30 and the pinned `wgpu-fft` submodule.
 
 ### Added
 
-- Type-1, type-2, and type-3 NUFFT plans that run on any
-  `wgpu` backend, including browser WebGPU, and record into a caller's command
-  encoder with caller-owned buffers.
+- Type-1, type-2, and type-3 NUFFT plans that run on any `wgpu` backend,
+  including browser WebGPU, and record into a caller's command encoder with
+  caller-owned buffers.
 - GPU plans in one to five dimensions: dedicated 1D, 2D, and 3D paths and a
   rank-generic path for 4D and 5D (`MAX_GPU_NUFFT_DIMENSIONS`). Direct `f64`
   reference transforms cover up to eight dimensions.
 - `f32`, native `f64` (with `SHADER_F64`), and portable double-float (`Df64`)
   precision.
-- Many-vector batching over a shared point set, and
-  `set_points_gpu` / `execute_type{1,2}_gpu[_batch]` to prepare a point set once
-  for repeated transforms.
+- Many-vector batching over a shared point set, and `set_points_gpu` /
+  `execute_type{1,2}_gpu[_batch]` to prepare a point set once for repeated
+  transforms.
 - Bitwise-repeatable results without floating-point atomics: coarse-bin
   spreaders and interpolators for `f32` (1D segments, 2D tiles, 3D blocks, and
   dense type-3 grids), and a per-cell gather elsewhere.

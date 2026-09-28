@@ -1,10 +1,9 @@
 //! Rank-generic (runtime-dimensional) type-2 GPU execution.
 //!
-//! This is adoption phase 1 of the ND NUFFT design (vault note "ND NUFFT Math
-//! Design", section 11): dimension appears only as generated WGSL, so one
-//! implementation serves every rank the config validates. Plan routing keeps
-//! the hand-tuned 1D/2D/3D paths for d <= 3 and selects this module for
-//! d >= 4. All three precisions are supported: F32, native F64 (requires
+//! Dimension appears only as generated WGSL, so one implementation serves
+//! every rank the config validates. Plan routing keeps the hand-tuned
+//! 1D/2D/3D paths for d <= 3 and selects this module for d >= 4 (see
+//! `nd_prototype/` for the design study behind it). All three precisions are supported: F32, native F64 (requires
 //! `wgpu::Features::SHADER_F64`, gated in plan.rs), and portable Df64.
 //!
 //! Conventions match the fixed-rank modules exactly: interleaved point-major

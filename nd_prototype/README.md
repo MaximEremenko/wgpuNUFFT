@@ -1,108 +1,112 @@
-# ND NUFFT research prototype (historical)
+# ND NUFFT research prototype
 
-This directory preserves a standalone research prototype for rank-generic
-N-dimensional NUFFT with
-per-dimension "translation-rank placement" — NOT part of the wgpu-fft /
-wgpu-nufft crates. It is retained as a reproducible reference oracle and
-historical design record. This README is self-contained; no private design
-vault is required.
+A standalone research prototype of rank-generic N-dimensional NUFFTs in which
+every dimension chooses how to pay its translation rank `r(eps)`. It is not
+part of the `wgpu-fft` or `wgpu-nufft` crates. It is kept as a reference
+oracle and as the record of the design behind `wgpu-nufft`'s 4D and 5D GPU
+paths.
 
-Each dimension independently chooses how to pay its translation rank r(eps):
+## Placements
 
-| placement | mechanism | fine grid | per-dim cost |
+| Placement | Mechanism | Fine grid | Cost per dimension |
 |---|---|---|---|
-| `SPREAD_S2` | ES-kernel spreading, sigma=2 | 2N | w(eps) grid touches |
-| `SPREAD_S125` | ES-kernel spreading, sigma=1.25 | 1.25N | wider w, 1.6x less memory |
-| `RT` | sigma=1 Chebyshev-interpolated perturbation factor (Ruiz-Antolin/Townsend-style) | N (none) | K(eps) scaled FFT passes |
+| `SPREAD_S2` | ES-kernel spreading, sigma = 2 | 2N | w(eps) grid touches |
+| `SPREAD_S125` | ES-kernel spreading, sigma = 1.25 | 1.25N | wider w, 1.6x less memory |
+| `RT` | sigma = 1 Chebyshev-interpolated perturbation factor (Ruiz-Antolin/Townsend style) | N | K(eps) scaled FFT passes |
 
-RT multiplicity is multiplicative across RT dims (K per dim), so the intended
-use is RT on 1-2 memory-critical dims and spreading elsewhere.
+RT multiplicity multiplies across RT dimensions (K per dimension), so RT is
+meant for one or two memory-critical dimensions, with spreading elsewhere.
 
 ## Files
 
-- `nd_nufft.py` — the reference implementation (types 1 and 2, any d, both
-  isigns, f64). Kernel parameters follow the standard ES rules exactly; RT factors
-  are built by barycentric Chebyshev interpolation in the sub-cell offset with
-  adaptive K selection.
-- `validate.py` — accuracy matrix vs a direct NDFT oracle + adjoint identity,
-  d = 1..5, all placements and mixes, both isigns, clustered points.
+- `nd_nufft.py`: the reference implementation (types 1 and 2, any d, both
+  signs, f64). Kernel parameters follow the standard ES rules; RT factors come
+  from barycentric Chebyshev interpolation in the sub-cell offset, with
+  adaptive K.
+- `validate.py`: an accuracy matrix against a direct NDFT plus the adjoint
+  identity, for d = 1 to 5, all placements and mixes, both signs, and
+  clustered points.
+- `cost.py`: analytic work counters checked against instrumented execution,
+  and the placement policy.
+- `gpu_experiment/`: a standalone Rust crate, outside the workspace, that
+  generates rank-generic WGSL spreading and interpolation kernels;
+  `check.py` and `check2.py` validate the results it exports.
 
-## Stage-1 verdict (2026-07-17)
+## Accuracy
 
-`python validate.py` — 22/22 PASS. Relative l2 errors track eps for every
-placement mix (e.g. 4D s1.25^3+RT at eps=1e-6: t1 4.3e-6, t2 4.2e-6); adjoint
-residuals are at machine precision (<= 7e-12), confirming the type-1/type-2
-composition is exactly consistent. The result shows that spread and RT
-placements compose without measurable error inflation in this validation
-matrix.
+`python validate.py` passes all 22 cases. Relative L2 errors track eps for
+every placement mix; for example, 4D with three sigma = 1.25 dimensions and
+one RT dimension at eps = 1e-6 gives 4.3e-6 for type 1 and 4.2e-6 for type 2.
+Adjoint residuals are at machine precision (at most 7e-12), so the type-1 and
+type-2 compositions are consistent, and spreading and RT placements compose
+without measurable error inflation in this matrix.
 
-## Stage-2 verdict (2026-07-17)
+## Cost model
 
-`python cost.py` — analytic update counters match instrumented execution
-exactly on every placement mix. Two corrections fed back into the design note:
-(1) RT multiplicity K multiplies spreading work (per-point updates =
-prod(w_spread) * prod(K_rt)), so per-point work is placement-invariant — the
-"rank budget" is paid identically everywhere; placement chooses only where
-memory and FFT passes go. (2) Interpolation-based K is ~10 at eps=1e-6 vs the
-SVD floor of 7 (stage-3 optimization: SVD-derived factors).
-Placement policy (`choose_placements`): sigma=2 for d<=3, sigma=1.25 for d>=4,
-RT only under hard memory walls — it is exactly what fits 64^4 into a 256 MiB
-browser budget (250 MiB); >=96^4 in browsers needs streaming/segmented
-execution (wgpu-fft's large-route machinery, if adopted).
+With `python cost.py`, the analytic update counters match instrumented
+execution exactly for every placement mix. Two consequences:
 
-## Stage-3 milestone 1 (2026-07-17): rank-generic GPU spreading works
+1. RT multiplicity K multiplies the spreading work
+   (updates per point = prod(w_spread) * prod(K_rt)), so the work per point
+   does not depend on the placement. Placement only decides where memory and
+   FFT passes go.
+2. Interpolation-based K is about 10 at eps = 1e-6, against an SVD floor of 7,
+   which leaves room for SVD-derived factors.
 
-`gpu_experiment/` — standalone scratch crate (workspace-detached), generates the
-S1 gather-form spreading kernel in WGSL for ANY dimension (d appears only as
-unrolled generated code): one workgroup per output tile, one register
-accumulator per owned cell, shared-memory point batches, per-dim ES weights
-with periodic wrap, atomic-free. Host-side binning duplicates points into
-touching tiles (scratch shortcut; production reads neighbor bins instead —
-duplication 21x (d=3) to 200x (small d=4 grids)).
+The placement policy (`choose_placements`) takes sigma = 2 for d <= 3 and
+sigma = 1.25 for d >= 4, and RT only under hard memory limits. RT is what
+fits 64^4 into a 256 MiB browser budget (250 MiB); 96^4 and larger grids in a
+browser need segmented execution such as `wgpu-fft`'s large routes.
+
+## GPU spreading in any dimension
+
+`gpu_experiment/` generates the gather-form spreading kernel in WGSL for any
+dimension; d appears only in unrolled generated code. Each workgroup owns an
+output tile with one register accumulator per cell, points arrive in
+shared-memory batches, ES weights are per dimension with periodic wrap, and
+there are no atomics. Host-side binning duplicates points into every tile
+they touch, a shortcut that costs 21x duplication in 3D and up to 200x on
+small 4D grids; production code reads neighbouring bins instead.
 
 Vulkan results (`cargo run --release`, then `python check.py`):
 
-| case | grid | median | throughput |
+| Case | Grid | Median | Throughput |
 |---|---|---|---|
 | d=3 256^3 s1.25, M=1e6, w=10 | 0.2 GiB | 8.99 ms | 1.11e11 upd/s |
 | d=4 48^4 s1.25, M=5e5, w=10 | 0.1 GiB | 68.6 ms | 7.29e10 upd/s |
 | d=4 64^4 s1.25, M=5e5, w=10 | 0.3 GiB | 73.2 ms | 6.83e10 upd/s |
 | d=5 24^5 s1.25 eps=1e-3, M=2e5, w=5 | 0.2 GiB | 35.0 ms | 1.79e10 upd/s |
 
-Correctness (d=4 exported case): rel-l2 = 1.11e-6 vs f64 numpy reference —
-pure f32 accumulation error. Throughput at d=4 matches the class of the
-hand-tuned production 2D bin-tile kernel (~6.7e10 upd/s), i.e. rank-generic
-codegen costs essentially nothing in these measurements. The experiment
-demonstrated GPU execution through d=5 on the tested configuration; it does not
-make a claim about all other GPU NUFFT implementations.
+The exported 4D case has a relative L2 error of 1.11e-6 against an f64 NumPy
+reference, the level of f32 accumulation error. Its throughput is in the
+class of the tuned 2D kernel of the time (about 6.7e10 updates/s), so
+rank-generic code generation cost essentially nothing in these measurements.
 
-## Stage-3 milestone 3b (2026-07-17): end-to-end d=4 on GPU
+## End-to-end 4D on the GPU
 
-Full chains on the GPU, with **wgpu-fft as the ND FFT backend via its
-public API** (a rank-4 plan over the 80^4 fine grid worked in the adoption
-experiment): type-1 = GPU spread -> wgpu-fft forward FFT;
-type-2 = host deconvolved pad -> wgpu-fft FFT -> new rank-generic GPU
-interpolation kernel. 64^4 sigma=1.25 timings: type-1 79.5 ms, type-2 86.7 ms
-(spreading/interp dominate, as the cost model predicts). wgpu-fft's forward
-direction matches isign=-1.
+Full chains ran on the GPU with `wgpu-fft` as the ND FFT through its public
+API (a rank-4 plan over the 80^4 fine grid): type 1 as GPU spreading followed
+by the forward FFT, and type 2 as host deconvolution and padding, the FFT, and
+a rank-generic GPU interpolation kernel. At 64^4 with sigma = 1.25, type 1
+took 79.5 ms and type 2 86.7 ms; spreading and interpolation dominate, as the
+cost model predicts. `wgpu-fft`'s forward direction corresponds to
+isign = -1.
 
-Correctness (12^4 exported case, `python check2.py`): interior modes
-(|k| <= N/4) at **3.56e-7** — clean f32; full-box rel-l2 3.76e-4/2.07e-4
-(type-1/type-2). The gap is a REAL, measured design finding: **sigma=1.25
-deconvolution conditioning** — 1/phi_hat amplifies f32 FFT rounding noise
-~50x per dim at the mode-box edge (compounding toward corners). Invisible in
-f64; material in f32. Candidate mitigations are an f64/df64 fine grid
-for tight eps at sigma=1.25 (wgpu-fft has both), mode-box margin trimming, or
-sigma=2 when memory allows. NOT prototyped here: production neighbor-bin reads
-(adoption reuses wgpu-nufft's cell binning) — host duplication stays a scratch
-shortcut.
+On the exported 12^4 case (`python check2.py`), interior modes (|k| <= N/4)
+reach 3.56e-7, clean f32, while the full mode box reaches 3.76e-4 (type 1)
+and 2.07e-4 (type 2). The gap comes from deconvolution conditioning at
+sigma = 1.25: 1/phi_hat amplifies f32 FFT rounding by about 50x per dimension
+at the edge of the mode box, compounding toward the corners. It is invisible
+in f64 but material in f32. Possible remedies are an f64 or df64 fine grid for
+tight eps at sigma = 1.25, trimming the mode-box margin, or sigma = 2 where
+memory allows.
 
-## Stage-4 decision (2026-07-17)
+## Outcome
 
-**ADOPT — hybrid strategy.** The decision was to use rank-generic codegen for
-d>=4 and as the universal fallback, while retaining tuned 1D/2D/3D kernels as
-plan-selected fast paths. Production work belongs in `wgpu-nufft`, reusing its
-cell binning and scan rather than this prototype's host-duplication shortcut.
-This directory remains the historical reference oracle for the placement math;
-its milestone descriptions report the state measured on 2026-07-17 rather than
-the current production implementation status.
+The prototype led to the hybrid design in `wgpu-nufft`: generated
+rank-generic kernels for 4D and 5D (`MAX_GPU_NUFFT_DIMENSIONS`), with the
+tuned 1D, 2D, and 3D paths kept for lower ranks. The production path reuses
+the crate's cell binning, scan, and sort instead of host duplication,
+supports `f32`, native `f64`, and `Df64`, and uses sigma = 2 unless
+`NufftConfig::with_sigma` selects another oversampling factor. The
+measurements above describe the prototype, not the production code.

@@ -1,9 +1,21 @@
 # Browser test harness
 
-The browser tests use `wasm-bindgen-test-runner`, ChromeDriver, and Chrome's
-WebGPU implementation. Install the matching `wasm-bindgen-cli` version and the
-`wasm32-unknown-unknown` target, then point `CHROMEDRIVER` at a ChromeDriver
-matching the installed Chrome build:
+Browser checks of `wgpu-fft`, `wgpu-nufft`, and the `wgpu-web` package in
+Chrome's WebGPU implementation. Run them from the `wgpuNUFFT` repository
+root:
+
+| Runner | Checks |
+|---|---|
+| `web\run_browser_tests.cmd` | FFT smoke, correctness-matrix, df64-canary, and large-route tests, the NUFFT browser matrix, and a `wgpu-web` NUFFT smoke test. |
+| `web\run_phase_c_browser.cmd` | Pipeline-cache persistence across documents, and a timing comparison with the JavaScript WebGPU-FFT library. |
+| `web\run_phase_d_browser.cmd` | The JavaScript type-1, type-2, and type-3 NUFFT surface against an independent `f64` NDFT, at the WebGPU default limits. |
+
+## Browser tests
+
+The tests use `wasm-bindgen-test-runner` and ChromeDriver. Install the
+`wasm32-unknown-unknown` target and the `wasm-bindgen-cli` version in
+`Cargo.lock`, and point `CHROMEDRIVER` at a ChromeDriver matching the
+installed Chrome (or put `chromedriver.exe` on `PATH`):
 
 ```powershell
 rustup target add wasm32-unknown-unknown
@@ -12,89 +24,63 @@ $env:CHROMEDRIVER = 'C:\path\to\chromedriver.exe'
 web\run_browser_tests.cmd
 ```
 
-The runner automatically loads the checked-in root `webdriver.json`, which pins
-the WebGPU-related Chrome flags. The wrapper forces ChromeDriver rather than
-allowing `wasm-bindgen-test-runner` to select another WebDriver found on `PATH`
-first.
+The runner loads the checked-in root `webdriver.json`, which sets the
+WebGPU-related Chrome flags, and forces ChromeDriver so that
+`wasm-bindgen-test-runner` does not pick another WebDriver from `PATH`. The
+FFT tests run through the `wgpuFFT/` submodule's manifest, and the NUFFT and
+`wgpu-web` tests through the outer workspace. The large FFT cases allocate
+about 1 GiB of transient GPU memory, so only this runner enables them
+(`WGPU_FFT_RUN_BROWSER_LARGE_TESTS=1`); ordinary `cargo test` runs skip them.
 
-The wrapper runs the FFT smoke test, browser-default FFT correctness matrix,
-exact df64 canaries, natural four-step and segmented-volume cases, the complete
-browser NUFFT matrix, and a website-wrapper NUFFT smoke test. The large FFT
-cases allocate roughly 1 GiB of transient GPU resources and are therefore
-enabled by the wrapper's `WGPU_FFT_RUN_BROWSER_LARGE_TESTS=1` setting instead
-of ordinary workspace test commands.
+## Pipeline cache and JavaScript comparison
 
-The FFT tests run through the pinned `wgpuFFT/` submodule manifest; the NUFFT
-and wrapper tests run through the outer workspace. Archive-producing Phase C
-and Phase D runners record the outer `wgpuNUFFT` revision and the pinned
-`wgpuFFT` revision separately.
-
-## Pipeline-cache demo and Rust/Wasm vs JavaScript comparison
-
-Phase C requires the JavaScript `WebGPU-FFT` repository as the exact sibling
-checkout `../WebGPU-FFT`. From the `wgpuNUFFT` repository root, prepare the
-pinned comparison source before running the page:
+The comparison needs the JavaScript
+[WebGPU-FFT](https://github.com/MaximEremenko/WebGPU-FFT) repository checked
+out next to this one, as `../WebGPU-FFT`, at the pinned revision:
 
 ```powershell
 git clone https://github.com/MaximEremenko/WebGPU-FFT.git ..\WebGPU-FFT
 git -C ..\WebGPU-FFT checkout fa45c93f524a69a96c9f55acfad865226bfccd29
-```
-
-If the sibling checkout already exists, fetch that revision if necessary and
-check it out before recording a Phase C result. The page imports
-`../WebGPU-FFT/src/index.js` relative to the repository root; a differently
-named or differently located checkout will not satisfy the harness.
-
-After preparing the sibling checkout and building the `wgpu-web` package, run
-the Phase C page through the same Chrome/WebGPU setup:
-
-```powershell
 web\run_phase_c_browser.cmd --mode all
 ```
 
-For an archive-ready machine record, add for example
-`--output benchmark-results/2026-07-15-browser/phase-c-result.json`.
+`--mode` is `snapshot`, `bench`, or `all`. `--output <file>` writes the
+complete result as JSON, for example `--output target\browser\comparison.json`.
 
-The runner builds `wgpu-web` for `wasm32-unknown-unknown`, runs `wasm-bindgen`,
-serves this repository and the sibling `WebGPU-FFT` checkout from one origin,
-and records the required JavaScript reference revision as
-`fa45c93f524a69a96c9f55acfad865226bfccd29`. It attempts headless Chrome first
-with a 30-second callback deadline, then cleans up that process tree and falls
-back to the headed app-window pattern proven by the JavaScript library's
-harness. `--headed-only` skips the probe on machines where headless WebGPU is
-known to be unavailable.
+The runner builds `wgpu-web`, runs `wasm-bindgen`, and serves this repository
+and the sibling checkout from one origin. It refuses a sibling checkout at
+another revision or with uncommitted changes, and records the `wgpuNUFFT`,
+`wgpuFFT`, and WebGPU-FFT revisions. It first tries headless Chrome for up to
+30 seconds, then falls back to a headed app window; `--headed-only` skips the
+headless attempt on machines where headless WebGPU is unavailable.
 
-The short comparison is one out-of-place f32 C2C forward transform at N=4096,
-batch=1024. Plans, buffer allocation, upload, and download are outside the timed
-region. Each timed iteration includes command encoding, one queue submission,
-and `onSubmittedWorkDone`; both implementations reuse their buffers. Five
-warmups precede three alternating 20-iteration blocks, reported as average
-milliseconds per transform plus standard error across block means. This is an
-end-to-end library comparison under the same Chrome/Tint compiler and GPU, not a
-claim that the generated shaders are identical. Both sides first request the
-adapter's supported limits without optional features and fall back to browser
-defaults only if Chrome rejects that request; the runner records the active
-limits and the Rust route.
-
-The cache demo creates a plan, exports the versioned JSON snapshot to
-`localStorage` under `wgpu-fft.pipeline-cache.v1`, reads it from a fresh
-same-origin document, imports it into a fresh WebGPU context, recreates the
-plan, executes it, and validates an impulse transform.
+- **Pipeline cache.** The page creates a plan, exports its versioned JSON
+  snapshot to `localStorage` under `wgpu-fft.pipeline-cache.v1`, reads it back
+  in a fresh same-origin document, imports it into a fresh WebGPU context,
+  recreates the plan, and validates an impulse transform.
+- **Comparison.** One out-of-place `f32` C2C forward transform of N = 4096
+  with batch 1024. Plan creation, allocation, upload, and download are
+  outside the timed region; each timed iteration covers command encoding, one
+  queue submission, and `onSubmittedWorkDone`, and both libraries reuse their
+  buffers. Five warm-ups precede three alternating 20-iteration blocks,
+  reported as the mean milliseconds per transform with the standard error
+  across blocks. Both libraries run under the same browser, shader compiler,
+  and GPU, and first request the adapter's limits without optional features,
+  falling back to the browser defaults only if Chrome rejects them. The result
+  records the active limits and the Rust route. This compares the libraries
+  end to end, not their generated shaders.
 
 ## Browser NUFFT matrix
 
-The Phase D runner tests the JavaScript-facing type-1, type-2, and type-3
-surface in one through three dimensions, with batched F32 and Df64 data, at
-exact WebGPU default limits:
-
 ```powershell
-web\run_phase_d_browser.cmd --headed-only `
-  --output benchmark-results/2026-07-15-browser/phase-d-result.json
+web\run_phase_d_browser.cmd --headed-only --output target\browser\nufft-matrix.json
 ```
 
-It rebuilds `wgpu-web`, generates the browser module with `wasm-bindgen`, and
-launches Chrome directly. The page compares every result with an independent
-JavaScript f64 NDFT, verifies all 96 df64 canary words, checks the inclusive
-df64 type-3 phase bound at 1024 and structured rejection at 1025, and confirms
-that browser native F64 remains unavailable. Omit `--headed-only` to try a
-bounded 30-second headless probe before the headed fallback.
+The runner rebuilds `wgpu-web`, generates the browser module with
+`wasm-bindgen`, and launches Chrome. The page runs batched type-1, type-2, and
+type-3 plans in one to three dimensions, in `F32` and `Df64`, at the exact
+WebGPU default limits, and compares every result with an independent
+JavaScript `f64` NDFT. It also verifies all 96 df64 canary words, checks that
+the `Df64` type-3 phase bound accepts 1024 and rejects 1025, and confirms
+that native `F64` is unavailable in the browser. Without `--headed-only`, it
+first tries headless Chrome for up to 30 seconds.

@@ -1,63 +1,69 @@
 # wgpuNUFFT
 
-`wgpu-nufft` is a portable nonuniform FFT library built only on `wgpu-fft`'s
-public API. The repository is named `wgpuNUFFT`, the Cargo package is
-`wgpu-nufft`, and Rust code imports it as `wgpu_nufft`.
+[![CI](https://github.com/MaximEremenko/wgpuNUFFT/actions/workflows/ci.yml/badge.svg)](https://github.com/MaximEremenko/wgpuNUFFT/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust 1.92+](https://img.shields.io/badge/rust-1.92%2B-orange.svg)](Cargo.toml)
 
-This is the upper-level repository. Its `wgpuFFT/` directory is a pinned Git
-submodule rather than an internal copy of the FFT implementation. Planning is
-separate from execution and plans are reusable. The Cargo packages are kept
-local (`publish = false`) and are consumed from a Git checkout rather than
-crates.io.
+Nonuniform fast Fourier transforms (NUFFTs) on the GPU through `wgpu`
+(Vulkan, DX12, Metal) and in the browser through WebGPU. Results are bitwise
+repeatable: no floating-point atomics, and every output is a sum in a fixed
+order.
 
-## Checkout and repository layout
+The Cargo package is `wgpu-nufft`, imported as `wgpu_nufft`. Its FFTs come
+from [wgpu-fft](https://github.com/MaximEremenko/wgpuFFT), pinned here as the
+`wgpuFFT/` Git submodule.
 
-Any fresh Git clone must include Git's `--recurse-submodules` option. If the
-repository is already checked out, initialize its pinned FFT dependency with:
+## Features
 
-```powershell
-git submodule update --init --recursive
-```
+- **All three transform types**: type 1 (nonuniform points to Fourier modes),
+  type 2 (modes to points), and type 3 (nonuniform points to nonuniform
+  frequencies).
+- **One to five dimensions on the GPU**: tuned 1D, 2D, and 3D paths plus a
+  rank-generic path for 4D and 5D. The direct `f64` reference transforms
+  cover up to eight dimensions.
+- **Three precisions**: `f32`, native `f64` (devices with `SHADER_F64`), and
+  portable double-float (`Df64`, about 44-48 significant bits on any device).
+- **Deterministic**: repeated executions give bitwise-identical results, also
+  for tightly clustered points.
+- **GPU-resident**: plans record into your command encoder and read and write
+  your buffers, so data never has to leave the GPU.
+- **Batches and point reuse**: many vectors over one point set, and a point
+  set prepared once for repeated transforms.
+- **Python and JavaScript**: a PyO3 + NumPy binding and a `wasm-bindgen`
+  browser package.
 
-```text
-wgpuNUFFT/
-|-- src/, tests/, benches/  wgpu-nufft package
-|-- wgpuFFT/                pinned wgpu-fft submodule
-|-- wgpu-web/               combined browser wrapper
-|-- python/                 local PyO3 + NumPy binding
-|-- web/                    browser integration harness
-`-- nd_prototype/           standalone NUFFT research prototype
-```
+## Installation
 
-The outer Cargo workspace intentionally excludes `wgpuFFT/`. This keeps the
-submodule independently buildable and prevents parent formatting or lockfile
-operations from modifying it. Validate both repository boundaries explicitly:
-
-```powershell
-cargo test --locked
-cargo test --manifest-path wgpuFFT/Cargo.toml --locked
-```
-
-Rust 1.92 or newer is required. The GPU suites are opt-in: set
-`WGPU_FFT_RUN_GPU_TESTS=1` to run them on the default adapter, optionally with
-`WGPU_BACKEND=vulkan`, `dx12`, or `metal` to pick a backend.
-`WGPU_NUFFT_RUN_LARGE_GPU_TESTS=1` adds a 256^3 case, which needs the
-`gpu-profiling` feature. That feature also adds timestamp-query stage profiling
-(`NufftPlan::encode_type1_gpu_profiled` and friends); the other features only
-build benchmark prototypes.
-
-## Local dependency and quick start
-
-Add the checkout as a path dependency, with the path resolved relative to the
-consumer's `Cargo.toml`:
+`wgpu-nufft` is distributed through GitHub rather than crates.io:
 
 ```toml
 [dependencies]
-wgpu-nufft = { path = '../wgpuNUFFT' }
+wgpu-nufft = { git = "https://github.com/MaximEremenko/wgpuNUFFT", tag = "v0.1.0" }
 ```
 
-The direct `f64` transform is a small CPU-only way to verify the dependency
-before creating a GPU plan:
+Cargo checks out the `wgpuFFT` submodule automatically. Use the re-exported
+`wgpu_nufft::wgpu` and `wgpu_nufft::wgpu_fft` crates (or `wgpu = "30"`), so
+your types match the ones the plans take. A separate Git dependency on
+`wgpu-fft` would add a second, incompatible copy. Rust 1.92 or newer is
+required.
+
+To work on a local checkout, clone it with its submodule and depend on it by
+path:
+
+```bash
+git clone --recurse-submodules https://github.com/MaximEremenko/wgpuNUFFT.git
+# In an existing clone: git submodule update --init --recursive
+```
+
+```toml
+[dependencies]
+wgpu-nufft = { path = "../wgpuNUFFT" }
+```
+
+## Quick start
+
+The direct `f64` reference transform runs on the CPU, which makes it a quick
+check that the dependency works:
 
 ```rust
 use wgpu_nufft::{reference_type1_f64, Complex64, NufftConfig};
@@ -73,9 +79,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-A GPU plan records its work into a caller's command encoder and reads and
-writes caller-owned buffers, so results can stay on the GPU. This 2D type-1
-transform spreads 1,000 points onto 64 x 64 Fourier modes:
+A GPU plan records its work into your command encoder and reads and writes
+your buffers, so results can stay on the GPU. This 2D type-1 transform spreads
+1,000 points onto 64 x 64 Fourier modes:
 
 ```rust,no_run
 use wgpu_nufft::wgpu::{self, util::DeviceExt};
@@ -118,29 +124,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Type-2 and type-3 plans follow the same pattern. `wgpu_nufft::wgpu` re-exports
-the `wgpu` release the plans are built on (currently 30), so a consumer that
-uses it cannot end up with a second, incompatible copy.
+Type-2 plans (`NufftPlan::type2_gpu`) and type-3 plans (`NufftType3Plan`)
+follow the same pattern. Run `cargo doc --open` for the full API.
 
-## Python binding
+## Data layout
 
-`python/` builds a native CPython extension directly from the Rust library
-with PyO3, NumPy, and maturin. It does not add a separate C ABI and it is not
-published. The first supported Python data path is `float32` coordinates with
-`complex64` values for reusable type-1, type-2, and type-3 GPU plans. The
-pinned development tools below need Python 3.12 or newer (NumPy 2.5.2 has no
-older wheels); the built package itself supports Python 3.10 and newer.
+| Data | Layout |
+|---|---|
+| Points | Point-major, in the plan's precision: one value per point in 1D, `[x0, y0, z0, x1, y1, z1, ...]` in 3D. |
+| Complex values | Interleaved `(re, im)` pairs; `Df64` stores `(re_hi, re_lo, im_hi, im_lo)`. |
+| Fourier modes | Dimension zero fastest, in centered order by default (`ModeOrder::Fft` selects FFT order). |
+| Batches | Transform-major, `[transform][point or mode]`, with every transform sharing one point set. |
 
-```powershell
-$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install "maturin==1.15.0" "numpy==2.5.2" "pytest==9.1.1"
-$env:PYO3_PYTHON = (Resolve-Path .\.venv\Scripts\python.exe).Path
-cargo test -p wgpu-nufft-python --locked
-maturin develop --release --manifest-path python\Cargo.toml
-python -m pytest python\tests -q
-```
+Every buffer needs `STORAGE` usage. Size buffers with the plan's
+`required_*_buffer_size_bytes` methods, which follow its dimensionality,
+precision, and batch; the `*_for_batch` variants size a smaller active batch.
+
+Type-1 and type-2 coordinates are radians in `[-3*pi, 3*pi]`. Type-3 sources
+and targets must stay inside the intervals given when the plan is created.
+See [Conventions](#conventions) for the exact definitions.
+
+## Python
+
+[`python/`](python/README.md) builds a native NumPy extension with PyO3 and
+maturin. It runs reusable type-1, type-2, and type-3 GPU plans on `float32`
+coordinates and `complex64` values:
 
 ```python
 import numpy as np
@@ -150,212 +158,184 @@ context = wgpu_nufft.Context()
 plan = wgpu_nufft.Type1Plan(context, (16,), eps=1e-5)
 points = np.linspace(-np.pi, np.pi, 32, endpoint=False, dtype=np.float32)
 strengths = np.ones(32, dtype=np.complex64)
-modes = plan.execute(points, strengths)
+modes = plan.execute(points, strengths)  # shape (16,)
 ```
 
-Plans retain their GPU context and serialize reuse of internal scratch
-buffers. Inputs must be C-contiguous NumPy arrays. Multidimensional Fourier
-arrays keep the logical Python shape `(*n_modes)`; the binding explicitly
-converts that C-order layout to and from the Rust core's dimension-zero-fast
-storage. See [python/README.md](python/README.md) for the complete array and
-batch contract and the command that builds a local wheel.
+Multidimensional modes keep the NumPy shape `(*n_modes)`; the binding
+converts between C order and the dimension-zero-fast storage of the Rust
+core. See [python/README.md](python/README.md) for building, array shapes, and
+batches.
 
-## Current scope
+## Browser
 
-The current implementation provides:
+[`wgpu-web/`](wgpu-web/README.md) is a `wasm-bindgen` package that exposes
+`wgpu-fft` and `wgpu-nufft` to JavaScript. Plans and buffers stay on the GPU
+until an explicit download.
 
-- Type-1, type-2, and type-3 definitions: GPU plans use
-  hand-tuned 1D, 2D, and 3D paths plus a rank-generic path for 4D and 5D
-  (`MAX_GPU_NUFFT_DIMENSIONS`) for all three transform types in F32, native
-  F64, and portable double-float, and the CPU reference transforms accept up to
-  8 dimensions (`MAX_NUFFT_DIMENSIONS`);
-- direct `f64` NDFT execution for every transform kind as the correctness oracle
-  and tiny-problem fallback;
-- `sigma = 2` default exponential-of-semicircle kernel planning;
-- host-`f64` centered-grid kernel Fourier coefficients;
-- even fine-grid selection through `wgpu-fft`'s public supported-length
-  factorization;
-- reusable 1D, 2D, and 3D type-2 `f32`, native-`f64`, and portable
-  double-float GPU plans with caller-owned point, Fourier-coefficient, and
-  output buffers, including many-vector batching;
-- reusable 1D, 2D, and 3D type-1 plans in the same three precisions with
-  caller-owned point, strength, and Fourier-mode output buffers, including
-  many-vector batching;
-- reusable 1D, 2D, and 3D type-3 plans in the same three precisions with
-  caller-owned source points, strengths, target frequencies, and output
-  buffers, also with many-vector batching;
-- a `set_points_gpu` / `execute_*` split for type-1 and type-2 plans that
-  prepares a point set once for repeated executions (see
-  [Reusing a point set](#reusing-a-point-set));
-- a local native Python extension with persistent GPU contexts, reusable
-  type-1/type-2/type-3 plans, NumPy host-array transfer, and many-vector
-  batching in F32/`complex64`.
+```bash
+wasm-pack build wgpu-web --target web --out-dir pkg
+```
 
-The GPU type-2 route pre-deconvolves and zero-pads on the GPU, executes a public
-`wgpu-fft` C2C plan on the oversampled grid, and gathers the ES interpolation
-kernel at each nonuniform point. The caller records execution into its own
-command encoder and can consume the caller-owned output buffer without a
-readback. Plan-owned fine-grid buffers are reused between ordered executions.
-Points are point-major values in the configured precision (scalar in 1D and, for example,
-`[x0, y0, z0, x1, y1, z1, ...]` in 3D), while coefficients and outputs are
-interleaved complex `(re, im)` pairs; all require `STORAGE` buffer usage.
-Size every buffer with the plan's `required_*_buffer_size_bytes` methods, which
-follow its dimensionality, precision, and configured batch; the `*_for_batch`
-variants size a smaller active batch.
-
-`NufftConfig::with_batch(ntr)` and `NufftType3Config::with_batch(ntr)` follow
-the `ntransf` batching convention: every transform shares one point set, while
-complex inputs and outputs are transform-major (`[transform][point or mode]`).
-Point binning, scanning, and sorting run once per execution (or once per point
-set, see [Reusing a point set](#reusing-a-point-set)) for all vectors together,
-and the per-cell spread and direct interpolation kernels reuse each computed
-support weight across blocks of up to four vectors. The oversampled-grid C2C plan uses `wgpu-fft`'s native batch
-dimension. The ordinary encode methods execute the configured count; the
-explicit `*_batch` methods may execute `1..=ntr` vectors on the same plan for
-grow/shrink workflows. The embedded FFT remains capacity-sized in that case,
-so a smaller active count is a reuse feature rather than a promise of
-proportionally lower FFT work.
-
-The 1D Vulkan accuracy matrix enforces relative L2 error at most `4*eps` over
-the complete random-plus-adversarial vector and `8*eps` for each isolated
-boundary, cluster, duplicate, and seeded-random subset. The 2D and 3D matrices
-cover the same tolerance range, signs, mode orders, and adversarial point
-classes at a `20*eps` float acceptance ceiling, plus
-determinism, non-square/non-cubic grids, scratch reuse, and opposite-sign
-adjoint checks.
-
-The GPU type-1 route bins point indices with portable `u32` atomics, scans the
-flattened 1D, 2D, or 3D bin counts hierarchically, restores a stable input order
-within each bin, and assigns each fine-grid cell to exactly one gathering
-invocation. It therefore needs no unavailable WGSL `f32` atomics, and repeated
-executions accumulate strengths in deterministic point order. In 2D and 3D,
-the ES spreading/interpolation weights and deconvolution amplitudes are tensor
-products, with dimension zero stored fastest. Shared-memory tiles accelerate
-the default multidimensional spreading path while retaining a global fallback
-for device limits that cannot support the tile. The gathered grid passes
-through a public `wgpu-fft` ND C2C plan before deconvolution and truncation into
-the caller-owned mode buffer. The type-1/type-2 routes reuse plan-owned fine-grid
-scratch. Type 1 also reuses fixed bin-count, cursor, and offset buffers and grows
-its sorted-point-index buffer only when a larger point set requires it.
-Executions on a given plan must remain in queue order.
-
-F32 plans whose fine grid is large enough (at `eps = 1e-6`, at least 18 cells
-per axis in 1D and 2D, and 32/32/22 cells in 3D) use coarse-bin paths instead.
-The points are grouped into small bins once (integer-atomic counts, a prefix
-scan, and, for type 1, a sort back into input order inside every bin), and
-every point's support start and df64 offset are prepared once, so the kernels
-evaluate every weight as `(j + hi) + lo` without refolding coordinates:
-
-- Type-1 spreading stays output-stationary. In 1D each invocation owns four
-  consecutive fine-grid cells and in 2D a `4x4` tile, and walks only the few
-  bins that can reach them, in a fixed order. In 3D each workgroup owns a
-  `16x16x8` block whose rows stay in registers while the block's nearby points
-  stream through workgroup memory. Every fine-grid cell is written exactly
-  once, without atomics, so results remain bitwise repeatable.
-- Type-2 interpolation evaluates the points in bin order for cache locality
-  (in 2D and 3D, eight invocations share one point and read each fine-grid row
-  as one run). Every output is still one fixed-order sum.
-- The small, densely populated outer grids of 1D and 2D type-3 plans use a
-  dense spreader that splits the sources by index into fixed groups, sums each
-  group into a partial grid, and adds the partial grids in group order. The 3D
-  type-3 outer grid uses the 3D block spreader.
-
-F64/Df64 plans, smaller grids, and devices without the required workgroup
-limits keep the per-cell gather and direct interpolation.
-
-### Clustered points
-
-Tightly clustered inputs, such as displacement vectors near zero, put many
-points into a few coarse bins. Type-1 plans keep such inputs parallel and
-deterministic:
-
-- Restoring input order inside a bin ranks the points of bins up to 64 points
-  and sorts larger bins with a parallel merge sort over all invocations,
-  instead of one invocation per bin.
-- A gather tile or block whose reach holds more records than a fixed limit is
-  handed to a heavy pass: in 1D and 2D a whole workgroup shares the tile, and
-  in 3D the block's records are split into parts, one workgroup each. Every
-  heavy path takes records in a fixed order and adds partial sums in a fixed
-  order, so outputs stay bitwise repeatable.
-
-4,194,304 points inside a single bin take about 44 ms in 1D,
-69 ms in 2D and 93 ms in 3D per execution, far from the Windows TDR limit.
-Evenly spread points pay a few microseconds for the checks. F64 and Df64
-plans, and grids too small for the coarse-bin paths, sort in parallel too but
-keep the per-cell gather, which still walks each cell's reach serially.
-
-### Reusing a point set
-
-`NufftPlan::set_points_gpu` records the point-dependent work (for the F32
-coarse-bin paths of 1D-3D type-1 and type-2 plans: binning, sorting, and
-per-point preparation) once, and
-`execute_type1_gpu[_batch]` or `execute_type2_gpu[_batch]` then transform new
-strengths or coefficients at those points, like a one-time point setup followed by
-repeated `execute` calls. The plan keeps a reference to the point buffer; its
-contents must not change while executions use it, and executions must be
-submitted after the commands recorded by `set_points_gpu`. The existing
-`encode_*` methods are equivalent to `set_points_gpu` followed by the matching
-`execute_*` call. `cargo bench -p wgpu-nufft --bench nufft_bench --
---reuse-points` times this execute-only path.
-
-The GPU type-3 route follows the standard rescaling composition: it rescales and
-pre-phases nonuniform sources, spreads them to an outer uniform grid, evaluates
-that grid through an inner type-2 plan, then applies the continuous ES-kernel
-correction and post-phase at rescaled nonuniform target frequencies. A reusable
-GPU plan cannot inspect arbitrary device buffers during construction, so
-`NufftType3Config` requires conservative source and target intervals. Every
-coordinate supplied to later GPU executions must remain finite and inside those
-planned intervals. The direct CPU route validates this contract explicitly;
-GPU execution treats it as a caller guarantee. Absurd space-bandwidth products
-and rescalings that cannot fit the GPU index, buffer, or portable double-float
-phase range return structured planning errors. Use the dimension-aware
-`NufftType3Plan::required_*_buffer_size_bytes` methods to size each caller-owned
-source, target, strength, and output buffer. Type-3 plans likewise reuse
-grow-only internal scratch and require ordered execution on a given plan.
+`F32` and `Df64` plans run in browsers. Native `F64` does not, because WebGPU
+has no 64-bit float shaders. Chrome tests at the exact WebGPU default limits
+cover batched type 1, 2, and 3 in one to three dimensions in both precisions;
+see [web/README.md](web/README.md) for the browser test harness.
 
 ## Precision
 
-`NufftConfig::with_precision` and `NufftType3Config::with_precision` select the
-coordinate, complex-value, kernel, and fine-grid FFT precision together. `F32`
-is the default and preserves the original shader path. `F64` uses scalar `f64`
-coordinates and `vec2<f64>` complex values and requires a device created with
-`wgpu::Features::SHADER_F64`; this is currently a Vulkan capability in wgpu.
-Plans return a structured `PrecisionUnsupported` error before shader creation
-when that feature is absent. `Df64` represents every scalar as an unevaluated
-`hi + lo` pair of `f32` words and every complex value as
-`(re_hi, re_lo, im_hi, im_lo)`. It requires no optional device feature and is
-the portable high-precision route for DX12, Metal, and browser/WebGPU devices
-that do not expose native shader `f64`.
+`NufftConfig::with_precision` and `NufftType3Config::with_precision` choose
+the precision of coordinates, values, kernel, and FFT together:
 
-The ES kernel cannot call `exp` in native-f64 SPIR-V, and df64 deliberately
-contains no shader transcendental operations. Both high-precision routes fit
-piecewise-Horner tables on the host in `f64` and use the same
-polynomial for interpolation/spreading and Fourier deconvolution. Native-f64
-tables store `f64` coefficients; df64 tables split each coefficient into its
-high and low `f32` words. Type-3 phase factors use a transcendental-free,
-range-reduced polynomial sine/cosine. Native f64 conservatively rejects planned
-phase magnitudes above `1e6`; portable df64 uses the tighter, accuracy-driven
-bound of `1024` because its two-f32 range reduction loses absolute precision as
-the unreduced phase grows.
+| Precision | Scalar storage | Requirement | Use |
+|---|---|---|---|
+| `F32` (default) | `f32` | none | Every backend, including browsers. |
+| `F64` | `f64` | `wgpu::Features::SHADER_F64` (Vulkan in wgpu 30) | Full double precision where the device supports it. |
+| `Df64` | `hi + lo` pair of `f32` words | none | About 44-48 significant bits on DX12, Metal, and browsers. |
 
-Df64 retains roughly 44-48 significant bits, but its exponent range remains
-that of `f32` (approximately `1e-38` through `1e38`). Its split-based Dekker
-products avoid relying on fused multiply-add contraction; exact-word arithmetic
-canaries in `wgpu-fft` define the backend support contract. Vulkan and DX12 are
-tested. Metal remains the riskiest untested backend because its
-shader compiler enables fast-math transformations by default. The plans'
-byte-size helpers account for 8-byte coordinates and 16-byte complex values in
-both high-precision formats.
+Plans return a `PrecisionUnsupported` error before creating shaders when the
+device lacks `SHADER_F64`. In both `F64` and `Df64`, coordinates take 8 bytes
+and complex values 16 bytes, which the size helpers account for. `Df64` keeps
+the `f32` exponent range (about `1e-38` to `1e38`).
 
-Both the crate and the `wgpu-web` JavaScript surface run on browser WebGPU.
-Chrome/Tint testing at exact WebGPU defaults covers batched type 1/2/3 in one
-through three dimensions for F32 and Df64. The browser compiler must first pass
-all 96 exact df64 arithmetic words; otherwise only Df64 is disabled. Native F64
-remains structurally unsupported in browsers because `SHADER_F64` is absent.
-The browser wrapper keeps plans and caller buffers GPU-resident and exposes
-explicit upload, awaited execution, and download operations.
+Native-`f64` shaders cannot call `exp`, and `Df64` uses no shader
+transcendentals, so both evaluate the kernel from piecewise Horner
+polynomials fitted on the host in `f64`, with the same polynomial for
+spreading and deconvolution. Type-3 phases use a range-reduced polynomial
+sine and cosine. `F64` plans reject phase magnitudes above `1e6` and `Df64`
+plans above `1024`, since two-word range reduction loses absolute precision
+as the phase grows.
 
-## Mathematical conventions
+`Df64` products use Dekker splits rather than fused multiply-add. Exact-word
+canaries in `wgpu-fft` check each backend's arithmetic: Vulkan and DX12 are
+tested, while Metal, whose shader compiler enables fast math by default, is
+untested. In the browser, `wgpu-web` runs all 96 canary words at start-up and
+disables only `Df64` if one fails.
+
+## How it works
+
+**Type 2** deconvolves and zero-pads the modes onto an oversampled grid, runs
+a `wgpu-fft` C2C transform on it, and interpolates the grid at every point
+with the exponential-of-semicircle (ES) kernel.
+
+**Type 1** reverses these steps: it spreads the points onto the fine grid,
+transforms the grid, and deconvolves and truncates it into the mode buffer.
+Points are binned with portable `u32` atomics, a prefix scan, and a sort that
+restores input order inside every bin. Each fine-grid cell is then written by
+exactly one invocation, which adds its points in that fixed order, so no
+floating-point atomics are needed.
+
+- **Binned spreaders.** `F32` plans whose fine grid is large enough (at
+  `eps = 1e-6`, at least 18 cells per axis in 1D and 2D and 32 x 32 x 22 in
+  3D) group the points into coarse bins and prepare every point's support
+  once. In 1D each invocation owns four consecutive cells and in 2D a 4 x 4
+  tile, and walks only the bins that reach them. In 3D each workgroup owns a
+  16 x 16 x 8 block whose rows stay in registers while nearby points stream
+  through workgroup memory. Type 2 interpolates the points in bin order for
+  cache locality.
+- **Per-cell gather.** `F64` and `Df64` plans, 4D and 5D plans, smaller
+  grids, and devices without the required workgroup limits bin the points by
+  fine-grid cell, and every cell gathers the points within the kernel's
+  reach. In 2D and 3D, `F32` plans gather through shared-memory tiles when the
+  device limits allow.
+- **Clustered points.** Bins of more than 64 points are sorted by a parallel
+  merge sort. A tile or block that reaches too many points goes to a heavy
+  pass, in which a whole workgroup shares a 1D or 2D tile and a 3D block's
+  points are split across workgroups; partial sums are added in a fixed order.
+  4,194,304 points in a single bin take about 44 ms in 1D, 69 ms in 2D, and
+  93 ms in 3D per execution, while evenly spread points pay a few
+  microseconds for the checks. The per-cell gather sorts in parallel too, but
+  still walks each cell's reach serially.
+
+**Type 3** rescales and pre-phases the sources, spreads them onto an outer
+uniform grid, evaluates that grid through an inner type-2 plan, and applies
+the kernel correction and post-phase at the targets. The small, densely
+populated outer grids of 1D and 2D plans use a spreader that sums fixed
+groups of sources into partial grids and adds the partial grids in group
+order; 3D plans use the 3D block spreader.
+
+A GPU plan cannot read device buffers while it is created, so
+`NufftType3Config` takes conservative source and target intervals, and every
+later coordinate must stay finite and inside them. The CPU reference checks
+this; on the GPU it is the caller's guarantee. Space-bandwidth products or
+rescalings too large for GPU indices, buffers, or the `Df64` phase range
+return planning errors.
+
+Plans own and reuse their fine-grid and binning scratch, growing point-sized
+buffers only when a larger point set needs them, so executions of one plan
+must stay in queue order.
+
+### Batches
+
+`NufftConfig::with_batch(n)` and `NufftType3Config::with_batch(n)` plan `n`
+transforms over one shared point set. Binning, scanning, and sorting run once
+for all of them, the per-cell spreading and direct interpolation kernels
+reuse each kernel weight for up to four vectors, and the fine-grid FFT uses
+`wgpu-fft`'s batch dimension. The ordinary encode methods run all `n`
+transforms; the `*_batch` methods run any active count from 1 to `n` on the
+same plan. The FFT stays sized for `n`, so a smaller count does not reduce
+FFT work proportionally.
+
+### Reusing a point set
+
+`NufftPlan::set_points_gpu` records the point-dependent work once (binning,
+sorting, and per-point preparation on the binned `F32` paths of 1D-3D
+type-1 and type-2 plans). `execute_type1_gpu[_batch]` and
+`execute_type2_gpu[_batch]` then transform new strengths or coefficients at
+those points. The plan keeps a reference to the point buffer: its contents
+must not change while executions use it, and executions must be submitted
+after the commands recorded by `set_points_gpu`. The `encode_*` methods are
+`set_points_gpu` followed by the matching `execute_*` call.
+
+## Testing
+
+```bash
+cargo test --locked                                     # wgpu-nufft and wgpu-web
+cargo test --manifest-path wgpuFFT/Cargo.toml --locked  # the wgpu-fft submodule
+```
+
+The workspace excludes `wgpuFFT/`, so the submodule builds on its own and
+workspace commands never modify it.
+
+GPU tests are opt-in. `WGPU_FFT_RUN_GPU_TESTS=1` runs them on the default
+adapter; `WGPU_BACKEND` (`vulkan`, `dx12`, or `metal`) picks a backend and
+`WGPU_ADAPTER_NAME` an adapter whose name contains the given text:
+
+```bash
+WGPU_FFT_RUN_GPU_TESTS=1 cargo test --release
+```
+
+```powershell
+$env:WGPU_FFT_RUN_GPU_TESTS = '1'; cargo test --release
+```
+
+| Test | Covers |
+|---|---|
+| `gpu_nufft` | 1D at `eps` from `1e-2` to `1e-6`, both signs and mode orders, and random, boundary, clustered, and duplicate points: relative L2 error at most `4*eps` overall and `8*eps` for each point class. |
+| `gpu_nufft_2d`, `gpu_nufft_3d` | The same in 2D (at most `20*eps`) and 3D (at most `32*eps`), with non-square grids, scratch reuse, determinism, and adjoint checks. |
+| `gpu_nufft_nd` | 4D and 5D in all three precisions. |
+| `gpu_nufft_type3` | Type 3 in 1D to 3D (at most `100*eps`). |
+| `gpu_nufft_batch` | Batched type 1, 2, and 3. |
+| `gpu_nufft_precision`, `gpu_nufft_df64` | Native `f64` and `Df64` accuracy, layouts, and device capabilities. |
+| `gpu_clustered_points` | Tightly clustered points, the large-bin sort, and the heavy passes. |
+| `gpu_invalid_points` | Coordinates outside the contract, NaN and infinities included. |
+| `gpu_device_mismatch` | Buffers and devices from another `wgpu` device. |
+
+`WGPU_NUFFT_RUN_LARGE_GPU_TESTS=1` adds a 256^3 case, which needs
+`--features gpu-profiling`. Browser tests are described in
+[web/README.md](web/README.md).
+
+### Features and benchmarks
+
+| Feature | Effect |
+|---|---|
+| `gpu-profiling` | Timestamp-query stage profiling (`NufftPlan::encode_type1_gpu_profiled` and friends). |
+| `type1-2d-tile-prototype`, `type1-3d-tile-prototype` | Benchmark-only variants of the type-1 gather. |
+
+The benchmarks in `benches/` list their options with `--help`, for example
+`cargo bench --bench nufft_bench -- --help`. With `--reuse-points`,
+`nufft_bench` times the execute-only path of a prepared point set.
+
+## Conventions
 
 For integer mode vectors `k`, nonuniform points `x_j`, and complex strengths
 `c_j`, type 1 computes
@@ -377,18 +357,35 @@ type 3 computes
 f_k = sum_j c_j exp(isign * i * dot(s_k, x_j)).
 ```
 
-There is no normalization. Nonnegative `isign` selects the positive sign;
-negative values select the negative sign. Centered mode order is the default,
-and dimension zero is stored fastest. Type 3 has no integer-mode ordering.
-Type-1/type-2 coordinates follow the documented `|x| <= 3*pi` contract
-and are periodic modulo `2*pi`; type-3 source and target domains are instead
-the explicit intervals supplied at planning. GPU plans cannot check device
-buffers, so a coordinate that breaks the contract, including NaN or an
-infinity, is not reported: it makes the type-1 or type-3 result that contains
-it undefined, but it never corrupts memory or other points' type-2 outputs,
-and a plan's later executions are unaffected. With the conventional Hermitian
-inner product, type-2 with sign `s` is adjoint to type-1 with sign `-s`; a
-type-3 plan's adjoint swaps source and target sets and reverses the sign.
+- There is no normalization. A nonnegative `isign` selects the positive sign
+  and a negative one the negative sign.
+- Modes are in centered order by default, with dimension zero stored fastest.
+  Type 3 has no integer-mode ordering.
+- Type-1 and type-2 coordinates must satisfy `|x| <= 3*pi` and are periodic
+  modulo `2*pi`. Type-3 sources and targets must lie inside the intervals
+  given when the plan is created.
+- GPU plans cannot check device buffers, so a coordinate that breaks the
+  contract, NaN or an infinity included, is not reported. It makes the type-1
+  or type-3 result that contains it undefined, but never corrupts memory,
+  other points' type-2 outputs, or the plan's later executions.
+- With the usual Hermitian inner product, type 2 with sign `s` is the adjoint
+  of type 1 with sign `-s`. The adjoint of a type-3 plan swaps its source and
+  target sets and reverses the sign.
+
+## Repository layout
+
+```text
+wgpuNUFFT/
+|-- src/, tests/, benches/  the wgpu-nufft crate
+|-- wgpuFFT/                pinned wgpu-fft submodule
+|-- wgpu-web/               browser package (wasm-bindgen)
+|-- python/                 Python binding (PyO3 + NumPy)
+|-- web/                    browser test harness
+`-- nd_prototype/           research prototype of the 4D/5D design
+```
+
+The Cargo packages are not published to crates.io (`publish = false`). See
+[CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## License
 

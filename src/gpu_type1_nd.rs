@@ -1,14 +1,15 @@
 //! Rank-generic (runtime-dimensional) type-1 GPU execution.
 //!
-//! Adoption phase 1, second half: the 1D type-1 pipeline generalized to any
-//! rank. The stage list is identical to `gpu_type1.rs` — bin count (u32
-//! atomics) -> exclusive scan -> terminal -> scatter (u32 atomics) -> per-bin
-//! heap sort -> deterministic per-cell gather (one writer per fine cell) ->
-//! oversampled C2C FFT -> deconvolution/truncation. Bins are fine-grid cells
-//! flattened axis-0-fast; the scan, sort, and scratch machinery are already
-//! rank-free and are reused as-is. All three precisions are supported; F64 and
-//! Df64 evaluate the ES kernel through the host-fitted Horner table because
-//! GLSL.std.450 transcendentals are 32-bit only.
+//! The per-cell 1D type-1 pipeline generalized to any rank, with the same
+//! stages as the per-cell path of `gpu_type1.rs` — bin count (u32 atomics) ->
+//! exclusive scan -> terminal -> scatter (u32 atomics) -> order restore within
+//! each bin (ranking, then the parallel large-bin sort) -> deterministic
+//! per-cell gather (one writer per fine cell) -> oversampled C2C FFT ->
+//! deconvolution/truncation. Bins are fine-grid cells flattened axis-0-fast;
+//! the scan, sort, and scratch machinery are already rank-free and are reused
+//! as-is. All three precisions are supported; F64 and Df64 evaluate the ES
+//! kernel through the host-fitted Horner table because GLSL.std.450
+//! transcendentals are 32-bit only.
 
 use wgpu::util::DeviceExt;
 use wgpu_fft::math::DoubleFloat;
