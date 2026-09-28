@@ -12,7 +12,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   memory, behind the default `cpu` feature. They take the same
   configurations and layouts as the GPU plans, support one to eight
   dimensions and all three precisions, check every coordinate, and give
-  bitwise-identical results for any thread count.
+  bitwise-identical results for any thread count. They transform their fine
+  grid in place, on a `wgpu-fft` whose CPU backend runs strided axes in place
+  and long lines as a parallel four-step decomposition.
 
 ## [0.1.0] - 2026-09-28
 

@@ -53,8 +53,8 @@ const MIN_VALUES_PER_THREAD: usize = 1 << 15;
 /// word in one place. The kernel is evaluated from the same piecewise
 /// polynomials as the GPU `F64` and `Df64` paths, and the fine-grid FFT runs
 /// on `wgpu-fft`'s CPU backend. `F32` plans compute in `f32`; `F64` and
-/// `Df64` plans compute in `f64`. A plan keeps its two fine-grid buffers
-/// between executions.
+/// `Df64` plans compute in `f64`. A plan keeps its fine grid and its other
+/// large buffers between executions.
 ///
 /// ```
 /// use wgpu_nufft::{CpuNufftPlan, NufftConfig};
@@ -97,7 +97,6 @@ struct TypedEngine<T> {
 /// and the first touch of every page.
 struct Buffers<T> {
     fine: Vec<T>,
-    transformed: Vec<T>,
     sort: SortBuffers,
     values: Vec<[T; 2]>,
 }
@@ -106,7 +105,6 @@ impl<T> Default for Buffers<T> {
     fn default() -> Self {
         Self {
             fine: Vec::new(),
-            transformed: Vec::new(),
             sort: SortBuffers::default(),
             values: Vec::new(),
         }
@@ -476,15 +474,9 @@ impl<T: Real, P: Coordinate> Job<'_, T, P> {
 
         let fine_words = checked_product("CPU fine-grid words", &[grid.cells(), batch, 2])?;
         ensure(&mut buffers.fine, fine_words, "CPU fine grid")?;
-        ensure(
-            &mut buffers.transformed,
-            fine_words,
-            "CPU transformed fine grid",
-        )?;
         let fine = &mut buffers.fine[..fine_words];
-        let transformed = &mut buffers.transformed[..fine_words];
-        let fft = |input: &[T], output: &mut [T], stage| {
-            T::fft(&self.engine.fft, input, output)
+        let fft = |data: &mut [T], stage| {
+            T::fft_in_place(&self.engine.fft, data)
                 .map_err(|source| NufftError::FftExecutionFailed { stage, source })
         };
         match plan.kind {
@@ -500,12 +492,12 @@ impl<T: Real, P: Coordinate> Job<'_, T, P> {
                     )?,
                     None => fine.fill(T::ZERO),
                 }
-                fft(fine, transformed, "CPU type-1 fine-grid FFT")?;
+                fft(fine, "CPU type-1 fine-grid FFT")?;
                 deconvolve(
                     &self.engine.axes,
                     &grid,
                     config.n_modes(),
-                    transformed,
+                    fine,
                     output,
                     threads,
                 );
@@ -519,11 +511,11 @@ impl<T: Real, P: Coordinate> Job<'_, T, P> {
                     fine,
                     threads,
                 );
-                fft(fine, transformed, "CPU type-2 fine-grid FFT")?;
+                fft(fine, "CPU type-2 fine-grid FFT")?;
                 if direct && self.point_count > 0 {
                     interpolate_direct::<T, P, D, RUN>(
                         &points,
-                        bytemuck::cast_slice(transformed),
+                        bytemuck::cast_slice(fine),
                         bytemuck::cast_slice_mut(output),
                         threads,
                     );
@@ -534,7 +526,7 @@ impl<T: Real, P: Coordinate> Job<'_, T, P> {
                     let values = &mut buffers.values[..value_count];
                     interpolate::<T, P, D, RUN>(
                         &points,
-                        bytemuck::cast_slice(transformed),
+                        bytemuck::cast_slice(fine),
                         sorted,
                         values,
                         threads,

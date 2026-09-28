@@ -27,9 +27,9 @@ pub(crate) trait Real:
 
     fn is_finite(self) -> bool;
 
-    /// Transforms `input` into `output` with `plan`, whose precision
-    /// computes in `Self`.
-    fn fft(plan: &CpuFftPlan, input: &[Self], output: &mut [Self]) -> Result<(), FftError>;
+    /// Transforms `data` in place with `plan`, whose precision computes in
+    /// `Self`.
+    fn fft_in_place(plan: &CpuFftPlan, data: &mut [Self]) -> Result<(), FftError>;
 }
 
 impl Real for f32 {
@@ -48,8 +48,8 @@ impl Real for f32 {
         f32::is_finite(self)
     }
 
-    fn fft(plan: &CpuFftPlan, input: &[Self], output: &mut [Self]) -> Result<(), FftError> {
-        plan.execute(input, output)
+    fn fft_in_place(plan: &CpuFftPlan, data: &mut [Self]) -> Result<(), FftError> {
+        plan.execute_in_place(data)
     }
 }
 
@@ -69,8 +69,8 @@ impl Real for f64 {
         f64::is_finite(self)
     }
 
-    fn fft(plan: &CpuFftPlan, input: &[Self], output: &mut [Self]) -> Result<(), FftError> {
-        plan.execute_f64(input, output)
+    fn fft_in_place(plan: &CpuFftPlan, data: &mut [Self]) -> Result<(), FftError> {
+        plan.execute_in_place_f64(data)
     }
 }
 
