@@ -652,9 +652,9 @@ impl Type1GpuPlan2d {
 
     fn encode_fft(&self, device: &wgpu::Device, recorder: &mut GpuRecorder<'_>) -> Result<()> {
         self.fft
-            .execute_views(
+            .record_views(
                 device,
-                recorder.encoder(),
+                recorder.fft(),
                 BufferView::whole(self.fine_grid_buffer()),
                 BufferView::whole(&self.fine_output),
             )

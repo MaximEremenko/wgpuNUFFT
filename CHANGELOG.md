@@ -27,6 +27,9 @@ browser wrapper, built on `wgpu` 30 and the pinned `wgpu-fft` submodule.
   dense type-3 grids), and a per-cell gather elsewhere.
 - Parallel sorting of large bins and heavy gather passes, so tightly clustered
   points stay fast and deterministic.
+- One compute pass per execution, fine-grid FFTs included, through
+  `wgpu-fft`'s `FftRecorder`; the pinned `wgpu-fft` also runs long
+  power-of-two FFTs faster.
 - GPU stage profiling with timestamp queries behind the `gpu-profiling`
   feature.
 - A PyO3 + NumPy Python binding and a `wasm-bindgen` browser wrapper.
