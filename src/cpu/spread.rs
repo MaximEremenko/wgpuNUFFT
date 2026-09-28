@@ -69,7 +69,7 @@ impl<T: Real, P: Coordinate, const D: usize> Points<'_, T, P, D> {
 
     /// Copies the coordinates of `points` into `block`, `D` per point.
     fn gather(&self, points: &[u32], block: &mut Block<T>) {
-        for (&point, target) in points.iter().zip(block.coordinates.chunks_exact_mut(D)) {
+        for (&point, target) in points.iter().zip(block.coordinates.as_chunks_mut::<D>().0) {
             let source = &self.coordinates[point as usize * D..(point as usize + 1) * D];
             for (target, &coordinate) in target.iter_mut().zip(source) {
                 *target = coordinate.to_f64();

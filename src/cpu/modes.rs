@@ -91,7 +91,9 @@ pub(crate) fn deconvolve<T: Real, const D: usize>(
             }
             let axis = &axes[0];
             for (pair, (&cell, &factor)) in row
-                .chunks_exact_mut(2)
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
                 .zip(axis.fine_index.iter().zip(&axis.amplitude))
             {
                 let source = 2 * (base + cell);

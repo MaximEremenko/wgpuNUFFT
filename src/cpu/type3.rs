@@ -375,7 +375,12 @@ impl CpuNufftType3Plan {
                 MIN_VALUES_PER_THREAD,
                 |first, chunk| {
                     let sources = &sources[first * D..first * D + chunk.len()];
-                    for (point, source) in chunk.chunks_exact_mut(D).zip(sources.chunks_exact(D)) {
+                    for (point, source) in chunk
+                        .as_chunks_mut::<D>()
+                        .0
+                        .iter_mut()
+                        .zip(sources.as_chunks::<D>().0)
+                    {
                         for ((value, &coordinate), axis) in point.iter_mut().zip(source).zip(axes) {
                             *value = axis.rescale_source(coordinate);
                         }
@@ -429,7 +434,12 @@ impl CpuNufftType3Plan {
             MIN_VALUES_PER_THREAD,
             |first, chunk| {
                 let targets = &targets[first * D..first * D + chunk.len()];
-                for (point, target) in chunk.chunks_exact_mut(D).zip(targets.chunks_exact(D)) {
+                for (point, target) in chunk
+                    .as_chunks_mut::<D>()
+                    .0
+                    .iter_mut()
+                    .zip(targets.as_chunks::<D>().0)
+                {
                     for ((value, &frequency), axis) in point.iter_mut().zip(target).zip(axes) {
                         *value = axis.rescale_target(frequency);
                     }
