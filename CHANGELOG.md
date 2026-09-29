@@ -6,6 +6,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-28
+
+A CPU backend for all three transform types, in Rust and Python, with point
+sets prepared once for repeated transforms.
+
 ### Added
 
 - `CpuNufftPlan` (types 1 and 2) and `CpuNufftType3Plan`: plans in host
@@ -33,9 +38,7 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- CPU spreading and interpolation run in steps of 6 and 12 cells for kernel
-  widths 5-6 and 9-12 (tolerances near `1e-5` and `1e-8` to `1e-11`), where
-  they used steps of 8 and 16.
+- The `wgpu-fft` submodule is pinned to its v0.1.0 release.
 
 ## [0.1.0] - 2026-09-28
 
@@ -101,5 +104,6 @@ These affect code written against earlier development snapshots.
   device once every object of its context is freed, and Rust panics are
   reported through `console.error`.
 
-[Unreleased]: https://github.com/MaximEremenko/wgpuNUFFT/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/MaximEremenko/wgpuNUFFT/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/MaximEremenko/wgpuNUFFT/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MaximEremenko/wgpuNUFFT/releases/tag/v0.1.0

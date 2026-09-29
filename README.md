@@ -33,8 +33,8 @@ from [wgpu-fft](https://github.com/MaximEremenko/wgpuFFT), pinned here as the
   on the CPU in one to eight dimensions, with the same configuration and
   layouts and the same bitwise repeatability, for any thread count, and
   prepare point sets once for repeated transforms.
-- **Python and JavaScript**: a PyO3 + NumPy binding and a `wasm-bindgen`
-  browser package.
+- **Python and JavaScript**: a PyO3 + NumPy binding with the GPU and CPU
+  plans, and a `wasm-bindgen` browser package.
 
 ## Installation
 
@@ -42,7 +42,7 @@ from [wgpu-fft](https://github.com/MaximEremenko/wgpuFFT), pinned here as the
 
 ```toml
 [dependencies]
-wgpu-nufft = { git = "https://github.com/MaximEremenko/wgpuNUFFT", tag = "v0.1.0" }
+wgpu-nufft = { git = "https://github.com/MaximEremenko/wgpuNUFFT", tag = "v0.2.0" }
 ```
 
 Cargo checks out the `wgpuFFT` submodule automatically. The default `cpu`
