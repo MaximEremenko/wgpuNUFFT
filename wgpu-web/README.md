@@ -13,8 +13,19 @@ wasm-pack build wgpu-web --target web --out-dir pkg
 python -m http.server 8000 --directory wgpu-web
 ```
 
-Then open <http://localhost:8000/demo/> in a browser with WebGPU. The
-generated `pkg/` directory is not checked in.
+Then open <http://localhost:8000/demo/> in a browser with WebGPU. Opening
+`demo/index.html` from disk does not work, because browsers load neither
+JavaScript modules nor WebAssembly from `file://` URLs. The generated `pkg/`
+directory is not checked in.
+
+Without `wasm-pack`, `wasm-bindgen-cli` builds the same package. Its version
+must match the `wasm-bindgen` crate in `Cargo.lock`, currently 0.2.129
+(`cargo install wasm-bindgen-cli --version 0.2.129 --locked`):
+
+```bash
+cargo build -p wgpu-web --target wasm32-unknown-unknown --release
+wasm-bindgen --target web --out-dir wgpu-web/pkg target/wasm32-unknown-unknown/release/wgpu_web.wasm
+```
 
 ## Example
 

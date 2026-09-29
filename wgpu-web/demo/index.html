@@ -16,6 +16,18 @@
     <button id="runFft">Run C2C N=4</button>
     <button id="runNufft">Run type-1 NUFFT N=8</button>
     <pre id="output">Idle</pre>
+    <script>
+      // Browsers load neither JavaScript modules nor WebAssembly from file:// URLs.
+      if (location.protocol === "file:") {
+        for (const button of document.querySelectorAll("button")) button.disabled = true;
+        document.querySelector("#output").textContent =
+          "Open this page over HTTP; browsers do not load modules or WebAssembly from file:// URLs.\n" +
+          "From the repository root, build the package and serve wgpu-web (see wgpu-web/README.md):\n\n" +
+          "  wasm-pack build wgpu-web --target web --out-dir pkg\n" +
+          "  python -m http.server 8000 --directory wgpu-web\n\n" +
+          "then open http://localhost:8000/demo/";
+      }
+    </script>
     <script type="module" src="./demo.js"></script>
   </body>
 </html>
