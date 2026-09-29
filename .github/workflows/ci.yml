@@ -101,6 +101,10 @@ jobs:
         run: |
           export PYO3_PYTHON="$(command -v python)"
           cargo test --locked -p wgpu-nufft-python
-      # The pytest suite needs a GPU adapter; building the wheel checks the
-      # packaging.
+      # Building the wheel checks the packaging. The GPU tests need an
+      # adapter; the CPU tests run here.
       - run: maturin build --release --manifest-path python/Cargo.toml
+      - name: CPU tests
+        run: |
+          python -m pip install "pytest==9.1.1" target/wheels/*.whl
+          python -m pytest python/tests/test_cpu.py -q

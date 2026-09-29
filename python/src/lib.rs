@@ -15,6 +15,8 @@ use wgpu_nufft::{
     ModeOrder, NufftConfig, NufftInterval, NufftPlan, NufftType3Config, NufftType3Plan,
 };
 
+mod cpu;
+
 create_exception!(wgpu_nufft, WgpuNufftError, PyRuntimeError);
 
 struct ContextInner {
@@ -1360,6 +1362,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Type1Plan>()?;
     m.add_class::<Type2Plan>()?;
     m.add_class::<Type3Plan>()?;
+    cpu::register(m)?;
     Ok(())
 }
 

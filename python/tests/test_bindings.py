@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 import wgpu_nufft
+from direct_sums import direct_type1, direct_type2, direct_type3
 
 
 @pytest.fixture(scope="session")
@@ -88,52 +89,6 @@ thread.join()
     assert completed.returncode == 0, completed.stderr
 
 
-def _point_matrix(points):
-    points = np.asarray(points, dtype=np.float64)
-    return points[:, None] if points.ndim == 1 else points
-
-
-def _mode_axes(n_modes, mode_order):
-    axes = []
-    for length in n_modes:
-        if mode_order == "centered":
-            axes.append(np.arange(-(length // 2), (length - 1) // 2 + 1))
-        else:
-            axes.append(np.rint(np.fft.fftfreq(length) * length).astype(np.int64))
-    return axes
-
-
-def _direct_type1(points, strengths, n_modes, isign, mode_order):
-    points = _point_matrix(points)
-    axes = _mode_axes(n_modes, mode_order)
-    output = np.empty(n_modes, dtype=np.complex128)
-    for index in np.ndindex(*n_modes):
-        mode = np.array([axes[axis][position] for axis, position in enumerate(index)])
-        output[index] = np.sum(
-            np.asarray(strengths, dtype=np.complex128)
-            * np.exp(1j * isign * (points @ mode))
-        )
-    return output
-
-
-def _direct_type2(points, coefficients, n_modes, isign, mode_order):
-    points = _point_matrix(points)
-    axes = _mode_axes(n_modes, mode_order)
-    output = np.zeros(points.shape[0], dtype=np.complex128)
-    coefficients = np.asarray(coefficients, dtype=np.complex128)
-    for index in np.ndindex(*n_modes):
-        mode = np.array([axes[axis][position] for axis, position in enumerate(index)])
-        output += coefficients[index] * np.exp(1j * isign * (points @ mode))
-    return output
-
-
-def _direct_type3(source_points, strengths, target_points, isign):
-    source_points = _point_matrix(source_points)
-    target_points = _point_matrix(target_points)
-    phase = target_points @ source_points.T
-    return np.exp(1j * isign * phase) @ np.asarray(strengths, dtype=np.complex128)
-
-
 def _assert_gpu_close(actual, expected):
     scale = max(1.0, float(np.max(np.abs(expected), initial=0.0)))
     np.testing.assert_allclose(actual, expected, rtol=5e-3, atol=5e-3 * scale)
@@ -158,7 +113,7 @@ def test_type1_and_type2_1d_match_direct(context, isign, mode_order):
         context, n_modes, eps=1e-4, isign=isign, mode_order=mode_order
     )
     actual1 = type1.execute(points, strengths)
-    expected1 = _direct_type1(points, strengths, n_modes, isign, mode_order)
+    expected1 = direct_type1(points, strengths, n_modes, isign, mode_order)
     assert actual1.dtype == np.complex64
     assert actual1.shape == n_modes
     _assert_gpu_close(actual1, expected1)
@@ -167,7 +122,7 @@ def test_type1_and_type2_1d_match_direct(context, isign, mode_order):
         context, n_modes, eps=1e-4, isign=isign, mode_order=mode_order
     )
     actual2 = type2.execute(points, coefficients)
-    expected2 = _direct_type2(points, coefficients, n_modes, isign, mode_order)
+    expected2 = direct_type2(points, coefficients, n_modes, isign, mode_order)
     assert actual2.dtype == np.complex64
     assert actual2.shape == (points.size,)
     _assert_gpu_close(actual2, expected2)
@@ -185,7 +140,7 @@ def test_non_square_2d_numpy_axis_order(context):
     type1 = wgpu_nufft.Type1Plan(context, n_modes, eps=1e-4)
     modes = type1.execute(points, strengths)
     assert modes.shape == n_modes
-    _assert_gpu_close(modes, _direct_type1(points, strengths, n_modes, 1, "centered"))
+    _assert_gpu_close(modes, direct_type1(points, strengths, n_modes, 1, "centered"))
 
     coefficients = (
         np.arange(15, dtype=np.float32).reshape(n_modes) / 10
@@ -193,7 +148,7 @@ def test_non_square_2d_numpy_axis_order(context):
     ).astype(np.complex64)
     type2 = wgpu_nufft.Type2Plan(context, n_modes, eps=1e-4)
     values = type2.execute(points, coefficients)
-    _assert_gpu_close(values, _direct_type2(points, coefficients, n_modes, 1, "centered"))
+    _assert_gpu_close(values, direct_type2(points, coefficients, n_modes, 1, "centered"))
 
 
 def test_batched_reuse_and_explicit_batch_axis(context):
@@ -213,7 +168,7 @@ def test_batched_reuse_and_explicit_batch_axis(context):
     for transform in range(3):
         _assert_gpu_close(
             batched[transform],
-            _direct_type1(points, strengths[transform], (6,), 1, "centered"),
+            direct_type1(points, strengths[transform], (6,), 1, "centered"),
         )
 
     single = plan.execute(points, strengths[0])
@@ -241,10 +196,10 @@ def test_same_plan_serializes_concurrent_grow_and_shrink(context):
         small = small_future.result()
 
     _assert_gpu_close(
-        large, _direct_type1(large_points, large_strengths, (8,), 1, "centered")
+        large, direct_type1(large_points, large_strengths, (8,), 1, "centered")
     )
     _assert_gpu_close(
-        small, _direct_type1(small_points, small_strengths, (8,), 1, "centered")
+        small, direct_type1(small_points, small_strengths, (8,), 1, "centered")
     )
     np.testing.assert_array_equal(small, plan.execute(small_points, small_strengths))
 
@@ -266,7 +221,7 @@ def test_type3_batched_matches_direct(context):
     assert actual.shape == (2, 4)
     for transform in range(2):
         _assert_gpu_close(
-            actual[transform], _direct_type3(source, strengths[transform], target, -1)
+            actual[transform], direct_type3(source, strengths[transform], target, -1)
         )
 
 

@@ -1,14 +1,19 @@
 # wgpu-nufft for Python
 
 Python binding of [wgpu-nufft](https://github.com/MaximEremenko/wgpuNUFFT):
-portable GPU nonuniform FFTs for NumPy arrays. It is a native CPython
-extension built with PyO3 and maturin, with no separate C ABI.
+portable GPU and CPU nonuniform FFTs for NumPy arrays. It is a native
+CPython extension built with PyO3 and maturin, with no separate C ABI.
 
-- Reusable type-1, type-2, and type-3 plans in one to five dimensions.
-- `float32` coordinates and `complex64` values.
-- A `Context` holds one GPU device, and plans keep their context, pipelines,
-  and scratch buffers between calls. Each call uploads its NumPy inputs and
-  returns a new NumPy array.
+- Reusable type-1, type-2, and type-3 plans: on the GPU in one to five
+  dimensions, and on the CPU in one to eight.
+- GPU plans take `float32` coordinates and `complex64` values. CPU plans
+  take either those or `float64` coordinates and `complex128` values.
+- A `Context` holds one GPU device, and GPU plans keep their context,
+  pipelines, and scratch buffers between calls. Each call uploads its NumPy
+  inputs and returns a new NumPy array.
+- CPU plans need no GPU. They release the GIL while they work, give
+  bitwise-identical results for any thread count, and prepare a point set
+  once for repeated transforms.
 
 ## Example
 
@@ -44,6 +49,27 @@ targets = rng.uniform(-50.0, 50.0, 200).astype(np.float32)
 spectrum = type3.execute(sources, np.ones(500, np.complex64), targets)  # shape (200,)
 ```
 
+The CPU plans work the same way without a `Context`, in `complex128` unless
+`dtype` says otherwise. `prepare_points` checks and sorts a point set once;
+`execute` then takes the prepared set in place of the point array, with
+results bitwise identical to passing the array:
+
+```python
+import numpy as np
+import wgpu_nufft
+
+rng = np.random.default_rng(0)
+points = rng.uniform(-np.pi, np.pi, (100_000, 2))
+forward = wgpu_nufft.CpuType2Plan((128, 128), eps=1e-9, isign=-1)
+adjoint = wgpu_nufft.CpuType1Plan((128, 128), eps=1e-9, isign=1)
+prepared = forward.prepare_points(points)  # serves both plans
+
+image = np.zeros((128, 128), np.complex128)
+image[64, 64] = 1.0
+for _ in range(10):
+    image = adjoint.execute(prepared, forward.execute(prepared, image))
+```
+
 ## API
 
 | Name | Description |
@@ -52,19 +78,30 @@ spectrum = type3.execute(sources, np.ones(500, np.complex64), targets)  # shape 
 | `Type1Plan(context, n_modes, eps=1e-6, isign=1, mode_order="centered", batch=1)` | `execute(points, strengths)` returns the Fourier modes. |
 | `Type2Plan(context, n_modes, eps=1e-6, isign=1, mode_order="centered", batch=1)` | `execute(points, coefficients)` returns the values at the points. |
 | `Type3Plan(context, source_bounds, target_bounds, eps=1e-6, isign=1, batch=1)` | `execute(source_points, strengths, target_points)` returns the values at the target frequencies. |
+| `CpuType1Plan(n_modes, eps=1e-6, isign=1, mode_order="centered", batch=1, dtype=None, threads=None)` | `execute(points, strengths)` returns the Fourier modes; `points` may be a `CpuPoints` from `prepare_points(points)`. |
+| `CpuType2Plan(n_modes, eps=1e-6, isign=1, mode_order="centered", batch=1, dtype=None, threads=None)` | `execute(points, coefficients)` returns the values at the points; `points` may be a `CpuPoints`. |
+| `CpuType3Plan(source_bounds, target_bounds, eps=1e-6, isign=1, batch=1, dtype=None, threads=None)` | `execute(source_points, strengths, target_points)` returns the values at the target frequencies. `prepare_points(source_points, target_points)` returns a `CpuType3Points`, then `execute(prepared, strengths)`. |
 | `WgpuNufftError` | Raised when the GPU fails or cannot run a plan; a subclass of `RuntimeError`. |
 
 `isign` must be `1` or `-1`, and `mode_order` is `"centered"` or `"fft"`.
-Invalid arguments, shapes, and coordinates raise `ValueError`. Plans can be
-shared between threads; calls on one plan run one at a time.
+A CPU plan's `dtype` is `complex64` or `complex128` (the default), in any
+form `numpy.dtype` accepts, and `threads` defaults to every core. A
+`CpuPoints` set serves every CPU type-1 and type-2 plan with the same modes,
+`eps`, and `dtype`; a `CpuType3Points` set serves every CPU type-3 plan with
+the same bounds, `eps`, `isign`, and `dtype`. Invalid arguments, shapes, and
+coordinates raise `ValueError`, and arrays of the wrong dtype `TypeError`.
+Plans can be shared between threads. Calls on one GPU plan run one at a
+time; calls on one CPU plan run concurrently.
 
 ## Arrays
 
-- Points are C-contiguous `float32` arrays shaped `(M, d)`; a 1D plan also
-  accepts `(M,)`. Type-1 and type-2 coordinates must be finite and lie in
-  `[-3*pi, 3*pi]`, which the binding checks before uploading them.
-- Values are C-contiguous `complex64` arrays shaped `(M,)` for one transform
-  or `(B, M)` for a batch of `B` transforms.
+- GPU points are C-contiguous `float32` arrays shaped `(M, d)`; a 1D plan
+  also accepts `(M,)`. CPU points have the same shapes and the plan's real
+  dtype, `float32` or `float64`, in any memory order. Type-1 and type-2
+  coordinates must be finite and lie in `[-3*pi, 3*pi]`, which both check.
+- Values are `complex64` arrays (or `complex128` for CPU plans) shaped
+  `(M,)` for one transform or `(B, M)` for a batch of `B` transforms. GPU
+  plans need them C-contiguous.
 - Type-1 output and type-2 input have the shape `(*n_modes)` for one
   transform and `(B, *n_modes)` for a batch.
 - Type-3 bounds are `float64` arrays shaped `(d, 2)` with one
@@ -74,6 +111,8 @@ shared between threads; calls on one plan run one at a time.
 A plan created with `batch=B` executes any batch of 1 to `B` transforms. The
 binding converts between NumPy's C order and the dimension-zero-fast storage
 of the Rust core, so multidimensional arrays keep their natural NumPy layout.
+CPU plans read C-contiguous inputs in place, so do not modify an input array
+from another thread while a call on it runs.
 
 ## Building
 
@@ -90,6 +129,8 @@ cargo test -p wgpu-nufft-python --locked
 maturin develop --release --manifest-path python\Cargo.toml
 python -m pytest python\tests -q
 ```
+
+`python\tests\test_cpu.py` needs no GPU; the other tests open one.
 
 To build a wheel:
 

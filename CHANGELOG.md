@@ -24,6 +24,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   transforms about twice as fast.
 - `NufftError::PointSetMismatch` for a prepared point set passed to a plan
   it does not fit.
+- Python: `CpuType1Plan`, `CpuType2Plan`, and `CpuType3Plan` run the CPU
+  plans on NumPy arrays without a GPU, in `complex64` or `complex128`
+  (`dtype`, `complex128` by default), with a `threads` option. They read
+  contiguous inputs in place, release the GIL, and run concurrently on one
+  plan. `prepare_points` returns a `CpuPoints` or `CpuType3Points` set that
+  `execute` takes in place of the point arrays. CI runs their tests.
 
 ### Changed
 

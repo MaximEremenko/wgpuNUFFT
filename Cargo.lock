@@ -1429,6 +1429,7 @@ name = "wgpu-nufft-python"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "num-complex",
  "numpy",
  "pollster",
  "pyo3",
