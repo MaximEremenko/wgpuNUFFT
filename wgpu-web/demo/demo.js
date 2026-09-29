@@ -1,25 +1,39 @@
-import initWasm, {
-  WebFftDirection,
-  WebFftNormalization,
-  WebFftPrecision,
-  WebNufftModeOrder,
-  WgpuFft,
-} from "../pkg/wgpu_web.js";
+"use strict";
 
+// A classic script over the standalone build (../dist/wgpu_web.js), so the
+// page also works when opened from disk.
 const output = document.querySelector("#output");
+const CACHE_KEY = "wgpu-fft.pipeline-cache.v1";
 let contextPromise;
 
 async function context() {
   if (!contextPromise) {
     contextPromise = (async () => {
-      await initWasm();
+      const { WgpuFft } = await wgpuWeb.load();
       const fft = await WgpuFft.init();
-      const cached = localStorage.getItem("wgpu-fft.pipeline-cache.v1");
+      const cached = readCache();
       if (cached) await fft.importSnapshot(cached);
       return fft;
     })();
   }
   return contextPromise;
+}
+
+// Storage can be unavailable, for example for some file:// pages.
+function readCache() {
+  try {
+    return localStorage.getItem(CACHE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(snapshot) {
+  try {
+    localStorage.setItem(CACHE_KEY, snapshot);
+  } catch {
+    // The cache only speeds up the next visit.
+  }
 }
 
 function asF32(bytes) {
@@ -49,6 +63,7 @@ function describeContext(fft) {
 document.querySelector("#runFft").addEventListener("click", async () => {
   try {
     output.textContent = "Loading WebAssembly and WebGPU...";
+    const { WebFftDirection, WebFftNormalization, WebFftPrecision } = await wgpuWeb.load();
     const fft = await context();
     const plan = await fft.createPlan(
       4,
@@ -60,7 +75,7 @@ document.querySelector("#runFft").addEventListener("click", async () => {
     const gpuInput = fft.upload(new Float32Array([1, 0, 2, 0, 3, 0, 4, 0]));
     const gpuOutput = fft.createBuffer(plan.outputBytes);
     await plan.execute(gpuInput, gpuOutput);
-    localStorage.setItem("wgpu-fft.pipeline-cache.v1", fft.exportSnapshot());
+    writeCache(fft.exportSnapshot());
     output.textContent = JSON.stringify(
       { ...describeContext(fft), transform: "C2C", route: plan.route,
         output: Array.from(asF32(await fft.download(gpuOutput))) },
@@ -75,6 +90,7 @@ document.querySelector("#runFft").addEventListener("click", async () => {
 document.querySelector("#runNufft").addEventListener("click", async () => {
   try {
     output.textContent = "Planning a browser GPU NUFFT...";
+    const { WebFftPrecision, WebNufftModeOrder } = await wgpuWeb.load();
     const fft = await context();
     const plan = await fft.createNufftType1Plan(
       new Uint32Array([8]),

@@ -4,32 +4,55 @@ JavaScript bindings of `wgpu-fft` and `wgpu-nufft` for the browser, built
 with `wasm-bindgen` on WebGPU. Plans, inputs, and outputs stay on the GPU
 until an explicit `download`.
 
-## Build and demo
+## Demo
 
-From the `wgpuNUFFT` repository root:
+Open `demo/index.html` in a browser with WebGPU, straight from disk or from
+any web server. It loads `dist/wgpu_web.js`, a standalone build with the
+WebAssembly module embedded in a classic script, so it needs neither a server
+nor a build step.
 
-```bash
-wasm-pack build wgpu-web --target web --out-dir pkg
-python -m http.server 8000 --directory wgpu-web
-```
+## Loading wgpu-web
 
-Then open <http://localhost:8000/demo/> in a browser with WebGPU. Opening
-`demo/index.html` from disk does not work, because browsers load neither
-JavaScript modules nor WebAssembly from `file://` URLs. The generated `pkg/`
-directory is not checked in.
+There are two builds:
 
-Without `wasm-pack`, `wasm-bindgen-cli` builds the same package. Its version
-must match the `wasm-bindgen` crate in `Cargo.lock`, currently 0.2.129
-(`cargo install wasm-bindgen-cli --version 0.2.129 --locked`):
+- `dist/wgpu_web.js`, checked in: one classic script that defines `wgpuWeb`.
+  It works in any page, including pages opened from disk:
 
-```bash
-cargo build -p wgpu-web --target wasm32-unknown-unknown --release
-wasm-bindgen --target web --out-dir wgpu-web/pkg target/wasm32-unknown-unknown/release/wgpu_web.wasm
-```
+  ```html
+  <script src="wgpu_web.js"></script>
+  <script>
+    wgpuWeb.load().then(async ({ WgpuFft }) => {
+      const gpu = await WgpuFft.init();
+      // ...
+    });
+  </script>
+  ```
+
+  `python wgpu-web/build_standalone.py` rebuilds it. The script needs
+  `wasm-bindgen-cli` in the version of the `wasm-bindgen` crate in
+  `Cargo.lock`, currently 0.2.129
+  (`cargo install wasm-bindgen-cli --version 0.2.129 --locked`);
+  `--wasm-bindgen PATH` picks another binary.
+- ES modules in `pkg/`, not checked in, for bundlers and module pages.
+  Browsers load modules and `.wasm` files over HTTP only, not from disk.
+  From the repository root:
+
+  ```bash
+  wasm-pack build wgpu-web --target web --out-dir pkg
+  ```
+
+  or, without `wasm-pack`:
+
+  ```bash
+  cargo build -p wgpu-web --target wasm32-unknown-unknown --release
+  wasm-bindgen --target web --out-dir wgpu-web/pkg target/wasm32-unknown-unknown/release/wgpu_web.wasm
+  ```
 
 ## Example
 
-A 1D type-1 transform of 1,000 points onto 64 Fourier modes:
+A 1D type-1 transform of 1,000 points onto 64 Fourier modes, with the ES
+modules. With the standalone build, `await wgpuWeb.load()` takes the place of
+the `import` and of `await init()`, and returns the same names:
 
 ```js
 import init, { WebFftPrecision, WebNufftModeOrder, WgpuFft } from "./pkg/wgpu_web.js";

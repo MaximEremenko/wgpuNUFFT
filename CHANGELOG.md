@@ -6,6 +6,14 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `wgpu-web/dist/wgpu_web.js`: a standalone browser build, one classic
+  script with the WebAssembly module embedded, loaded with
+  `wgpuWeb.load()`. It works in pages opened from disk, so the demo now
+  opens without a server or a build step. `wgpu-web/build_standalone.py`
+  rebuilds it.
+
 ## [0.2.0] - 2026-09-28
 
 A CPU backend for all three transform types, in Rust and Python, with point
