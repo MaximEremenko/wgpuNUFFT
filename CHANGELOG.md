@@ -25,6 +25,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `NufftError::PointSetMismatch` for a prepared point set passed to a plan
   it does not fit.
 
+### Changed
+
+- CPU spreading and interpolation run in steps of 6 and 12 cells for kernel
+  widths 5-6 and 9-12 (tolerances near `1e-5` and `1e-8` to `1e-11`), where
+  they used steps of 8 and 16.
+
 ## [0.1.0] - 2026-09-28
 
 First tagged release of `wgpu-nufft`, its Python binding, and the `wgpu-web`

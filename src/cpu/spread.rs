@@ -1,8 +1,8 @@
 //! Type-1 spreading onto the fine grid and type-2 interpolation from it.
 //!
 //! Both work on runs of `RUN` complex cells along axis zero, where `RUN` is
-//! the kernel width rounded up to 4, 8, or 16 and the extra weights are
-//! zero. Fixed-length runs vectorize and keep interpolation sums in
+//! the kernel width rounded up to 4, 6, 8, 12, or 16 and the extra weights
+//! are zero. Fixed-length runs vectorize and keep interpolation sums in
 //! registers; a run that would wrap around the end of a row takes a slower
 //! cell-by-cell path.
 

@@ -608,7 +608,9 @@ impl CpuNufftType3Plan {
     ) -> Result<()> {
         match self.kernel.width() {
             0..=4 => self.run_with::<T, D, 4>(engine, points, strengths, output),
-            5..=8 => self.run_with::<T, D, 8>(engine, points, strengths, output),
+            5..=6 => self.run_with::<T, D, 6>(engine, points, strengths, output),
+            7..=8 => self.run_with::<T, D, 8>(engine, points, strengths, output),
+            9..=12 => self.run_with::<T, D, 12>(engine, points, strengths, output),
             _ => self.run_with::<T, D, 16>(engine, points, strengths, output),
         }
     }

@@ -2,7 +2,7 @@
 //! preparation, and executions on prepared points.
 //!
 //! ```text
-//! cargo bench --bench nufft_cpu_bench -- [--threads N] [--runs N] [--f64] [--only TEXT]
+//! cargo bench --bench nufft_cpu_bench -- [--threads N] [--runs N] [--f64] [--eps E] [--only TEXT]
 //! ```
 
 use std::f64::consts::PI;
@@ -16,6 +16,7 @@ struct Options {
     threads: Option<usize>,
     runs: usize,
     precision: FftPrecision,
+    eps: f64,
     /// Runs only the cases whose label contains this text.
     only: Option<String>,
 }
@@ -63,7 +64,7 @@ fn main() {
             if !options.runs_case(&format!("{kind} modes={shape:?}")) {
                 continue;
             }
-            let config = NufftConfig::new(shape, 1.0e-6).with_precision(options.precision);
+            let config = NufftConfig::new(shape, options.eps).with_precision(options.precision);
             let plan = match kind {
                 "type1" => CpuNufftPlan::type1(config),
                 _ => CpuNufftPlan::type2(config),
@@ -75,8 +76,9 @@ fn main() {
             };
             let timings = time_plan(&plan, point_count, options.runs);
             println!(
-                "CPU_NUFFT {kind} modes={shape:?} points={point_count} {:?} threads={} {}",
+                "CPU_NUFFT {kind} modes={shape:?} points={point_count} {:?} eps={:e} threads={} {}",
                 options.precision,
+                options.eps,
                 plan.threads(),
                 timings.report(point_count),
             );
@@ -95,7 +97,7 @@ fn main() {
         let config = NufftType3Config::new(
             vec![NufftInterval::new(-PI, PI); dimensions],
             vec![NufftInterval::new(-half_band, half_band); dimensions],
-            1.0e-6,
+            options.eps,
         )
         .with_precision(options.precision);
         let plan = CpuNufftType3Plan::new(config).expect("type-3 plan");
@@ -105,9 +107,10 @@ fn main() {
         };
         let timings = time_type3(&plan, point_count, half_band, options.runs);
         println!(
-            "CPU_NUFFT type3 dims={dimensions} band={half_band} sources=targets={point_count} outer={:?} {:?} threads={} {}",
+            "CPU_NUFFT type3 dims={dimensions} band={half_band} sources=targets={point_count} outer={:?} {:?} eps={:e} threads={} {}",
             plan.outer_grid_shape(),
             options.precision,
+            options.eps,
             plan.threads(),
             timings.report(point_count),
         );
@@ -250,6 +253,7 @@ fn parse_options() -> Options {
         threads: None,
         runs: 3,
         precision: FftPrecision::F32,
+        eps: 1.0e-6,
         only: None,
     };
     // Cargo passes `--bench` to harness-free benchmarks.
@@ -266,9 +270,15 @@ fn parse_options() -> Options {
             }
             "--f64" => options.precision = FftPrecision::F64,
             "--only" => options.only = arguments.next(),
+            "--eps" => {
+                options.eps = arguments
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .expect("--eps takes a tolerance");
+            }
             "--help" | "-h" => {
                 println!(
-                    "usage: cargo bench --bench nufft_cpu_bench -- [--threads N] [--runs N] [--f64] [--only TEXT]"
+                    "usage: cargo bench --bench nufft_cpu_bench -- [--threads N] [--runs N] [--f64] [--eps E] [--only TEXT]"
                 );
                 std::process::exit(0);
             }

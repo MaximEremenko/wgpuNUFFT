@@ -712,12 +712,14 @@ struct Job<'a, T, P> {
 }
 
 impl<T: Real, P: Coordinate> Job<'_, T, P> {
-    /// Runs with axis-zero runs of the kernel width rounded up to 4, 8, or
-    /// 16 cells.
+    /// Runs with axis-zero runs of the kernel width rounded up to 4, 6, 8,
+    /// 12, or 16 cells.
     fn run<const D: usize>(&self, output: &mut [T]) -> Result<()> {
         match self.plan.kernel.width() {
             0..=4 => self.run_with::<D, 4>(output),
-            5..=8 => self.run_with::<D, 8>(output),
+            5..=6 => self.run_with::<D, 6>(output),
+            7..=8 => self.run_with::<D, 8>(output),
+            9..=12 => self.run_with::<D, 12>(output),
             _ => self.run_with::<D, 16>(output),
         }
     }
