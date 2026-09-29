@@ -26,6 +26,8 @@ struct Runtime {
     queue: wgpu::Queue,
     adapter_name: String,
     adapter_vendor: u32,
+    adapter_vendor_name: String,
+    adapter_architecture: String,
     adapter_device: u32,
     adapter_device_type: String,
     adapter_driver: String,
@@ -57,6 +59,54 @@ impl Drop for WgpuFftBuffer {
 extern "C" {
     #[wasm_bindgen(js_namespace = console, js_name = error)]
     fn console_error(message: &str);
+}
+
+/// The browser's `GPUAdapterInfo` vendor and architecture, which wgpu does
+/// not keep: its adapter name is only the description, which browsers
+/// usually withhold.
+#[derive(Default)]
+struct BrowserAdapterInfo {
+    vendor: String,
+    architecture: String,
+}
+
+/// Asks the browser for the adapter that `initialize` requests, with the same
+/// options, and reads its info. Empty when the browser does not say.
+#[cfg(target_arch = "wasm32")]
+async fn browser_adapter_info(force_fallback: bool) -> BrowserAdapterInfo {
+    async fn query(force_fallback: bool) -> Result<BrowserAdapterInfo, JsValue> {
+        let get =
+            |target: &JsValue, key: &str| js_sys::Reflect::get(target, &JsValue::from_str(key));
+        let gpu = get(&get(&js_sys::global(), "navigator")?, "gpu")?;
+        let request_adapter = get(&gpu, "requestAdapter")?.dyn_into::<js_sys::Function>()?;
+        let options = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &options,
+            &"powerPreference".into(),
+            &"high-performance".into(),
+        )?;
+        js_sys::Reflect::set(
+            &options,
+            &"forceFallbackAdapter".into(),
+            &JsValue::from_bool(force_fallback),
+        )?;
+        let request = request_adapter
+            .call1(&gpu, &options.into())?
+            .dyn_into::<js_sys::Promise>()?;
+        let adapter = wasm_bindgen_futures::JsFuture::from(request).await?;
+        let info = get(&adapter, "info")?;
+        let text = |key| get(&info, key).map(|value| value.as_string().unwrap_or_default());
+        Ok(BrowserAdapterInfo {
+            vendor: text("vendor")?,
+            architecture: text("architecture")?,
+        })
+    }
+    query(force_fallback).await.unwrap_or_default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn browser_adapter_info(_force_fallback: bool) -> BrowserAdapterInfo {
+    BrowserAdapterInfo::default()
 }
 
 /// Sends Rust panic messages to `console.error`; the browser otherwise reports
@@ -178,6 +228,21 @@ async fn initialize(
         .await
         .map_err(|error| js_error(format!("WebGPU adapter request failed: {error}")))?;
     let info = adapter.get_info();
+    let browser_info = browser_adapter_info(force_fallback).await;
+    // Browsers usually withhold the description that wgpu names the adapter
+    // by; the vendor and architecture still say which GPU runs the plans.
+    let adapter_name = if info.name.is_empty() {
+        [
+            browser_info.vendor.as_str(),
+            browser_info.architecture.as_str(),
+        ]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+    } else {
+        info.name
+    };
     let default_descriptor = || wgpu::DeviceDescriptor {
         label: Some("wgpu_web.default_device"),
         required_features: wgpu::Features::empty(),
@@ -238,8 +303,10 @@ async fn initialize(
             _instance: instance,
             device,
             queue,
-            adapter_name: info.name,
+            adapter_name,
             adapter_vendor: info.vendor,
+            adapter_vendor_name: browser_info.vendor,
+            adapter_architecture: browser_info.architecture,
             adapter_device: info.device,
             adapter_device_type: format!("{:?}", info.device_type),
             adapter_driver: info.driver,
@@ -277,15 +344,29 @@ impl WgpuFft {
         initialize(false, false).await
     }
 
-    /// Adapter name reported by the browser.
+    /// The adapter's description as the browser reports it or, as browsers
+    /// usually withhold it, its vendor and architecture.
     #[wasm_bindgen(getter, js_name = adapterName)]
     pub fn adapter_name(&self) -> String {
         self.runtime.adapter_name.clone()
     }
 
+    /// PCI vendor ID; browsers report 0.
     #[wasm_bindgen(getter, js_name = adapterVendor)]
     pub fn adapter_vendor(&self) -> u32 {
         self.runtime.adapter_vendor
+    }
+
+    /// The adapter's vendor as the browser names it, or empty.
+    #[wasm_bindgen(getter, js_name = adapterVendorName)]
+    pub fn adapter_vendor_name(&self) -> String {
+        self.runtime.adapter_vendor_name.clone()
+    }
+
+    /// The adapter's GPU architecture as the browser names it, or empty.
+    #[wasm_bindgen(getter, js_name = adapterArchitecture)]
+    pub fn adapter_architecture(&self) -> String {
+        self.runtime.adapter_architecture.clone()
     }
 
     #[wasm_bindgen(getter, js_name = adapterDevice)]

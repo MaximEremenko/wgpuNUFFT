@@ -6,14 +6,33 @@ const output = document.querySelector("#output");
 const CACHE_KEY = "wgpu-fft.pipeline-cache.v1";
 let contextPromise;
 
+const accelerator = document.querySelector("#accelerator");
+
 // The build is not checked in; say how to get it.
 if (typeof wgpuWeb === "undefined") {
   for (const button of document.querySelectorAll("button")) button.disabled = true;
+  accelerator.textContent = "Accelerator: unknown";
   output.textContent =
     "wgpu-web/dist/wgpu_web.js is missing. Build it from the repository root with\n\n" +
     "  python wgpu-web/build_standalone.py\n\n" +
     "or download wgpu_web.js from a release (or from the wgpu_web artifact of a CI run)\n" +
     "into wgpu-web/dist/, then reload this page.";
+} else {
+  // Open WebGPU at once to name the GPU the transforms run on.
+  context().then(
+    (fft) => {
+      const name = fft.adapterName || "not reported by the browser";
+      // Chrome withholds the model name unless its WebGPU developer features
+      // are enabled; wgpu-web then names the vendor and architecture.
+      const generic = name === [fft.adapterVendorName, fft.adapterArchitecture].join(" ");
+      accelerator.textContent =
+        `Accelerator: ${name} (${fft.backend})` +
+        (generic ? ". For the model name, enable chrome://flags/#enable-webgpu-developer-features" : "");
+    },
+    (error) => {
+      accelerator.textContent = `Accelerator: unavailable (${error?.message ?? error})`;
+    },
+  );
 }
 
 async function context() {
@@ -57,6 +76,8 @@ function asF32(bytes) {
 function describeContext(fft) {
   return {
     adapter: fft.adapterName,
+    vendor: fft.adapterVendorName,
+    architecture: fft.adapterArchitecture,
     backend: fft.backend,
     limits: {
       maxBufferSize: fft.maxBufferSize,

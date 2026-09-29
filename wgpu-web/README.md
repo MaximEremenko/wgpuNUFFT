@@ -102,6 +102,7 @@ for (const object of [points, input, output, plan, gpu]) object.free();
 | `createNufftType1Plan(nModes, pointCount, batch, eps, isign, modeOrder, sigma, precision)` | A type-1 plan; `execute(points, strengths, output, activeBatch)`. |
 | `createNufftType2Plan(nModes, pointCount, batch, eps, isign, modeOrder, sigma, precision)` | A type-2 plan; `execute(points, coefficients, output, activeBatch)`. |
 | `createNufftType3Plan(sourceBounds, targetBounds, sourceCount, targetCount, batch, eps, isign, sigma, precision)` | A type-3 plan; `execute(sources, strengths, targets, output, activeBatch)`. |
+| `adapterName`, `adapterVendorName`, `adapterArchitecture`, `backend` | Describe the GPU. Browsers usually withhold the model name (Chrome reports it with `chrome://flags/#enable-webgpu-developer-features`), and `adapterName` then falls back to the vendor and architecture. |
 | `upload(Float32Array)`, `uploadDf64(Float64Array)`, `createBuffer(byteLength)` | Create GPU buffers. |
 | `download(buffer)` | Resolves to the buffer's bytes as a `Uint8Array`. |
 | `exportSnapshot()`, `importSnapshot(json)` | Save the pipeline cache (validated shader sources and pipeline keys) as JSON, and prewarm a new context from it; the demo keeps it in `localStorage`. |

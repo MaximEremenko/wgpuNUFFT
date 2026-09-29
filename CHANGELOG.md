@@ -13,6 +13,9 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   embedded, loaded with `wgpuWeb.load()`. It works in pages opened from
   disk, so the demo opens without a server. CI builds it on every push and
   attaches it to releases; it is not checked in.
+- wgpu-web: `adapterVendorName` and `adapterArchitecture` report the
+  browser's names for the GPU, and `adapterName`, which browsers usually
+  leave empty, falls back to them. The demo shows the accelerator on load.
 
 ## [0.2.0] - 2026-09-28
 
