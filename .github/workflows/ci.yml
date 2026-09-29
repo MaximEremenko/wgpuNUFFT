@@ -71,6 +71,40 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --locked -p wgpu-nufft -p wgpu-web --target wasm32-unknown-unknown --all-targets
 
+  # The standalone browser build is not checked in: every run uploads it as
+  # the wgpu_web artifact, and a v* tag attaches it to the tag's release.
+  browser:
+    name: Browser build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-bindgen-cli
+        # The CLI must match the wasm-bindgen crate in Cargo.lock.
+        run: |
+          version=$(sed -n '/^name = "wasm-bindgen"$/{n;s/^version = "\(.*\)"$/\1/p;}' Cargo.lock)
+          cargo install wasm-bindgen-cli --version "$version" --locked
+      - run: python3 wgpu-web/build_standalone.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wgpu_web
+          path: wgpu-web/dist/wgpu_web.js
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag --title "$GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" wgpu-web/dist/wgpu_web.js --clobber
+
   docs:
     name: Documentation
     runs-on: ubuntu-latest

@@ -6,17 +6,20 @@ until an explicit `download`.
 
 ## Demo
 
-Open `demo/index.html` in a browser with WebGPU, straight from disk or from
-any web server. It loads `dist/wgpu_web.js`, a standalone build with the
-WebAssembly module embedded in a classic script, so it needs neither a server
-nor a build step.
+`demo/index.html` loads `dist/wgpu_web.js`, a standalone build with the
+WebAssembly module embedded in a classic script, so it opens in a browser
+with WebGPU straight from disk or from any web server. The file is not
+checked in: build it with `python wgpu-web/build_standalone.py`, or download
+`wgpu_web.js` from a
+[release](https://github.com/MaximEremenko/wgpuNUFFT/releases) or from the
+`wgpu_web` artifact of a CI run into `wgpu-web/dist/`.
 
 ## Loading wgpu-web
 
 There are two builds:
 
-- `dist/wgpu_web.js`, checked in: one classic script that defines `wgpuWeb`.
-  It works in any page, including pages opened from disk:
+- `dist/wgpu_web.js`: one classic script that defines `wgpuWeb`. It works in
+  any page, including pages opened from disk:
 
   ```html
   <script src="wgpu_web.js"></script>
@@ -28,14 +31,14 @@ There are two builds:
   </script>
   ```
 
-  `python wgpu-web/build_standalone.py` rebuilds it. The script needs
+  `python wgpu-web/build_standalone.py` builds it. The script needs
   `wasm-bindgen-cli` in the version of the `wasm-bindgen` crate in
   `Cargo.lock`, currently 0.2.129
   (`cargo install wasm-bindgen-cli --version 0.2.129 --locked`);
-  `--wasm-bindgen PATH` picks another binary.
-- ES modules in `pkg/`, not checked in, for bundlers and module pages.
-  Browsers load modules and `.wasm` files over HTTP only, not from disk.
-  From the repository root:
+  `--wasm-bindgen PATH` picks another binary. CI builds it on every push, as
+  the `wgpu_web` artifact of the run, and attaches it to every release.
+- ES modules in `pkg/`, for bundlers and module pages. Browsers load modules
+  and `.wasm` files over HTTP only, not from disk. From the repository root:
 
   ```bash
   wasm-pack build wgpu-web --target web --out-dir pkg

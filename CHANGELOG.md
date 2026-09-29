@@ -8,11 +8,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `wgpu-web/dist/wgpu_web.js`: a standalone browser build, one classic
-  script with the WebAssembly module embedded, loaded with
-  `wgpuWeb.load()`. It works in pages opened from disk, so the demo now
-  opens without a server or a build step. `wgpu-web/build_standalone.py`
-  rebuilds it.
+- `wgpu-web/build_standalone.py` builds `wgpu-web/dist/wgpu_web.js`, a
+  standalone browser build: one classic script with the WebAssembly module
+  embedded, loaded with `wgpuWeb.load()`. It works in pages opened from
+  disk, so the demo opens without a server. CI builds it on every push and
+  attaches it to releases; it is not checked in.
 
 ## [0.2.0] - 2026-09-28
 

@@ -6,6 +6,16 @@ const output = document.querySelector("#output");
 const CACHE_KEY = "wgpu-fft.pipeline-cache.v1";
 let contextPromise;
 
+// The build is not checked in; say how to get it.
+if (typeof wgpuWeb === "undefined") {
+  for (const button of document.querySelectorAll("button")) button.disabled = true;
+  output.textContent =
+    "wgpu-web/dist/wgpu_web.js is missing. Build it from the repository root with\n\n" +
+    "  python wgpu-web/build_standalone.py\n\n" +
+    "or download wgpu_web.js from a release (or from the wgpu_web artifact of a CI run)\n" +
+    "into wgpu-web/dist/, then reload this page.";
+}
+
 async function context() {
   if (!contextPromise) {
     contextPromise = (async () => {
