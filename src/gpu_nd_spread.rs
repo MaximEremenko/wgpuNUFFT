@@ -44,7 +44,7 @@ use crate::kernel::EsKernel;
 const MAX_BLOCK_EDGE: usize = 16;
 /// Bin rows gathered and scanned at a time.
 const MAX_ROW_BATCH: usize = 128;
-/// Records staged in workgroup memory at a time.
+/// Records staged in workgroup memory at a time, at most.
 const MAX_CHUNK: usize = 64;
 /// Bin rows a block's reach may span.
 const MAX_ROWS: usize = 1 << 20;
@@ -160,13 +160,15 @@ impl NdSpreadLayout {
         block[0] = run * groups_0;
         let workgroup_size = groups_0 * block[1..].iter().product::<usize>();
 
+        // Finer bins stage fewer records outside a block's reach; the small
+        // two-dimensional F32 blocks gain from the finest.
+        let fine_bins = dimensions == 2 && precision == FftPrecision::F32;
         let mut bin_side = (0..dimensions)
-            .map(|axis| {
-                if axis == 0 {
-                    2
-                } else {
-                    block[axis].clamp(2, 4)
-                }
+            .map(|axis| match (axis, fine_bins) {
+                (0, true) => 1,
+                (0, false) => 2,
+                (_, true) => block[axis].clamp(1, 2),
+                (_, false) => block[axis].clamp(2, 4),
             })
             .collect::<Vec<_>>();
         let reach_cells = |axis: usize| block[axis] + width + 2;
@@ -212,7 +214,7 @@ impl NdSpreadLayout {
         let chunk_bytes =
             4 * dimensions + types.complex_bytes() + dimensions * width * types.weight_bytes();
         let row_bytes = 4 * 4 * row_batch;
-        let chunk = (0..=MAX_CHUNK.trailing_zeros())
+        let chunk = (0..=max_chunk(dimensions, precision).trailing_zeros())
             .rev()
             .map(|shift| 1usize << shift)
             .find(|&chunk| row_bytes + chunk * chunk_bytes <= storage_limit)
@@ -370,6 +372,17 @@ fn max_run(dimensions: usize, precision: FftPrecision) -> usize {
         (2, _) => 4,
         (3, _) | (_, FftPrecision::F64 | FftPrecision::Df64) => 8,
         _ => 16,
+    }
+}
+
+/// Records staged at a time. Two-dimensional `F32` and `Df64` blocks gain
+/// from shorter chunks, which leave more workgroups resident; the others,
+/// native `F64` especially, share each chunk's weight evaluation better when
+/// it is long. Chosen by measurement.
+fn max_chunk(dimensions: usize, precision: FftPrecision) -> usize {
+    match (dimensions, precision) {
+        (2, FftPrecision::F32 | FftPrecision::Df64) => MAX_CHUNK / 2,
+        _ => MAX_CHUNK,
     }
 }
 
