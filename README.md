@@ -20,8 +20,8 @@ from [wgpu-fft](https://github.com/MaximEremenko/wgpuFFT), pinned here as the
   frequencies).
 - **One to eight dimensions on the GPU**, in all three precisions: type 1
   spreads through one rank-generic spreader in every rank, and type 2
-  interpolates through tuned 1D, 2D, and 3D paths and a rank-generic path
-  for 4D to 8D.
+  interpolates `F32` through tuned 1D, 2D, and 3D paths and every other
+  precision and rank through a rank-generic path.
   The direct `f64` reference transforms cover eight dimensions too. See
   [Higher dimensions](#higher-dimensions) for what is practical where.
 - **Three precisions**: `f32`, native `f64` (devices with `SHADER_F64`), and
@@ -345,13 +345,16 @@ in registers, while the workgroup streams the points whose support reaches
 the block through workgroup memory and evaluates their kernel weights once
 for all invocations. The bins over a block and the kernel width below it
 hold exactly those points; they are single cells along the axes above
-zero unless a block's reach would span too many of them. Blocks with too many points in reach are split into parts
-added in a fixed order: a plan pass sizes the parts from the points listed
+zero unless a block's reach would span too many of them. Blocks with too
+many points in reach are split into parts added in a fixed order: a plan pass sizes the parts from the points listed
 in every crowded block's reach, with an exact sum that does not depend on
 the order in which the blocks were listed. Workgroup sizes and run lengths
 are chosen per rank and precision. Type 2 scatters the deconvolved modes
 onto the fine grid and interpolates the binned points with one lane per
-axis-zero support offset, adding the lanes in lane order. Executions whose
+axis-zero support offset, adding the lanes in lane order; the lanes of an
+`F64` or `Df64` point compute its kernel weights once, in workgroup memory,
+and this path also serves `F64` and `Df64` type-2 plans in one to three
+dimensions. Executions whose
 work would be large are recorded as several dispatches of bounded work,
 which keeps the operating system's GPU watchdog from firing on devices
 that preempt only between dispatches.

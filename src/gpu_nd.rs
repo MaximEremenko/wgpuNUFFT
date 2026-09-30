@@ -211,11 +211,17 @@ impl Type2GpuPlanNd {
             "wgpu_nufft.type2_nd.mode_scatter",
             &generate_mode_scatter_wgsl(config, fine_shape, precision),
         );
-        let lanes = interpolation_lanes(kernel.width());
+        let lanes = interpolation_lanes(kernel.width(), precision);
         let interpolation_pipeline = crate::gpu_type1_3d::create_compute_pipeline(
             device,
             "wgpu_nufft.type2_nd.interpolation",
-            &generate_interpolation_wgsl(kernel, fine_shape, precision),
+            &generate_interpolation_wgsl(
+                kernel,
+                fine_shape,
+                precision,
+                precision != FftPrecision::F32
+                    && shared_weights_fit(kernel, dimensions, precision, &limits),
+            ),
         );
 
         Ok(Self {
@@ -575,10 +581,32 @@ fn type2_bin_shape(fine_shape: &[usize]) -> Vec<usize> {
     sides
 }
 
-/// Lanes per point: one per axis-zero support offset, rounded up to a power
-/// of two.
-fn interpolation_lanes(width: usize) -> usize {
-    width.next_power_of_two()
+/// Lanes per point: one per axis-zero support offset. `F32` rounds them up
+/// to a power of two, which keeps its cheap points aligned to warps; the
+/// wider `F64` and `Df64` kernels would leave a third of their lanes idle.
+fn interpolation_lanes(width: usize, precision: FftPrecision) -> usize {
+    match precision {
+        FftPrecision::F32 => width.next_power_of_two(),
+        FftPrecision::F64 | FftPrecision::Df64 => width,
+    }
+}
+
+/// Whether the weight table of a workgroup's points fits workgroup memory
+/// next to the lane sums. The lanes of a point then compute its weights once
+/// instead of every lane computing all of them; F64 and Df64 plans use it,
+/// while cheap F32 weights measured faster without the extra barrier.
+fn shared_weights_fit(
+    kernel: EsKernel,
+    dimensions: usize,
+    precision: FftPrecision,
+    limits: &wgpu::Limits,
+) -> bool {
+    let types = NdWgsl::new(precision);
+    let width = kernel.width();
+    let points = INTERPOLATION_WORKGROUP_SIZE as usize / interpolation_lanes(width, precision);
+    let bytes = points * dimensions * width * types.weight_bytes()
+        + INTERPOLATION_WORKGROUP_SIZE as usize * types.complex_bytes();
+    bytes <= limits.max_compute_workgroup_storage_size as usize
 }
 
 /// Deconvolves and scatters every active mode onto the cleared fine grid:
@@ -678,12 +706,14 @@ fn generate_interpolation_wgsl(
     kernel: EsKernel,
     fine_shape: &[usize],
     precision: FftPrecision,
+    shared_weights: bool,
 ) -> String {
     let types = NdWgsl::new(precision);
     let dimensions = fine_shape.len();
     let width = kernel.width();
-    let lanes = interpolation_lanes(width);
+    let lanes = interpolation_lanes(width, precision);
     let zero = types.complex_zero();
+    let points_per_workgroup = INTERPOLATION_WORKGROUP_SIZE as usize / lanes;
 
     // The column sum of one lane: nested loops over axes d-1..2, and the
     // axis-1 sum unrolled at the innermost level.
@@ -696,17 +726,21 @@ fn generate_interpolation_wgsl(
         .chain(row_terms)
         .collect::<Vec<_>>()
         .join(" + ");
-    // Every (axis, support) weight of the point, from one loop.
-    let _ = writeln!(
-        column,
-        "            var weights: array<{weight_type}, {weight_count}>;
+    // Every (axis, support) weight of the point: computed once by the
+    // point's lanes into workgroup memory, or by every lane for itself where
+    // that table does not fit.
+    if !shared_weights {
+        let _ = writeln!(
+            column,
+            "            var weights: array<{weight_type}, {weight_count}>;
             for (var entry = 0u; entry < weight_entries; entry = entry + 1u) {{
                 let axis = entry / WIDTH;
                 weights[entry] = support_weight(prepared_offsets[slot * DIMS + axis], entry - axis * WIDTH);
             }}",
-        weight_type = types.weight_type(),
-        weight_count = dimensions * width,
-    );
+            weight_type = types.weight_type(),
+            weight_count = dimensions * width,
+        );
+    }
     if dimensions >= 2 {
         let _ = writeln!(
             column,
@@ -772,6 +806,31 @@ fn generate_interpolation_wgsl(
             types.complex_scale("fine_grid[grid_base]", "weights[lane]")
         );
     }
+    if shared_weights {
+        column = column.replace("weights[", "point_weights[weights_base + ");
+    }
+    let (shared_declaration, shared_fill) = if shared_weights {
+        (
+            format!(
+                "var<workgroup> point_weights: array<{}, {}>;\n",
+                types.weight_type(),
+                points_per_workgroup * dimensions * width
+            ),
+            "    let weights_base = (invocation / LANES) * DIMS * WIDTH;
+    if (has_work) {
+        let slot = work_index % point_count;
+        for (var entry = lane; entry < weight_entries; entry = entry + LANES) {
+            let axis = entry / WIDTH;
+            point_weights[weights_base + entry] = support_weight(prepared_offsets[slot * DIMS + axis], entry - axis * WIDTH);
+        }
+    }
+    workgroupBarrier();
+"
+            .to_owned(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
     let lane_total = types.complex_add("sum", "lane_sums[invocation + support]");
     let entry = format!(
         r#"const WORKGROUP_SIZE: u32 = {INTERPOLATION_WORKGROUP_SIZE}u;
@@ -786,7 +845,7 @@ const STRIDE: u32 = {stride}u;
 @group(0) @binding(3) var<storage, read_write> output_values: array<{complex}>;
 
 var<workgroup> lane_sums: array<{complex}, {INTERPOLATION_WORKGROUP_SIZE}>;
-{DISPATCH_RANGE_WGSL}
+{shared_declaration}{DISPATCH_RANGE_WGSL}
 @compute @workgroup_size({INTERPOLATION_WORKGROUP_SIZE})
 fn main(
     @builtin(local_invocation_index) invocation: u32,
@@ -799,13 +858,15 @@ fn main(
     if (wg_flat > (total - 1u) / POINTS_PER_WORKGROUP) {{ return; }}
     let lane = invocation % LANES;
     let work_index = wg_flat * POINTS_PER_WORKGROUP + invocation / LANES;
-    let has_work = work_index < total;
+    // Lanes that are not a whole multiple of the workgroup leave its last
+    // invocations without a point.
+    let has_work = invocation / LANES < POINTS_PER_WORKGROUP && work_index < total;
     // WIDTH and DIMS * WIDTH, but not constants the compiler can unroll
     // loops by: point counts stay below 2^31.
     let loop_width = WIDTH + (point_count >> 31u);
     let weight_entries = DIMS * WIDTH + (point_count >> 31u);
 
-    var lane_sum = {zero};
+{shared_fill}    var lane_sum = {zero};
     var batch_index = 0u;
     var point_index = 0u;
     if (has_work) {{
@@ -829,7 +890,6 @@ fn main(
     }}
 }}
 "#,
-        points_per_workgroup = INTERPOLATION_WORKGROUP_SIZE as usize / lanes,
         stride = dimensions + 1,
         offset_type = types.offset_type(),
         complex = types.complex_type(),
@@ -1078,10 +1138,17 @@ mod tests {
                     precision,
                     &generate_mode_scatter_wgsl(&config, &fine_shape, precision),
                 );
-                assert_valid_nd_wgsl(
-                    precision,
-                    &generate_interpolation_wgsl(kernel, &fine_shape, precision),
-                );
+                for shared_weights in [false, true] {
+                    assert_valid_nd_wgsl(
+                        precision,
+                        &generate_interpolation_wgsl(
+                            kernel,
+                            &fine_shape,
+                            precision,
+                            shared_weights,
+                        ),
+                    );
+                }
             }
         }
     }
@@ -1089,7 +1156,8 @@ mod tests {
     #[test]
     fn interpolation_unrolls_only_the_axis_one_sum() {
         let kernel = EsKernel::for_tolerance(1.0e-6, 2.0).unwrap();
-        let source = generate_interpolation_wgsl(kernel, &[16, 14, 14, 14], FftPrecision::F32);
+        let source =
+            generate_interpolation_wgsl(kernel, &[16, 14, 14, 14], FftPrecision::F32, false);
         assert!(source.contains("let loop_width = WIDTH + (point_count >> 31u);"));
         assert!(source.contains("for (var support_3 = 0u; support_3 < loop_width;"));
         assert!(source.contains("for (var support_2 = 0u; support_2 < loop_width;"));
@@ -1097,6 +1165,12 @@ mod tests {
         assert!(source.contains("let weight_1_6 = weights[WIDTH + 6u];"));
         assert_eq!(source.matches("support_weight(").count(), 2);
         assert!(source.contains("let row = grid_base + index_2 + index_3;"));
+        // Shared weights: the point's lanes fill one table, read by every lane.
+        let shared =
+            generate_interpolation_wgsl(kernel, &[16, 14, 14, 14], FftPrecision::F32, true);
+        assert!(shared.contains("var<workgroup> point_weights:"));
+        assert!(shared.contains("let weight_1_6 = point_weights[weights_base + WIDTH + 6u];"));
+        assert!(!shared.contains("var weights: array<"));
     }
 
     #[test]

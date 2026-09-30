@@ -612,8 +612,12 @@ impl NufftPlan {
         let mut plan = Self::new(NufftKind::Type2, config)?;
         validate_gpu_dimensions("type-2", plan.config.dimensions())?;
         validate_f32_rounding(&plan.config, &plan.centered_kernel_fourier_coefficients)?;
+        // The dedicated 1D-3D plans interpolate F32; the rank-generic plan,
+        // whose lanes of a point share its costly F64 and Df64 weights,
+        // measured as fast or faster for every other precision.
+        let generic = plan.config.precision() != wgpu_fft::FftPrecision::F32;
         let gpu = match plan.config.dimensions() {
-            1 => Type2GpuExecution::OneD(Type2GpuPlan::new(
+            1 if !generic => Type2GpuExecution::OneD(Type2GpuPlan::new(
                 device,
                 queue,
                 &plan.config,
@@ -621,7 +625,7 @@ impl NufftPlan {
                 plan.fine_grid_shape[0],
                 &plan.centered_kernel_fourier_coefficients[0],
             )?),
-            2 => Type2GpuExecution::TwoD(Type2GpuPlan2d::new(
+            2 if !generic => Type2GpuExecution::TwoD(Type2GpuPlan2d::new(
                 device,
                 queue,
                 &plan.config,
@@ -629,7 +633,7 @@ impl NufftPlan {
                 &plan.fine_grid_shape,
                 &plan.centered_kernel_fourier_coefficients,
             )?),
-            3 => Type2GpuExecution::ThreeD(Type2GpuPlan3d::new(
+            3 if !generic => Type2GpuExecution::ThreeD(Type2GpuPlan3d::new(
                 device,
                 queue,
                 &plan.config,

@@ -66,6 +66,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of locating the panel again, and `F64` plans evaluate the tiny leading
   Horner terms in `f32`, within a hundredth of the tolerance; `F64` type-1
   plans spread markedly faster.
+- `F64` and `Df64` type-2 GPU plans in one to three dimensions interpolate
+  through the rank-generic path, which bins their points; the dedicated
+  paths walked the points in input order. The lanes of a rank-generic point
+  now compute its `F64` or `Df64` weights once, in workgroup memory, where
+  every lane computed all of them, and those precisions give a point one
+  lane per support offset instead of a power of two.
 - `NufftPlan::set_points_gpu` now prepares 4D and higher point sets once,
   so later executions skip the binning, as they do in 1D to 3D.
 - Large executions of the rank-generic paths are recorded as several

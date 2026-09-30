@@ -5,9 +5,10 @@
 //! `f64` reference transforms, and exponential-of-semicircle kernel tables for
 //! all three transform types. GPU execution supports rank up to
 //! [`MAX_GPU_NUFFT_DIMENSIONS`]: type 1 spreads through one rank-generic
-//! spreader in every rank, type 2 interpolates through dedicated 1D, 2D, and
-//! 3D paths and a rank-generic path for 4D to 8D, and the CPU reference
-//! transforms reach [`MAX_NUFFT_DIMENSIONS`] too.
+//! spreader in every rank, type 2 interpolates `f32` through dedicated 1D,
+//! 2D, and 3D paths and every other precision and rank through a
+//! rank-generic path, and the CPU reference transforms reach
+//! [`MAX_NUFFT_DIMENSIONS`] too.
 //! Plans support `f32`, native `f64`, and portable double-float precision,
 //! and encode spreading or interpolation around a fine-grid C2C transform
 //! using caller-owned input and output buffers. With the default `cpu` feature,
