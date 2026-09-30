@@ -428,11 +428,12 @@ fn generate_count_wgsl(
     let bin = linear_index(&terms, &lengths);
     let record = if stable {
         // The point that overfills a small bin flags the large-bin sort,
-        // behind the counts and their trailing zero.
+        // behind the counts and their trailing zero; points at every later
+        // power-of-two rank raise the flag, so it bounds the largest bin.
         "    let rank = atomicAdd(&bin_counts[bin], 1u);
     point_slots[point_index] = vec2<u32>(bin, rank);
-    if (rank == SMALL_BIN) {
-        atomicMax(&bin_counts[arrayLength(&bin_counts) - 1u], 1u);
+    if (rank >= SMALL_BIN && (rank & (rank - 1u)) == 0u) {
+        atomicMax(&bin_counts[arrayLength(&bin_counts) - 1u], rank);
     }
 "
     } else {
@@ -686,6 +687,6 @@ mod tests {
         assert!(source.contains(
             "let bin = start_0 / BIN_SIDE_0 + BINS_0 * (start_1 / BIN_SIDE_1 + BINS_1 * (start_2 / BIN_SIDE_2 + BINS_2 * (start_3 / BIN_SIDE_3)));"
         ));
-        assert!(source.contains("atomicMax(&bin_counts[arrayLength(&bin_counts) - 1u], 1u);"));
+        assert!(source.contains("atomicMax(&bin_counts[arrayLength(&bin_counts) - 1u], rank);"));
     }
 }
