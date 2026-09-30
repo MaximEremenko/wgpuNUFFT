@@ -218,11 +218,12 @@ impl NdPointBins {
     /// Prepared data for the `point_count` points of the last
     /// [`Self::encode`], in bin order.
     pub(crate) fn prepared(&self, point_count: usize) -> Result<NdPreparedPoints> {
-        let start_words = point_count
-            .checked_mul(self.dimensions + 1)
-            .ok_or(NufftError::LengthOverflow {
-                context: "rank-generic prepared point starts",
-            })?;
+        let start_words =
+            point_count
+                .checked_mul(self.dimensions + 1)
+                .ok_or(NufftError::LengthOverflow {
+                    context: "rank-generic prepared point starts",
+                })?;
         let offset_count =
             point_count
                 .checked_mul(self.dimensions)

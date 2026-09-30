@@ -20,7 +20,7 @@ use crate::config::{ModeOrder, NufftConfig, NufftSign};
 use crate::direct::mode_for_storage_index;
 use crate::error::{NufftError, Result};
 use crate::gpu::max_supported_workgroup_size;
-use crate::gpu_dispatch::split_workgroups;
+use crate::gpu_dispatch::{split_workgroups, RangedDispatch, DISPATCH_RANGE_WGSL};
 use crate::gpu_nd_bins::{NdBinOrder, NdPointBins};
 use crate::gpu_nd_wgsl::{position_wgsl, weight_wgsl, NdWgsl, WRAP_INDEX_WGSL};
 #[cfg(feature = "gpu-profiling")]
@@ -35,6 +35,9 @@ const INTERPOLATION_WORKGROUP_SIZE: u32 = 256;
 const TYPE2_BIN_SIDE: usize = 4;
 /// Bins above which interpolation bins grow, keeping the scan small.
 const TYPE2_MAX_BINS: usize = 1 << 24;
+/// Lane loads one interpolation dispatch may take; larger workloads are
+/// split into consecutive dispatches.
+const DISPATCH_LOAD_BUDGET: u64 = 1 << 33;
 
 pub(crate) struct Type2GpuPlanNd {
     fft: FftPlan,
@@ -47,6 +50,10 @@ pub(crate) struct Type2GpuPlanNd {
     interpolation_pipeline: wgpu::ComputePipeline,
     interpolation_layout: wgpu::BindGroupLayout,
     points_per_workgroup: usize,
+    /// Fine-grid loads of one lane: the kernel support over the axes above
+    /// zero.
+    lane_loads: u64,
+    ranged: RangedDispatch,
     max_workgroups_per_dimension: u32,
     batch_capacity: usize,
     mode_count: usize,
@@ -219,6 +226,8 @@ impl Type2GpuPlanNd {
             interpolation_layout: interpolation_pipeline.get_bind_group_layout(0),
             interpolation_pipeline,
             points_per_workgroup: INTERPOLATION_WORKGROUP_SIZE as usize / lanes,
+            lane_loads: (kernel.width() as u64).saturating_pow(dimensions as u32 - 1),
+            ranged: RangedDispatch::new(device),
             max_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
             batch_capacity,
             mode_count,
@@ -432,14 +441,19 @@ impl Type2GpuPlanNd {
             coefficient_elements_u32.div_ceil(WORKGROUP_SIZE),
             self.max_workgroups_per_dimension,
         )?;
-        let interpolation_workgroups = u32::try_from(
-            output_elements.div_ceil(self.points_per_workgroup),
-        )
-        .map_err(|_| NufftError::LengthOverflow {
-            context: "rank-generic type-2 batched interpolation workgroup count",
-        })?;
-        let interpolation_dispatch =
-            split_workgroups(interpolation_workgroups, self.max_workgroups_per_dimension)?;
+        let interpolation_workgroups =
+            u32::try_from(output_elements.div_ceil(self.points_per_workgroup)).map_err(|_| {
+                NufftError::LengthOverflow {
+                    context: "rank-generic type-2 batched interpolation workgroup count",
+                }
+            })?;
+        let precision_factor = match self.precision {
+            FftPrecision::F32 => 1,
+            FftPrecision::F64 | FftPrecision::Df64 => 4,
+        };
+        let interpolation_per_dispatch = (DISPATCH_LOAD_BUDGET
+            / (u64::from(INTERPOLATION_WORKGROUP_SIZE) * self.lane_loads * precision_factor))
+            .max(1);
 
         if record_points {
             self.bins
@@ -501,20 +515,43 @@ impl Type2GpuPlanNd {
                 binding_entry(3, output, output_bytes),
             ],
         });
-        recorder.dispatch_profiled(
-            "wgpu_nufft.type2_nd.interpolation.pass",
+        #[cfg(feature = "gpu-profiling")]
+        encode_profile_marker(recorder, profile, Some(2), None);
+        self.ranged.encode(
+            device,
+            recorder,
             &self.interpolation_pipeline,
             &interpolation_bind_group,
-            interpolation_dispatch,
-            #[cfg(feature = "gpu-profiling")]
-            profile.timestamp_writes(Some(2), Some(3)),
-        );
+            u64::from(interpolation_workgroups),
+            interpolation_per_dispatch,
+        )?;
+        #[cfg(feature = "gpu-profiling")]
+        encode_profile_marker(recorder, profile, None, Some(3));
         Ok(())
     }
 
     #[cfg(feature = "gpu-profiling")]
     pub(crate) fn fft_diagnostics(&self) -> wgpu_fft::FftDiagnostics {
         self.fft.diagnostics()
+    }
+}
+
+/// Writes profiling timestamps from an empty pass, around dispatches that
+/// cannot carry them themselves.
+#[cfg(feature = "gpu-profiling")]
+fn encode_profile_marker(
+    recorder: &mut GpuRecorder<'_>,
+    profile: GpuProfileQueryWriter<'_>,
+    beginning: Option<u32>,
+    end: Option<u32>,
+) {
+    if let Some(timestamp_writes) = profile.timestamp_writes(beginning, end) {
+        let _pass = recorder
+            .encoder()
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("wgpu_nufft.profile.marker"),
+                timestamp_writes: Some(timestamp_writes),
+            });
     }
 }
 
@@ -531,7 +568,11 @@ fn type2_bin_shape(fine_shape: &[usize]) -> Vec<usize> {
     };
     let mut axis = fine_shape.len();
     while bin_count(&sides) > TYPE2_MAX_BINS {
-        axis = if axis == 0 { fine_shape.len() - 1 } else { axis - 1 };
+        axis = if axis == 0 {
+            fine_shape.len() - 1
+        } else {
+            axis - 1
+        };
         sides[axis] *= 2;
     }
     sides
@@ -743,7 +784,7 @@ const STRIDE: u32 = {stride}u;
 @group(0) @binding(3) var<storage, read_write> output_values: array<{complex}>;
 
 var<workgroup> lane_sums: array<{complex}, {INTERPOLATION_WORKGROUP_SIZE}>;
-
+{DISPATCH_RANGE_WGSL}
 @compute @workgroup_size({INTERPOLATION_WORKGROUP_SIZE})
 fn main(
     @builtin(local_invocation_index) invocation: u32,
@@ -752,7 +793,7 @@ fn main(
 ) {{
     let point_count = arrayLength(&prepared_starts) / STRIDE;
     let total = arrayLength(&output_values);
-    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    let wg_flat = dispatch_range.first + (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
     if (wg_flat > (total - 1u) / POINTS_PER_WORKGROUP) {{ return; }}
     let lane = invocation % LANES;
     let work_index = wg_flat * POINTS_PER_WORKGROUP + invocation / LANES;
@@ -1026,7 +1067,9 @@ mod tests {
                 let kernel = EsKernel::for_tolerance(eps, 2.0).unwrap();
                 let fine_shape = n_modes
                     .iter()
-                    .map(|&modes| crate::kernel::select_fine_grid_size(modes, 2.0, kernel.width()).unwrap())
+                    .map(|&modes| {
+                        crate::kernel::select_fine_grid_size(modes, 2.0, kernel.width()).unwrap()
+                    })
                     .collect::<Vec<_>>();
                 assert_valid_nd_wgsl(
                     precision,

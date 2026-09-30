@@ -167,9 +167,9 @@ impl NdWgsl {
     /// The prepared offset `start - position` in storage form.
     pub(crate) fn offset(self, start: &str, position: &str) -> String {
         match self.precision {
-            FftPrecision::F32 | FftPrecision::Df64 => format!(
-                "df64_pack(df64_sub(Df64(f32({start}), 0.0), {position}))"
-            ),
+            FftPrecision::F32 | FftPrecision::Df64 => {
+                format!("df64_pack(df64_sub(Df64(f32({start}), 0.0), {position}))")
+            }
             FftPrecision::F64 => format!("(f64({start}) - {position})"),
         }
     }
@@ -205,7 +205,11 @@ impl NdWgsl {
 /// `FOLD_REACH`), `HALF_WIDTH`, and `fold_position_{a}`. `F32` and `Df64`
 /// shaders also get `floor_df64_to_i32`, `ceil_df64_to_i32` and `df64_pack`,
 /// and need the df64 library in front ([`NdWgsl::with_library`]).
-pub(crate) fn position_wgsl(fine_shape: &[usize], kernel: EsKernel, precision: FftPrecision) -> String {
+pub(crate) fn position_wgsl(
+    fine_shape: &[usize],
+    kernel: EsKernel,
+    precision: FftPrecision,
+) -> String {
     let mut source = String::new();
     let mut stride = 1usize;
     for (axis, &length) in fine_shape.iter().enumerate() {

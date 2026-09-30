@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use wgpu::util::DeviceExt;
 use wgpu_nufft::{
     reference_type3_f64, Complex64, NufftError, NufftInterval, NufftSign, NufftType3Config,
-    NufftType3Plan, MAX_GPU_NUFFT_DIMENSIONS,
+    NufftType3Plan, MAX_GPU_NUFFT_DIMENSIONS, MAX_NUFFT_DIMENSIONS,
 };
 
 const FLOAT_TOLERANCE_FACTOR: f64 = 100.0;
@@ -37,6 +37,7 @@ async fn run_gpu_type3_cases() {
     validate_zero_source_and_target_counts(&context.device, &context.queue);
     validate_adjoint_consistency(&context.device, &context.queue);
     validate_repeat_determinism(&context.device, &context.queue);
+    validate_high_rank_accuracy(&context.device, &context.queue);
     validate_rank_cap(&context.device, &context.queue);
 
     #[cfg(windows)]
@@ -321,17 +322,53 @@ impl PointClass {
     }
 }
 
+/// Type 3 above four dimensions, through the rank-generic spreader and inner
+/// type 2, on small intervals that keep the outer grids small.
+fn validate_high_rank_accuracy(device: &wgpu::Device, queue: &wgpu::Queue) {
+    for dimensions in [5, 6] {
+        let source_bounds = vec![NufftInterval::new(-0.6, 0.4); dimensions];
+        let target_bounds = vec![NufftInterval::new(-1.2, 0.9); dimensions];
+        let eps = 1.0e-3;
+        let config = NufftType3Config::new(source_bounds.clone(), target_bounds.clone(), eps)
+            .with_sign(NufftSign::Negative);
+        let plan = NufftType3Plan::new_gpu(device, queue, config.clone()).unwrap();
+        let class = PointClass::Random;
+        let source_count = class.source_count();
+        let target_count = class.target_count();
+        let source = class.coordinates(&source_bounds, source_count, 0x6a09_e667);
+        let target = class.coordinates(&target_bounds, target_count, 0xbb67_ae85);
+        let strengths = test_values(source_count, NufftSign::Negative);
+        let actual = interleaved_to_complex64(&execute_type3(
+            device, queue, &plan, &source, &strengths, &target,
+        ));
+        let reference = reference_type3_f64(
+            &config,
+            &f32_to_f64(&source),
+            &f32_to_f64(&target),
+            &interleaved_to_complex64(&strengths),
+        )
+        .unwrap();
+        let error = relative_l2(&actual, &reference);
+        eprintln!(
+            "NUFFT_TYPE3_ACCURACY dimensions={dimensions} eps={eps:.0e} outer_grid={:?} relative_l2={error:.9e}",
+            plan.outer_grid_shape(),
+        );
+        assert!(
+            error <= FLOAT_TOLERANCE_FACTOR * eps,
+            "type3 dimensions={dimensions}: relative L2 {error}"
+        );
+    }
+}
+
+/// GPU type-3 plans take every rank a configuration does.
 fn validate_rank_cap(device: &wgpu::Device, queue: &wgpu::Queue) {
-    let rank = MAX_GPU_NUFFT_DIMENSIONS + 1;
+    assert_eq!(MAX_GPU_NUFFT_DIMENSIONS, MAX_NUFFT_DIMENSIONS);
+    let rank = MAX_NUFFT_DIMENSIONS + 1;
     let bounds = vec![NufftInterval::new(-1.0, 1.0); rank];
     let config = NufftType3Config::new(bounds.clone(), bounds, 1.0e-2);
     assert!(matches!(
         NufftType3Plan::new_gpu(device, queue, config),
-        Err(NufftError::GpuDimensionsUnsupported {
-            actual,
-            supported: MAX_GPU_NUFFT_DIMENSIONS,
-            ..
-        }) if actual == rank
+        Err(NufftError::InvalidDimensions { actual, .. }) if actual == rank
     ));
 }
 

@@ -29,7 +29,7 @@ use std::sync::Mutex;
 use wgpu_fft::FftPrecision;
 
 use crate::error::{NufftError, Result};
-use crate::gpu_dispatch::split_workgroups;
+use crate::gpu_dispatch::{split_workgroups, RangedDispatch, DISPATCH_RANGE_WGSL};
 use crate::gpu_nd_bins::NdPreparedPoints;
 use crate::gpu_nd_wgsl::{position_wgsl, weight_wgsl, NdWgsl};
 use crate::gpu_point_bins::GrowOnlyBuffer;
@@ -60,6 +60,9 @@ const MAX_HEAVY_PARTS: u64 = 32;
 /// Scratch that bounds the part count: parts shrink as the possible heavy
 /// blocks and the batch grow.
 const HEAVY_SCRATCH_BUDGET_BYTES: u64 = 64 << 20;
+/// Invocation steps one spreading dispatch may take; larger workloads are
+/// split into consecutive dispatches.
+const DISPATCH_WORK_BUDGET: u64 = 1 << 36;
 /// Invocations of the classify pass, one block each.
 const CLASSIFY_WORKGROUP_SIZE: u32 = 64;
 /// Invocations of the heavy reduce pass, one cell each.
@@ -92,6 +95,9 @@ pub(crate) struct NdSpreadLayout {
     chunk: usize,
     /// Records in reach above which a block goes to the heavy passes.
     heavy_records: u32,
+    fine_shape: Vec<usize>,
+    /// Invocation steps a workgroup spends on one staged record.
+    record_steps: u64,
 }
 
 impl NdSpreadLayout {
@@ -173,7 +179,9 @@ impl NdSpreadLayout {
         };
         let (mut bins, mut full, mut reach_bins) = reach_geometry(&bin_side);
         // Coarser bins along the widest reaches keep the row count bounded.
-        while reach_bins[1..].iter().try_fold(1usize, |rows, &n| rows.checked_mul(n))
+        while reach_bins[1..]
+            .iter()
+            .try_fold(1usize, |rows, &n| rows.checked_mul(n))
             .is_none_or(|rows| rows > MAX_ROWS)
         {
             let Some(axis) = (1..dimensions)
@@ -191,9 +199,8 @@ impl NdSpreadLayout {
             .min(rows.next_power_of_two())
             .max(1);
         let storage_limit = limits.max_compute_workgroup_storage_size as usize;
-        let chunk_bytes = 4 * dimensions
-            + types.complex_bytes()
-            + dimensions * width * types.weight_bytes();
+        let chunk_bytes =
+            4 * dimensions + types.complex_bytes() + dimensions * width * types.weight_bytes();
         let row_bytes = 4 * 4 * row_batch;
         let chunk = (0..=MAX_CHUNK.trailing_zeros())
             .rev()
@@ -208,8 +215,8 @@ impl NdSpreadLayout {
             FftPrecision::F64 => 4,
             FftPrecision::Df64 => 8,
         };
-        let step_cost = (workgroup_size * (dimensions + run) * cost_factor) as u64;
-        let heavy_records = (LIGHT_WORK_BUDGET / step_cost.max(1))
+        let record_steps = (workgroup_size * (dimensions + run) * cost_factor) as u64;
+        let heavy_records = (LIGHT_WORK_BUDGET / record_steps.max(1))
             .clamp(MIN_HEAVY_RECORDS, MAX_HEAVY_RECORDS) as u32;
         let blocks = fine_shape
             .iter()
@@ -230,6 +237,8 @@ impl NdSpreadLayout {
             row_batch,
             chunk,
             heavy_records,
+            fine_shape: fine_shape.to_vec(),
+            record_steps,
         };
         let block_count = layout
             .blocks
@@ -251,6 +260,32 @@ impl NdSpreadLayout {
 
     fn block_count(&self) -> usize {
         self.blocks.iter().product()
+    }
+
+    /// Light workgroups per dispatch for `point_count` evenly spread points:
+    /// each block's reach then holds its share of the grid volume, and never
+    /// more than the heavy limit.
+    fn light_workgroups_per_dispatch(&self, point_count: usize) -> u64 {
+        let fraction = (0..self.block.len())
+            .map(|axis| {
+                ((self.reach_bins[axis] * self.bin_side[axis]) as f64
+                    / self.fine_shape[axis] as f64)
+                    .min(1.0)
+            })
+            .product::<f64>();
+        let records = ((point_count as f64 * fraction).ceil() as u64)
+            .min(u64::from(self.heavy_records))
+            .max(1);
+        let rows = self.reach_bins[1..].iter().product::<usize>().max(1) as u64;
+        let steps = records * self.record_steps + rows * self.workgroup_size as u64;
+        (DISPATCH_WORK_BUDGET / steps).max(1)
+    }
+
+    /// Heavy part workgroups per dispatch: a part holds at most
+    /// `ceil(point_count / parts)` records.
+    fn part_workgroups_per_dispatch(&self, point_count: usize, parts: u64) -> u64 {
+        let records = (point_count as u64).div_ceil(parts).max(1);
+        (DISPATCH_WORK_BUDGET / (records * self.record_steps)).max(1)
     }
 
     fn block_cells(&self) -> usize {
@@ -333,6 +368,7 @@ pub(crate) struct NdBlockSpread {
     heavy_list: GrowOnlyBuffer,
     /// Partial sums of the heavy parts.
     partials: Mutex<Option<wgpu::Buffer>>,
+    ranged: RangedDispatch,
     device: wgpu::Device,
     max_workgroups_per_dimension: u32,
 }
@@ -362,11 +398,8 @@ impl NdBlockSpread {
             "wgpu_nufft.nd_spread.heavy_part",
             &shaders.spread(SpreadMode::HeavyPart),
         );
-        let classify_pipeline = create_compute_pipeline(
-            device,
-            "wgpu_nufft.nd_spread.classify",
-            &shaders.classify(),
-        );
+        let classify_pipeline =
+            create_compute_pipeline(device, "wgpu_nufft.nd_spread.classify", &shaders.classify());
         let reduce_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.nd_spread.heavy_reduce",
@@ -395,6 +428,7 @@ impl NdBlockSpread {
             block_state,
             heavy_list: GrowOnlyBuffer::new(device, "wgpu_nufft.nd_spread.heavy_list"),
             partials: Mutex::new(None),
+            ranged: RangedDispatch::new(device),
             device: device.clone(),
             max_workgroups_per_dimension: device.limits().max_compute_workgroups_per_dimension,
             layout,
@@ -480,15 +514,14 @@ impl NdBlockSpread {
             .checked_mul(active_batch)
             .and_then(|count| u32::try_from(count).ok())
             .ok_or_else(|| overflow("batched rank-generic spread workgroup count"))?;
-        encode_pass(
+        self.ranged.encode(
+            device,
             recorder,
-            "wgpu_nufft.nd_spread.light.pass",
             &self.spread_pipeline,
             &spread_bind_group,
-            split_workgroups(light_workgroups, self.max_workgroups_per_dimension)?,
-            #[cfg(feature = "gpu-profiling")]
-            None,
-        );
+            u64::from(light_workgroups),
+            self.layout.light_workgroups_per_dispatch(point_count),
+        )?;
         if heavy.capacity == 0 {
             // No block can exceed the limit.
             return Ok(());
@@ -545,18 +578,15 @@ impl NdBlockSpread {
         let workgroup_count = |count: u64| {
             u32::try_from(count).map_err(|_| overflow("batched rank-generic heavy workgroup count"))
         };
-        encode_pass(
+        self.ranged.encode(
+            device,
             recorder,
-            "wgpu_nufft.nd_spread.heavy_part.pass",
             &self.part_pipeline,
             &part_bind_group,
-            split_workgroups(
-                workgroup_count(part_workgroups)?,
-                self.max_workgroups_per_dimension,
-            )?,
-            #[cfg(feature = "gpu-profiling")]
-            None,
-        );
+            u64::from(workgroup_count(part_workgroups)?),
+            self.layout
+                .part_workgroups_per_dispatch(point_count, heavy.parts),
+        )?;
         encode_pass(
             recorder,
             "wgpu_nufft.nd_spread.heavy_reduce.pass",
@@ -902,7 +932,8 @@ const FULL_{axis}: bool = {full};
                     })
                     .collect();
                 (
-                    "@group(0) @binding(5) var<storage, read> block_state: array<u32>;\n".to_owned(),
+                    "@group(0) @binding(5) var<storage, read> block_state: array<u32>;\n"
+                        .to_owned(),
                     "    if (wg_flat >= BLOCK_COUNT * total_vectors) { return; }
     let vector_index = wg_flat / BLOCK_COUNT;
     let block = wg_flat - vector_index * BLOCK_COUNT;
@@ -968,7 +999,7 @@ const SKIPPED: i32 = 0x3fffffff;
 @group(0) @binding(2) var<storage, read> strengths: array<{complex}>;
 @group(0) @binding(3) var<storage, read> bin_offsets: array<u32>;
 @group(0) @binding(4) var<storage, read_write> fine_grid: array<{complex}>;
-{mode_bindings}
+{mode_bindings}{DISPATCH_RANGE_WGSL}
 var<workgroup> row_start_a: array<u32, {row_batch}>;
 var<workgroup> row_length_a: array<u32, {row_batch}>;
 var<workgroup> row_start_b: array<u32, {row_batch}>;
@@ -994,7 +1025,7 @@ fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {{
-    let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
+    let wg_flat = dispatch_range.first + (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
     let total_vectors = arrayLength(&fine_grid) / FINE_COUNT;
     let point_count = arrayLength(&prepared_starts) / STRIDE;
 {locate}{origins}{locals}{reach}    if (records_end == 0u) {{ rows = 0u; }}
@@ -1304,7 +1335,10 @@ mod tests {
                 let layout = NdSpreadLayout::for_grid(kernel, &shape, precision, &limits).unwrap();
                 let width = kernel.width();
                 for (axis, &length) in shape.iter().enumerate() {
-                    assert!(layout.block[axis] + width - 1 <= length, "{shape:?} axis {axis}");
+                    assert!(
+                        layout.block[axis] + width - 1 <= length,
+                        "{shape:?} axis {axis}"
+                    );
                 }
                 assert!(layout.workgroup_size <= 256);
                 let types = NdWgsl::new(precision);

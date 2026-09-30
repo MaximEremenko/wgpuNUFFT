@@ -53,6 +53,23 @@ impl<'a> GpuRecorder<'a> {
         pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
     }
 
+    /// Records one dispatch of a pipeline that reads its first workgroup
+    /// from `range_group` at bind group 1 (see
+    /// [`crate::gpu_dispatch::RangedDispatch`]).
+    pub(crate) fn dispatch_ranged(
+        &mut self,
+        pipeline: &wgpu::ComputePipeline,
+        bind_group: &wgpu::BindGroup,
+        range_group: &wgpu::BindGroup,
+        workgroups: (u32, u32, u32),
+    ) {
+        let pass = self.inner.compute_pass();
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.set_bind_group(1, range_group, &[]);
+        pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+    }
+
     /// Records one dispatch. With profiling, a dispatch that writes
     /// timestamps gets a compute pass of its own named `label`, so the
     /// timestamps bracket exactly it; every other dispatch joins the shared

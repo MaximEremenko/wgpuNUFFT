@@ -1,4 +1,130 @@
+use wgpu::util::DeviceExt;
+
 use crate::error::{NufftError, Result};
+use crate::gpu_recorder::GpuRecorder;
+
+/// Declares the first flat workgroup of a ranged dispatch, at bind group 1.
+/// Shaders add `dispatch_range.first` to their flat workgroup index.
+pub(crate) const DISPATCH_RANGE_WGSL: &str = "
+struct DispatchRange {
+    first: u32,
+    unused_0: u32,
+    unused_1: u32,
+    unused_2: u32,
+}
+
+@group(1) @binding(0) var<uniform> dispatch_range: DispatchRange;
+";
+
+/// Bytes of one [`DISPATCH_RANGE_WGSL`] uniform.
+const RANGE_BYTES: u64 = 16;
+
+/// Splits one logical dispatch into dispatches of bounded work.
+///
+/// A long dispatch can hold the GPU past the operating system's watchdog on
+/// devices that preempt only between dispatches, so large rank-generic
+/// workloads are recorded as consecutive ranges of their flat workgroups.
+/// Every range reads its first workgroup from a uniform at bind group 1;
+/// results do not depend on the split, since each workgroup computes the
+/// same thing wherever its range starts.
+pub(crate) struct RangedDispatch {
+    /// The uniform of a single range starting at workgroup zero.
+    zero: wgpu::Buffer,
+    stride: u64,
+    max_workgroups_per_dimension: u32,
+}
+
+impl RangedDispatch {
+    pub(crate) fn new(device: &wgpu::Device) -> Self {
+        let limits = device.limits();
+        Self {
+            zero: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("wgpu_nufft.dispatch_range.zero"),
+                contents: &[0u8; RANGE_BYTES as usize],
+                usage: wgpu::BufferUsages::UNIFORM,
+            }),
+            stride: u64::from(limits.min_uniform_buffer_offset_alignment).max(RANGE_BYTES),
+            max_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
+        }
+    }
+
+    /// Records `total` flat workgroups of `pipeline` in ranges of at most
+    /// `per_dispatch` workgroups.
+    pub(crate) fn encode(
+        &self,
+        device: &wgpu::Device,
+        recorder: &mut GpuRecorder<'_>,
+        pipeline: &wgpu::ComputePipeline,
+        bind_group: &wgpu::BindGroup,
+        total: u64,
+        per_dispatch: u64,
+    ) -> Result<()> {
+        if total == 0 {
+            return Ok(());
+        }
+        let per_dispatch = per_dispatch.clamp(1, u64::from(u32::MAX));
+        let layout = pipeline.get_bind_group_layout(1);
+        let ranges = total.div_ceil(per_dispatch);
+        let overflow = || NufftError::LengthOverflow {
+            context: "ranged dispatch workgroup count",
+        };
+        if ranges == 1 {
+            let range_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("wgpu_nufft.dispatch_range.bind_group"),
+                layout: &layout,
+                entries: &[range_entry(&self.zero, 0)],
+            });
+            let workgroups = u32::try_from(total).map_err(|_| overflow())?;
+            recorder.dispatch_ranged(
+                pipeline,
+                bind_group,
+                &range_group,
+                split_workgroups(workgroups, self.max_workgroups_per_dimension)?,
+            );
+            return Ok(());
+        }
+        let stride = usize::try_from(self.stride).map_err(|_| overflow())?;
+        let range_count = usize::try_from(ranges).map_err(|_| overflow())?;
+        let mut contents = vec![0u8; range_count * stride];
+        for range in 0..range_count {
+            let first = u32::try_from(range as u64 * per_dispatch).map_err(|_| overflow())?;
+            contents[range * stride..range * stride + 4].copy_from_slice(&first.to_le_bytes());
+        }
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("wgpu_nufft.dispatch_range.ranges"),
+            contents: &contents,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        for range in 0..range_count {
+            let first = range as u64 * per_dispatch;
+            let count = per_dispatch.min(total - first);
+            let range_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("wgpu_nufft.dispatch_range.bind_group"),
+                layout: &layout,
+                entries: &[range_entry(&buffer, range as u64 * self.stride)],
+            });
+            let workgroups = u32::try_from(count).map_err(|_| overflow())?;
+            recorder.dispatch_ranged(
+                pipeline,
+                bind_group,
+                &range_group,
+                split_workgroups(workgroups, self.max_workgroups_per_dimension)?,
+            );
+        }
+        Ok(())
+    }
+}
+
+fn range_entry(buffer: &wgpu::Buffer, offset: u64) -> wgpu::BindGroupEntry<'_> {
+    wgpu::BindGroupEntry {
+        binding: 0,
+        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+            buffer,
+            offset,
+            size: std::num::NonZeroU64::new(RANGE_BYTES),
+        }),
+    }
+}
 
 /// Splits a flat workgroup count into a u32-safe 3D dispatch grid.
 ///

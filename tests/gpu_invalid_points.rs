@@ -77,6 +77,24 @@ async fn run() {
             eprintln!("NUFFT_INVALID_POINTS shape={shape:?} per-cell {precision:?} ok");
         }
     }
+    // The rank-generic paths bin and prepare every point, in every precision.
+    for shape in [vec![8, 6, 6, 6], vec![4, 4, 3, 3, 3, 3]] {
+        let invalid = Points::new(shape.len(), &INVALID);
+        let far = Points::new(shape.len(), &FAR);
+        for precision in [FftPrecision::F32, FftPrecision::Df64] {
+            let case = Case {
+                device,
+                queue,
+                shape: &shape,
+                precision,
+            };
+            case.check_others_kept(&invalid);
+            case.check_type1_ignores(&far);
+            case.check_type1_ignores(&invalid);
+            case.check_type2_zero_at(&invalid);
+            eprintln!("NUFFT_INVALID_POINTS shape={shape:?} rank-generic {precision:?} ok");
+        }
+    }
     // Mirror the other GPU tests, which leak their devices to avoid a
     // teardown stall on Windows.
     std::mem::forget(context);

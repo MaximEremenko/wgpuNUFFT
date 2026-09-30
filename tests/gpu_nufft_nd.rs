@@ -1,8 +1,8 @@
 #![cfg(not(target_arch = "wasm32"))]
 
-//! Opt-in rank-generic (d >= 4) GPU validation against the direct f64 NDFT
-//! oracle: F32/F64/Df64 precisions, sigma per config, both signs and mode
-//! orders, batching, and coordinates exercising the full
+//! Opt-in rank-generic (4D to 8D) GPU validation against the direct f64
+//! NDFT oracle: F32/F64/Df64 precisions, sigma per config, both signs and
+//! mode orders, batching, point reuse, and coordinates exercising the full
 //! [-3*pi, 3*pi] folding interval. The F64 cases run only when the adapter
 //! exposes SHADER_F64; Df64 needs no device feature.
 
@@ -13,7 +13,7 @@ use wgpu::util::DeviceExt;
 use wgpu_nufft::{
     reference_type1_f64, reference_type2_f64, Complex64, ComplexDoubleFloat, DoubleFloat,
     FftPrecision, ModeOrder, NufftConfig, NufftError, NufftPlan, NufftSign,
-    MAX_GPU_NUFFT_DIMENSIONS,
+    MAX_GPU_NUFFT_DIMENSIONS, MAX_NUFFT_DIMENSIONS,
 };
 
 #[test]
@@ -37,7 +37,7 @@ async fn run_cases() {
 
     // (label, n_modes, eps, sigma, sign, order, batch, tolerance_factor)
     #[allow(clippy::type_complexity)]
-    let cases: [(&str, Vec<usize>, f64, f64, NufftSign, ModeOrder, usize, f64); 6] = [
+    let cases: [(&str, Vec<usize>, f64, f64, NufftSign, ModeOrder, usize, f64); 9] = [
         (
             "4d eps=1e-3 sigma=2 negative centered",
             vec![6, 5, 4, 4],
@@ -98,6 +98,36 @@ async fn run_cases() {
             1,
             8.0,
         ),
+        (
+            "6d eps=1e-3 sigma=2 negative centered",
+            vec![4, 4, 3, 3, 3, 3],
+            1.0e-3,
+            2.0,
+            NufftSign::Negative,
+            ModeOrder::Centered,
+            1,
+            8.0,
+        ),
+        (
+            "7d eps=1e-3 sigma=2 positive fft-order batch=2",
+            vec![3, 3, 3, 2, 2, 2, 2],
+            1.0e-3,
+            2.0,
+            NufftSign::Positive,
+            ModeOrder::Fft,
+            2,
+            8.0,
+        ),
+        (
+            "8d eps=1e-3 sigma=2 negative centered",
+            vec![3, 2, 2, 2, 2, 2, 2, 2],
+            1.0e-3,
+            2.0,
+            NufftSign::Negative,
+            ModeOrder::Centered,
+            1,
+            8.0,
+        ),
     ];
 
     for (label, n_modes, eps, sigma, sign, order, batch, tolerance_factor) in cases {
@@ -126,6 +156,15 @@ async fn run_cases() {
         48.0,
     )
     .await;
+    high_precision_case(
+        &context,
+        "6d eps=1e-6 df64",
+        &[4, 4, 3, 3, 3, 3],
+        1.0e-6,
+        FftPrecision::Df64,
+        16.0,
+    )
+    .await;
     if context
         .device
         .features()
@@ -144,8 +183,11 @@ async fn run_cases() {
         eprintln!("skipping ND F64 case; the adapter lacks SHADER_F64");
     }
 
-    // Higher ranks stay on the CPU reference path.
-    let rank = MAX_GPU_NUFFT_DIMENSIONS + 1;
+    reuse_case(&context).await;
+
+    // GPU plans take every rank a configuration does.
+    assert_eq!(MAX_GPU_NUFFT_DIMENSIONS, MAX_NUFFT_DIMENSIONS);
+    let rank = MAX_NUFFT_DIMENSIONS + 1;
     let config = NufftConfig::new(vec![2; rank], 1.0e-3);
     for result in [
         NufftPlan::type1_gpu(&context.device, &context.queue, config.clone()),
@@ -153,16 +195,164 @@ async fn run_cases() {
     ] {
         assert!(matches!(
             result,
-            Err(NufftError::GpuDimensionsUnsupported {
-                actual,
-                supported: MAX_GPU_NUFFT_DIMENSIONS,
-                ..
-            }) if actual == rank
+            Err(NufftError::InvalidDimensions { actual, .. }) if actual == rank
         ));
     }
 
     #[cfg(windows)]
     std::mem::forget(context);
+}
+
+/// Executions after `set_points_gpu` match whole encodes bit for bit, and a
+/// second execution repeats them.
+async fn reuse_case(context: &wgpu_fft::device::GpuContext) {
+    let device = &context.device;
+    let queue = &context.queue;
+    for n_modes in [vec![6usize, 5, 4, 4], vec![4usize, 3, 3, 3, 3, 3]] {
+        let dims = n_modes.len();
+        let mode_count: usize = n_modes.iter().product();
+        let point_count = 211;
+        let config = NufftConfig::new(n_modes.clone(), 1.0e-4).with_sign(NufftSign::Negative);
+        let points: Vec<f32> = (0..point_count * dims)
+            .map(|index| ((index as f32 * 0.754_877_7).fract() - 0.5) * 6.0)
+            .collect();
+        let coefficients: Vec<f32> = (0..2 * mode_count)
+            .map(|index| (index as f32 * 0.37).sin())
+            .collect();
+        let strengths: Vec<f32> = (0..2 * point_count)
+            .map(|index| (index as f32 * 0.61).cos())
+            .collect();
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let type2 = NufftPlan::type2_gpu(device, queue, config.clone()).unwrap();
+        let type1 = NufftPlan::type1_gpu(device, queue, config).unwrap();
+        let point_buffer = storage(device, bytemuck::cast_slice(&points));
+        let coefficient_buffer = storage(device, bytemuck::cast_slice(&coefficients));
+        let strength_buffer = storage(device, bytemuck::cast_slice(&strengths));
+        let type2_output = output_buffer(device, (point_count * 8) as u64);
+        let type1_output = output_buffer(device, (mode_count * 8) as u64);
+        let run = |record: &dyn Fn(&mut wgpu::CommandEncoder), output: &wgpu::Buffer| {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            record(&mut encoder);
+            read_back(device, queue, encoder, output)
+        };
+        let encoded2 = run(
+            &|encoder| {
+                type2
+                    .encode_type2_gpu(
+                        device,
+                        encoder,
+                        point_count,
+                        &point_buffer,
+                        &coefficient_buffer,
+                        &type2_output,
+                    )
+                    .unwrap()
+            },
+            &type2_output,
+        );
+        let encoded1 = run(
+            &|encoder| {
+                type1
+                    .encode_type1_gpu(
+                        device,
+                        encoder,
+                        point_count,
+                        &point_buffer,
+                        &strength_buffer,
+                        &type1_output,
+                    )
+                    .unwrap()
+            },
+            &type1_output,
+        );
+        let mut encoder = device.create_command_encoder(&Default::default());
+        type2
+            .set_points_gpu(device, &mut encoder, point_count, &point_buffer)
+            .unwrap();
+        type1
+            .set_points_gpu(device, &mut encoder, point_count, &point_buffer)
+            .unwrap();
+        queue.submit([encoder.finish()]);
+        for _ in 0..2 {
+            let reused2 = run(
+                &|encoder| {
+                    type2
+                        .execute_type2_gpu(device, encoder, &coefficient_buffer, &type2_output)
+                        .unwrap()
+                },
+                &type2_output,
+            );
+            let reused1 = run(
+                &|encoder| {
+                    type1
+                        .execute_type1_gpu(device, encoder, &strength_buffer, &type1_output)
+                        .unwrap()
+                },
+                &type1_output,
+            );
+            assert!(
+                bits(&reused2) == bits(&encoded2),
+                "{dims}D: type-2 execution after set_points differs from encode"
+            );
+            assert!(
+                bits(&reused1) == bits(&encoded1),
+                "{dims}D: type-1 execution after set_points differs from encode"
+            );
+        }
+        if let Some(error) = scope.pop().await {
+            panic!("{dims}D reuse: validation error: {error}");
+        }
+        eprintln!("NUFFT_ND_REUSE {dims}d: bitwise ok");
+    }
+}
+
+fn storage(device: &wgpu::Device, contents: &[u8]) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("wgpu_nufft.test_nd.reuse_input"),
+        contents,
+        usage: wgpu::BufferUsages::STORAGE,
+    })
+}
+
+fn output_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_nufft.test_nd.reuse_output"),
+        size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
+}
+
+fn read_back(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mut encoder: wgpu::CommandEncoder,
+    output: &wgpu::Buffer,
+) -> Vec<f32> {
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("wgpu_nufft.test_nd.reuse_readback"),
+        size: output.size(),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_buffer_to_buffer(output, 0, &readback, 0, output.size());
+    queue.submit([encoder.finish()]);
+    let slice = readback.slice(..);
+    let (sender, receiver) = mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        sender.send(result).unwrap();
+    });
+    device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+    receiver.recv().unwrap().unwrap();
+    let mapped = slice.get_mapped_range().expect("mapped readback range");
+    let result = bytemuck::cast_slice::<u8, f32>(&mapped).to_vec();
+    drop(mapped);
+    readback.unmap();
+    result
+}
+
+fn bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|value| value.to_bits()).collect()
 }
 
 /// Runs both transform types in a high-precision configuration against the

@@ -2,7 +2,8 @@
 
 //! Opt-in GPU checks of tightly clustered type-1 inputs: bins far above the
 //! 64-point ranking limit, sorted by the parallel large-bin sort, and gather
-//! tiles and segments whose reach exceeds the heavy-path thresholds.
+//! tiles, segments and blocks, in 1D to 6D, whose reach exceeds the
+//! heavy-path thresholds.
 
 use std::sync::mpsc;
 
@@ -52,6 +53,27 @@ async fn run() {
         queue,
         &[16, 20, 12],
         &clustered(300_000, &[0.3, -1.1, 2.0], 4),
+    );
+    // The rank-generic spreader, through the large-bin sort in 4D and 6D.
+    check(
+        device,
+        queue,
+        &[8, 8, 6, 6],
+        &clustered(10_000, &[0.3, -1.1, 2.0, -0.5], 5),
+    );
+    check(
+        device,
+        queue,
+        &[4, 4, 3, 3, 3, 3],
+        &clustered(5_000, &[0.3, -1.1, 2.0, -0.5, 1.4, -2.2], 6),
+    );
+    // 300,000 points pass the 4D heavy-block limit, while either half stays
+    // below it.
+    check_heavy_blocks_by_linearity(
+        device,
+        queue,
+        &[8, 8, 6, 6],
+        &clustered(300_000, &[0.3, -1.1, 2.0, -0.5], 7),
     );
     // Mirror the other GPU tests, which leak their devices to avoid a
     // teardown stall on Windows.
