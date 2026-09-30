@@ -68,14 +68,14 @@ pub(crate) enum PointBinOrder {
 
 /// Plan-owned storage that grows with the largest point set. A clone of an
 /// older allocation stays alive in command buffers that captured it.
-struct GrowOnlyBuffer {
+pub(crate) struct GrowOnlyBuffer {
     device: wgpu::Device,
     label: &'static str,
     buffer: Mutex<Option<wgpu::Buffer>>,
 }
 
 impl GrowOnlyBuffer {
-    fn new(device: &wgpu::Device, label: &'static str) -> Self {
+    pub(crate) fn new(device: &wgpu::Device, label: &'static str) -> Self {
         Self {
             device: device.clone(),
             label,
@@ -83,7 +83,7 @@ impl GrowOnlyBuffer {
         }
     }
 
-    fn get(&self, required_bytes: u64) -> wgpu::Buffer {
+    pub(crate) fn get(&self, required_bytes: u64) -> wgpu::Buffer {
         let mut cached = self
             .buffer
             .lock()

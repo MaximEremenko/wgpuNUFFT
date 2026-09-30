@@ -29,6 +29,9 @@ mod gpu_bin_sort;
 mod gpu_dense_spread;
 mod gpu_dispatch;
 mod gpu_nd;
+mod gpu_nd_bins;
+mod gpu_nd_spread;
+mod gpu_nd_wgsl;
 mod gpu_point_bins;
 #[cfg(feature = "gpu-profiling")]
 mod gpu_profile;

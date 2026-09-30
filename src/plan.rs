@@ -96,7 +96,7 @@ impl Type1GpuExecution {
             Self::OneD(plan) => plan.set_points(device, recorder, point_count, points),
             Self::TwoD(plan) => plan.set_points(device, recorder, point_count, points),
             Self::ThreeD(plan) => plan.set_points(device, recorder, point_count, points),
-            Self::Nd(_) => Ok(()),
+            Self::Nd(plan) => plan.set_points(device, recorder, point_count, points),
         }
     }
 
@@ -139,7 +139,7 @@ impl Type1GpuExecution {
                 strengths,
                 output,
             ),
-            Self::Nd(_) => self.encode_batch(
+            Self::Nd(plan) => plan.encode_batch_with_recorded_points(
                 device,
                 recorder,
                 active_batch,
@@ -289,7 +289,7 @@ impl Type2GpuExecution {
             Self::OneD(plan) => plan.set_points(device, recorder, point_count, points),
             Self::TwoD(plan) => plan.set_points(device, recorder, point_count, points),
             Self::ThreeD(plan) => plan.set_points(device, recorder, point_count, points),
-            Self::Nd(_) => Ok(()),
+            Self::Nd(plan) => plan.set_points(device, recorder, point_count, points),
         }
     }
 
@@ -332,7 +332,7 @@ impl Type2GpuExecution {
                 coefficients,
                 output,
             ),
-            Self::Nd(_) => self.encode_batch(
+            Self::Nd(plan) => plan.encode_batch_with_recorded_points(
                 device,
                 recorder,
                 active_batch,

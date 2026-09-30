@@ -8,9 +8,8 @@ pub const DEFAULT_SIGMA: f64 = 2.0;
 /// transforms.
 pub const MAX_NUFFT_DIMENSIONS: usize = 8;
 /// Maximum dimensionality of a GPU plan. Ranks 1-3 use hand-tuned GPU paths;
-/// ranks 4 and 5 use the rank-generic implementation, which has not been
-/// validated above that.
-pub const MAX_GPU_NUFFT_DIMENSIONS: usize = 5;
+/// ranks 4 to 8 use the rank-generic implementation.
+pub const MAX_GPU_NUFFT_DIMENSIONS: usize = 8;
 
 /// Sign in the NUFFT exponential.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
