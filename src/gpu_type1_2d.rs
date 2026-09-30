@@ -36,34 +36,29 @@ const F32_BYTES: u64 = 4;
 const F64_BYTES: u64 = 8;
 const U32_BYTES: u64 = 4;
 
-mod block;
-
-use block::{BlockLayout2d, BlockSpread2d};
-
+/// The per-cell gathers of the benchmark-only comparison plans; public plans
+/// spread through the rank-generic plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Type1Gather2d {
     #[cfg_attr(not(feature = "type1-2d-tile-prototype"), allow(dead_code))]
     Global,
     #[cfg_attr(not(feature = "type1-2d-tile-prototype"), allow(dead_code))]
     Tiled16,
-    /// The block spreader, falling back to [`Self::Tiled16`] when the grid
-    /// or device cannot run it.
-    Block,
 }
 
 /// Device-specific resources for deterministic, atomics-free 2D spreading.
 ///
-/// Points are point-major `x, y` pairs. F32 plans on large enough grids use
-/// the block spreader (see [`block`]); the others build one bin per fine-grid
-/// cell, sort the point indices in each flattened `x + F0*y` bin into their
-/// original input order, and let one invocation own each fine-grid output
-/// cell.
+/// Points are point-major `x, y` pairs. The plan builds one bin per fine-grid
+/// cell, sorts the point indices in each flattened `x + F0*y` bin into their
+/// original input order, and lets one invocation own each fine-grid output
+/// cell (or each 16x16 tile). Only the benchmark-only gather comparisons use
+/// it; public plans spread through the rank-generic plan.
 pub(crate) struct Type1GpuPlan2d {
     fft: FftPlan,
     amplitudes: wgpu::Buffer,
     fine_input: wgpu::Buffer,
     fine_output: wgpu::Buffer,
-    spread: Spread2d,
+    spread: PerCellSpread2d,
     deconvolution_pipeline: wgpu::ComputePipeline,
     deconvolution_layout: wgpu::BindGroupLayout,
     max_workgroups_per_dimension: u32,
@@ -203,26 +198,8 @@ impl Type1GpuPlan2d {
         })?;
 
         let max_workgroups_per_dimension = limits.max_compute_workgroups_per_dimension;
-        let block_layout = match (precision, gather) {
-            (FftPrecision::F32, Type1Gather2d::Block) => {
-                BlockLayout2d::for_grid(kernel, fine_shape, &limits)
-            }
-            _ => None,
-        };
-        let spread = match block_layout {
-            Some(layout) => Spread2d::Block(Box::new(BlockSpread2d::new(
-                device, kernel, fine_shape, layout,
-            )?)),
-            None => {
-                let gather = match gather {
-                    Type1Gather2d::Block => Type1Gather2d::Tiled16,
-                    other => other,
-                };
-                Spread2d::PerCell(Box::new(PerCellSpread2d::new(
-                    device, kernel, fine_shape, precision, gather, fine_count,
-                )?))
-            }
-        };
+        let spread =
+            PerCellSpread2d::new(device, kernel, fine_shape, precision, gather, fine_count)?;
         let deconvolution_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.type1_2d.deconvolution",
@@ -310,40 +287,26 @@ impl Type1GpuPlan2d {
             point_count,
             points,
             strengths,
-            true,
             #[cfg(feature = "gpu-profiling")]
             GpuProfileQueryWriter::disabled(),
         )
     }
 
-    /// Records the point-dependent preparation (the stable coarse-bin order of
-    /// the block spreader) for later [`Self::encode_batch_with_recorded_points`]
-    /// calls with the same `points` contents. The per-cell gather prepares
-    /// nothing here and rebuilds its bins on every execution.
+    /// Validates `points` for later [`Self::encode_batch_with_recorded_points`]
+    /// calls. The per-cell gathers prepare nothing and rebuild their bins on
+    /// every execution.
     pub(crate) fn set_points(
         &self,
-        device: &wgpu::Device,
-        recorder: &mut GpuRecorder<'_>,
+        _device: &wgpu::Device,
+        _recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
     ) -> Result<()> {
-        let point_bytes = self.validate_points(point_count, points)?;
-        if let (Spread2d::Block(block), true) = (&self.spread, point_count > 0) {
-            block.encode_bins(
-                device,
-                recorder,
-                point_count,
-                points,
-                point_bytes,
-                #[cfg(feature = "gpu-profiling")]
-                GpuProfileQueryWriter::disabled(),
-            )?;
-        }
-        Ok(())
+        self.validate_points(point_count, points).map(|_| ())
     }
 
-    /// Like [`Self::encode_batch`], but reuses the preparation recorded by the
-    /// most recent [`Self::set_points`] for these `points`.
+    /// Like [`Self::encode_batch`]: the per-cell gathers keep no preparation
+    /// from [`Self::set_points`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_batch_with_recorded_points(
         &self,
@@ -364,7 +327,6 @@ impl Type1GpuPlan2d {
             points,
             strengths,
             output,
-            false,
             #[cfg(feature = "gpu-profiling")]
             GpuProfileQueryWriter::disabled(),
         )
@@ -438,7 +400,6 @@ impl Type1GpuPlan2d {
             points,
             strengths,
             output,
-            true,
             #[cfg(feature = "gpu-profiling")]
             GpuProfileQueryWriter::disabled(),
         )
@@ -475,7 +436,6 @@ impl Type1GpuPlan2d {
             points,
             strengths,
             output,
-            true,
             GpuProfileQueryWriter::enabled(query_set, &layout),
         )?;
         Ok(layout)
@@ -491,7 +451,6 @@ impl Type1GpuPlan2d {
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
         output: &wgpu::Buffer,
-        record_points: bool,
         #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
         let output_elements =
@@ -535,7 +494,6 @@ impl Type1GpuPlan2d {
             point_count,
             points,
             strengths,
-            record_points,
             #[cfg(feature = "gpu-profiling")]
             profile,
         )?;
@@ -561,7 +519,6 @@ impl Type1GpuPlan2d {
         point_count: usize,
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
-        record_points: bool,
         #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
         if point_count == 0 {
@@ -596,50 +553,23 @@ impl Type1GpuPlan2d {
             self.precision,
         )?;
 
-        match &self.spread {
-            Spread2d::Block(block) => {
-                if record_points {
-                    block.encode_bins(
-                        device,
-                        recorder,
-                        point_count,
-                        points,
-                        point_bytes,
-                        #[cfg(feature = "gpu-profiling")]
-                        profile,
-                    )?;
-                }
-                block.encode_spread(
-                    device,
-                    recorder,
-                    active_batch,
-                    point_count,
-                    strengths,
-                    strength_bytes,
-                    &self.fine_input,
-                    active_fine_bytes,
-                    #[cfg(feature = "gpu-profiling")]
-                    profile,
-                )?;
-            }
-            Spread2d::PerCell(per_cell) => per_cell.encode(
-                device,
-                recorder,
-                active_batch,
-                point_count,
-                points,
-                point_bytes,
-                strengths,
-                strength_bytes,
-                &self.fine_input,
-                active_fine_bytes,
-                self.max_workgroups_per_dimension,
-                self.max_storage_binding_bytes,
-                self.max_buffer_bytes,
-                #[cfg(feature = "gpu-profiling")]
-                profile,
-            )?,
-        }
+        self.spread.encode(
+            device,
+            recorder,
+            active_batch,
+            point_count,
+            points,
+            point_bytes,
+            strengths,
+            strength_bytes,
+            &self.fine_input,
+            active_fine_bytes,
+            self.max_workgroups_per_dimension,
+            self.max_storage_binding_bytes,
+            self.max_buffer_bytes,
+            #[cfg(feature = "gpu-profiling")]
+            profile,
+        )?;
         if active_batch < self.batch_capacity {
             recorder.clear_buffer(
                 &self.fine_input,
@@ -697,12 +627,6 @@ impl Type1GpuPlan2d {
             Ok(())
         }
     }
-}
-
-/// How a plan spreads points onto its fine grid.
-enum Spread2d {
-    Block(Box<BlockSpread2d>),
-    PerCell(Box<PerCellSpread2d>),
 }
 
 /// One bin per fine-grid cell and one gathering invocation per cell (or per
@@ -795,7 +719,7 @@ impl PerCellSpread2d {
                     generate_gather_wgsl(kernel, fine_shape),
                     workgroups_for_elements(fine_count)?,
                 ),
-                Type1Gather2d::Tiled16 | Type1Gather2d::Block => {
+                Type1Gather2d::Tiled16 => {
                     let halo_side = tiled_gather_halo_side(kernel.width())?;
                     if fine_shape.iter().any(|&length| length < halo_side)
                         || maximum_workgroup_size < TILED_GATHER_WORKGROUP_SIZE

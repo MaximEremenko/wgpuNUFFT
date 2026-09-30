@@ -4,10 +4,10 @@
 //! The crate provides reusable planning metadata, direct
 //! `f64` reference transforms, and exponential-of-semicircle kernel tables for
 //! all three transform types. GPU execution supports rank up to
-//! [`MAX_GPU_NUFFT_DIMENSIONS`]: dedicated 1D, 2D, and 3D paths are
-//! complemented by a rank-generic path for 4D to 8D, which also spreads the
-//! lower-rank type-1 transforms the dedicated `f32` spreaders do not cover,
-//! and the CPU reference transforms reach [`MAX_NUFFT_DIMENSIONS`] too.
+//! [`MAX_GPU_NUFFT_DIMENSIONS`]: type 1 spreads through one rank-generic
+//! spreader in every rank, type 2 interpolates through dedicated 1D, 2D, and
+//! 3D paths and a rank-generic path for 4D to 8D, and the CPU reference
+//! transforms reach [`MAX_NUFFT_DIMENSIONS`] too.
 //! Plans support `f32`, native `f64`, and portable double-float precision,
 //! and encode spreading or interpolation around a fine-grid C2C transform
 //! using caller-owned input and output buffers. With the default `cpu` feature,
@@ -38,7 +38,6 @@ mod gpu_point_bins;
 mod gpu_profile;
 mod gpu_recorder;
 mod gpu_scan;
-mod gpu_type1;
 mod gpu_type1_2d;
 mod gpu_type1_3d;
 mod gpu_type1_nd;

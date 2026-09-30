@@ -724,8 +724,8 @@ fn validate_binned_type2_large_set_matches_prefix(device: &wgpu::Device, queue: 
     );
 }
 
-/// Mode shapes whose fine grids (at least 64 cells per axis) take the 2D
-/// block spreader; the second is odd on both axes.
+/// Mode shapes whose fine grids span several spreading blocks per axis; the
+/// second is odd on both axes.
 const BLOCK_SPREAD_SHAPES: [[usize; DIMENSIONS]; 2] = [[32, 40], [33, 37]];
 
 fn validate_block_type1_oracle_matrix(device: &wgpu::Device, queue: &wgpu::Queue) {

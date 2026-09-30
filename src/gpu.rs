@@ -8,7 +8,7 @@ use crate::config::{ModeOrder, NufftConfig, NufftSign};
 use crate::direct::mode_for_storage_index;
 use crate::error::{NufftError, Result};
 use crate::gpu_dispatch::split_workgroups;
-use crate::gpu_point_bins::{PointBinOrder, PointBins};
+use crate::gpu_point_bins::PointBins;
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::{GpuProfileQueryWriter, NufftGpuProfileLayout};
 use crate::gpu_recorder::GpuRecorder;
@@ -206,8 +206,7 @@ impl Type2GpuPlan {
                     kernel,
                     &[fine_length],
                     &[BINNED_INTERPOLATION_BIN_SIDE],
-                    PointBinOrder::Grouped,
-                    &crate::gpu_type1::generate_binned_position_wgsl(fine_length),
+                    &generate_binned_position_wgsl(fine_length),
                 )?;
                 let pipeline = create_compute_pipeline(
                     device,
@@ -1392,6 +1391,82 @@ fn main(
     }}
 }}
 "#,
+    )
+}
+
+/// Folds one-axis coordinates into the fine grid in double-float arithmetic.
+fn generate_fold_position_wgsl(fine_length: usize) -> String {
+    let fine_length_f32 = format_wgsl_f32(fine_length as f32);
+    let position_scale = fine_length as f64 / std::f64::consts::TAU;
+    let position_scale_hi = position_scale as f32;
+    let position_scale_lo = (position_scale - f64::from(position_scale_hi)) as f32;
+    format!(
+        r#"const FINE_LENGTH: u32 = {fine_length}u;
+const FINE_LENGTH_I32: i32 = {fine_length}i;
+const FINE_LENGTH_F32: f32 = {fine_length_f32};
+const POSITION_SCALE_HI: f32 = {position_scale_hi};
+const POSITION_SCALE_LO: f32 = {position_scale_lo};
+const GRID_ORIGIN: f32 = {grid_origin};
+
+fn position_is_negative(value: Df64) -> bool {{
+    return value.hi < 0.0 || (value.hi == 0.0 && value.lo < 0.0);
+}}
+
+fn position_at_least_grid(value: Df64) -> bool {{
+    return value.hi > FINE_LENGTH_F32 ||
+        (value.hi == FINE_LENGTH_F32 && value.lo >= 0.0);
+}}
+
+fn fold_position(point: f32) -> Df64 {{
+    let scaled = df64_mul(
+        Df64(point, 0.0),
+        Df64(POSITION_SCALE_HI, POSITION_SCALE_LO),
+    );
+    var position = df64_add(scaled, Df64(GRID_ORIGIN, 0.0));
+    if (position_is_negative(position)) {{
+        position = df64_add(position, Df64(FINE_LENGTH_F32, 0.0));
+    }}
+    if (position_is_negative(position)) {{
+        position = df64_add(position, Df64(FINE_LENGTH_F32, 0.0));
+    }}
+    if (position_at_least_grid(position)) {{
+        position = df64_sub(position, Df64(FINE_LENGTH_F32, 0.0));
+    }}
+    if (position_at_least_grid(position)) {{
+        position = df64_sub(position, Df64(FINE_LENGTH_F32, 0.0));
+    }}
+    return position;
+}}
+
+fn floor_df64_to_i32(value: Df64) -> i32 {{
+    let base = floor(value.hi);
+    let remainder = df64_sub(value, Df64(base, 0.0));
+    let has_negative_remainder = remainder.hi < 0.0 ||
+        (remainder.hi == 0.0 && remainder.lo < 0.0);
+    return i32(base) - select(0, 1, has_negative_remainder);
+}}
+"#,
+        position_scale_hi = format_wgsl_f32(position_scale_hi),
+        position_scale_lo = format_wgsl_f32(position_scale_lo),
+        grid_origin = format_wgsl_f32((fine_length / 2) as f32),
+    )
+}
+
+/// Position WGSL with the axis-0 names that
+/// [`PointBins`](crate::gpu_point_bins::PointBins) expects of a one-axis grid.
+pub(crate) fn generate_binned_position_wgsl(fine_length: usize) -> String {
+    format!(
+        "{}
+const FINE_0: u32 = FINE_LENGTH;
+const FINE_0_F32: f32 = FINE_LENGTH_F32;
+const POSITION_SCALE_0_HI: f32 = POSITION_SCALE_HI;
+const GRID_ORIGIN_0: f32 = GRID_ORIGIN;
+
+fn fold_position_0(point: f32) -> Df64 {{
+    return fold_position(point);
+}}
+",
+        generate_fold_position_wgsl(fine_length)
     )
 }
 

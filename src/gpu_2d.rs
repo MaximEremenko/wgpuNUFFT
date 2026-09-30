@@ -8,7 +8,7 @@ use crate::config::{ModeOrder, NufftConfig, NufftSign};
 use crate::direct::mode_for_storage_index;
 use crate::error::{NufftError, Result};
 use crate::gpu_dispatch::split_workgroups;
-use crate::gpu_point_bins::{PointBinOrder, PointBins};
+use crate::gpu_point_bins::PointBins;
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::{GpuProfileQueryWriter, NufftGpuProfileLayout};
 use crate::gpu_recorder::GpuRecorder;
@@ -261,7 +261,6 @@ impl Type2GpuPlan2d {
                     kernel,
                     fine_shape,
                     &[BINNED_INTERPOLATION_BIN_SIDE; DIMENSIONS],
-                    PointBinOrder::Grouped,
                     &crate::gpu_type1_2d::generate_position_wgsl([fine_shape[0], fine_shape[1]]),
                 )?;
                 let pipeline = create_compute_pipeline(

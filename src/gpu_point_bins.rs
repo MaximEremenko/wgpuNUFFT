@@ -12,26 +12,19 @@
 //! the distance from support cell `start + j` as `(j + hi) + lo`, which
 //! matches a per-use df64 subtraction without repeating df64 folding.
 //!
-//! [`PointBinOrder::Grouped`] suits consumers whose per-point results do not
-//! depend on the order inside a bin, such as the binned type-2
-//! interpolations, which walk points in bin order only for fine-grid cache
-//! locality. Bins then come from a plain `f32` fold (a point near a bin edge
-//! may land in the neighbouring bin), and the order inside a bin follows
-//! atomic scheduling. While the prepared data of a point set is small enough
-//! to stay cache-resident, one pass writes every point's prepared data
-//! straight to its slot; larger sets scatter point indices first and then
-//! prepare in slot order, which keeps the wide writes coalesced.
-//! [`PointBinOrder::Stable`] bins with the exact df64
-//! fold and restores original point order inside every bin, so the order is
-//! deterministic: [`LargeBinSort`] sorts bins above [`SMALL_BIN`] points in
-//! parallel, and the prepare pass ranks the points of smaller bins. The type-1
-//! spreaders sum points in this order, walking the bins through
-//! [`PointBins::bin_offsets`].
+//! The consumers, the binned type-2 interpolations, walk points in bin order
+//! only for fine-grid cache locality, so their per-point results do not
+//! depend on the order inside a bin. Bins therefore come from a plain `f32`
+//! fold (a point near a bin edge may land in the neighbouring bin), and the
+//! order inside a bin follows atomic scheduling. While the prepared data of a
+//! point set is small enough to stay cache-resident, one pass writes every
+//! point's prepared data straight to its slot; larger sets scatter point
+//! indices first and then prepare in slot order, which keeps the wide writes
+//! coalesced.
 
 use std::sync::Mutex;
 
 use crate::error::{NufftError, Result};
-use crate::gpu_bin_sort::{LargeBinSort, SMALL_BIN};
 use crate::gpu_dispatch::split_workgroups;
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::GpuProfileQueryWriter;
@@ -56,15 +49,6 @@ const PREPARED_OFFSET_BYTES_PER_AXIS: u64 = 8;
 /// beat the indexed passes by 13-17% up to 32 MiB (2D, 1M points) but was
 /// 2.8x slower at 80 MiB (3D, 2M points), once the writes left the cache.
 const FUSED_PREPARE_LIMIT_BYTES: u64 = 32 << 20;
-
-/// How [`PointBins::encode`] orders the points inside each bin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PointBinOrder {
-    /// Scheduling-dependent order inside approximate bins.
-    Grouped,
-    /// Original point order inside exact bins.
-    Stable,
-}
 
 /// Plan-owned storage that grows with the largest point set. A clone of an
 /// older allocation stays alive in command buffers that captured it.
@@ -115,16 +99,15 @@ pub(crate) struct PreparedPoints {
 pub(crate) struct PointBins {
     dimensions: usize,
     /// One count per bin plus a trailing zero, so the scan also yields the
-    /// total, and behind them the flag stable counting sets when a bin holds
-    /// more than [`SMALL_BIN`] points.
+    /// total.
     bin_counts: wgpu::Buffer,
     bin_offsets: wgpu::Buffer,
     point_slots: GrowOnlyBuffer,
     count_pipeline: wgpu::ComputePipeline,
     count_layout: wgpu::BindGroupLayout,
     prefix_scan: GpuExclusiveScanU32,
-    /// Grouped mode only: every point prepares itself into its slot.
-    fused: Option<FusedPrepare>,
+    /// Every point prepares itself into its slot, for small point sets.
+    fused: FusedPrepare,
     indexed: IndexedPrepare,
     prepared_starts: GrowOnlyBuffer,
     prepared_offsets: GrowOnlyBuffer,
@@ -138,12 +121,10 @@ struct FusedPrepare {
     layout: wgpu::BindGroupLayout,
 }
 
-/// Index scatter, the large-bin sort of stable mode, then preparation in
-/// slot order.
+/// Index scatter, then preparation in slot order.
 struct IndexedPrepare {
     scatter_pipeline: wgpu::ComputePipeline,
     scatter_layout: wgpu::BindGroupLayout,
-    sort: Option<LargeBinSort>,
     prepare_pipeline: wgpu::ComputePipeline,
     prepare_layout: wgpu::BindGroupLayout,
     sorted_indices: GrowOnlyBuffer,
@@ -161,7 +142,6 @@ impl PointBins {
         kernel: EsKernel,
         fine_shape: &[usize],
         bin_shape: &[usize],
-        order: PointBinOrder,
         position_wgsl: &str,
     ) -> Result<Self> {
         let dimensions = fine_shape.len();
@@ -192,21 +172,19 @@ impl PointBins {
             entry_count,
             U32_BYTES,
         )?;
-        // The counts also carry the large-bin flag behind their trailing zero.
-        let count_bytes = entry_bytes + U32_BYTES;
         validate_binding_limit(
             "coarse point-bin counts and offsets",
-            count_bytes,
+            entry_bytes,
             limits.max_storage_buffer_binding_size,
         )?;
         validate_buffer_limit(
             "coarse point-bin counts and offsets",
-            count_bytes,
+            entry_bytes,
             limits.max_buffer_size,
         )?;
         let bin_counts = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("wgpu_nufft.point_bins.bin_counts"),
-            size: count_bytes,
+            size: entry_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -219,28 +197,20 @@ impl PointBins {
         let count_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.point_bins.count",
-            &generate_bin_count_wgsl(
-                bin_shape,
-                &bins,
-                order == PointBinOrder::Stable,
-                position_wgsl,
-            ),
+            &generate_bin_count_wgsl(bin_shape, &bins, position_wgsl),
         );
         let count_layout = count_pipeline.get_bind_group_layout(0);
         let prefix_scan = GpuExclusiveScanU32::new(device, entry_count)?;
         let max_workgroups_per_dimension = limits.max_compute_workgroups_per_dimension;
-        let fused = (order == PointBinOrder::Grouped).then(|| {
-            let pipeline = create_compute_pipeline(
-                device,
-                "wgpu_nufft.point_bins.scatter_prepare",
-                &generate_scatter_prepare_wgsl(kernel, dimensions, position_wgsl),
-            );
-            FusedPrepare {
-                layout: pipeline.get_bind_group_layout(0),
-                pipeline,
-            }
-        });
-        let sort = (order == PointBinOrder::Stable).then(|| LargeBinSort::new(device));
+        let fused_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.point_bins.scatter_prepare",
+            &generate_scatter_prepare_wgsl(kernel, dimensions, position_wgsl),
+        );
+        let fused = FusedPrepare {
+            layout: fused_pipeline.get_bind_group_layout(0),
+            pipeline: fused_pipeline,
+        };
         let scatter_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.point_bins.scatter",
@@ -249,17 +219,11 @@ impl PointBins {
         let prepare_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.point_bins.prepare",
-            &generate_prepare_wgsl(
-                kernel,
-                dimensions,
-                order == PointBinOrder::Stable,
-                position_wgsl,
-            ),
+            &generate_prepare_wgsl(kernel, dimensions, position_wgsl),
         );
         let indexed = IndexedPrepare {
             scatter_layout: scatter_pipeline.get_bind_group_layout(0),
             scatter_pipeline,
-            sort,
             prepare_layout: prepare_pipeline.get_bind_group_layout(0),
             prepare_pipeline,
             sorted_indices: GrowOnlyBuffer::new(device, "wgpu_nufft.point_bins.sorted_indices"),
@@ -280,12 +244,6 @@ impl PointBins {
             max_storage_binding_bytes: limits.max_storage_buffer_binding_size,
             max_buffer_bytes: limits.max_buffer_size,
         })
-    }
-
-    /// Bin offsets of the last [`Self::encode`], one entry per coarse bin plus
-    /// a terminal total, in axis-zero-fastest bin order.
-    pub(crate) fn bin_offsets(&self) -> &wgpu::Buffer {
-        &self.bin_offsets
     }
 
     fn scratch(
@@ -328,11 +286,8 @@ impl PointBins {
     /// points. Both stay valid for consumers until the next call; executions
     /// must keep queue order.
     ///
-    /// With profiling, stable mode writes the start marker and the ends of the
-    /// count, scan, scatter, and sort-and-prepare stages at offsets 0-4 of the
-    /// type-1 layout (the scan ends where the scatter begins). Grouped mode
-    /// writes the start marker at offset 0 and the end of the last pass at
-    /// offset 1.
+    /// With profiling, writes the start marker at offset 0 and the end of the
+    /// last pass at offset 1.
     ///
     /// # Panics
     ///
@@ -365,12 +320,7 @@ impl PointBins {
         let bin_counts = &self.bin_counts;
         let bin_offsets = &self.bin_offsets;
         let offset_bytes = bin_offsets.size();
-        #[cfg(feature = "gpu-profiling")]
-        let stable = self.indexed.sort.is_some();
-        let fused = self
-            .fused
-            .as_ref()
-            .filter(|_| prepared.start_bytes + prepared.offset_bytes <= FUSED_PREPARE_LIMIT_BYTES);
+        let fuse = prepared.start_bytes + prepared.offset_bytes <= FUSED_PREPARE_LIMIT_BYTES;
 
         let count_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.point_bins.count.bind_group"),
@@ -391,14 +341,13 @@ impl PointBins {
             &count_bind_group,
             point_dispatch,
             #[cfg(feature = "gpu-profiling")]
-            stable
-                .then(|| profile.timestamp_writes(None, Some(1)))
-                .flatten(),
+            None,
         );
         self.prefix_scan
             .encode(device, recorder, bin_counts, bin_offsets)?;
 
-        if let Some(fused) = fused {
+        if fuse {
+            let fused = &self.fused;
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("wgpu_nufft.point_bins.scatter_prepare.bind_group"),
                 layout: &fused.layout,
@@ -438,21 +387,15 @@ impl PointBins {
                 binding_entry(2, &sorted_indices, index_bytes),
             ],
         });
-        let mut prepare_entries = vec![
-            binding_entry(0, points, point_bytes),
-            binding_entry(1, &sorted_indices, index_bytes),
-            binding_entry(2, &prepared.starts, prepared.start_bytes),
-            binding_entry(3, &prepared.offsets, prepared.offset_bytes),
-        ];
-        if indexed.sort.is_some() {
-            // Stable mode ranks the points of small bins while preparing.
-            prepare_entries.push(binding_entry(4, &point_slots, slot_bytes));
-            prepare_entries.push(binding_entry(5, bin_offsets, offset_bytes));
-        }
         let prepare_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.point_bins.prepare.bind_group"),
             layout: &indexed.prepare_layout,
-            entries: &prepare_entries,
+            entries: &[
+                binding_entry(0, points, point_bytes),
+                binding_entry(1, &sorted_indices, index_bytes),
+                binding_entry(2, &prepared.starts, prepared.start_bytes),
+                binding_entry(3, &prepared.offsets, prepared.offset_bytes),
+            ],
         });
         encode_pass(
             recorder,
@@ -461,22 +404,8 @@ impl PointBins {
             &scatter_bind_group,
             point_dispatch,
             #[cfg(feature = "gpu-profiling")]
-            stable
-                .then(|| profile.timestamp_writes(Some(2), Some(3)))
-                .flatten(),
+            None,
         );
-        if let Some(sort) = &indexed.sort {
-            // The count pass left the large-bin flag in the last count word.
-            sort.encode(
-                device,
-                recorder,
-                bin_offsets,
-                offset_bytes,
-                bin_counts,
-                &sorted_indices,
-                point_count,
-            )?;
-        }
         encode_pass(
             recorder,
             "wgpu_nufft.point_bins.prepare.pass",
@@ -484,18 +413,13 @@ impl PointBins {
             &prepare_bind_group,
             point_dispatch,
             #[cfg(feature = "gpu-profiling")]
-            profile.timestamp_writes(None, Some(if stable { 4 } else { 1 })),
+            profile.timestamp_writes(None, Some(1)),
         );
         Ok(())
     }
 }
 
-fn generate_bin_count_wgsl(
-    bin_shape: &[usize],
-    bins: &[usize],
-    exact: bool,
-    position_wgsl: &str,
-) -> String {
+fn generate_bin_count_wgsl(bin_shape: &[usize], bins: &[usize], position_wgsl: &str) -> String {
     let dimensions = bin_shape.len();
     let constants: String = bin_shape
         .iter()
@@ -513,15 +437,9 @@ fn generate_bin_count_wgsl(
     // and preparation gives such a point zero weight.
     let cells: String = (0..dimensions)
         .map(|axis| {
-            if exact {
-                format!(
-                    "    let cell_{axis} = min(u32(max(floor_df64_to_i32(fold_position_{axis}(points[point_base + {axis}u])), 0)), FINE_{axis} - 1u);\n"
-                )
-            } else {
-                format!(
-                    "    let cell_{axis} = approximate_cell(points[point_base + {axis}u], POSITION_SCALE_{axis}_HI, GRID_ORIGIN_{axis}, FINE_{axis}_F32, FINE_{axis});\n"
-                )
-            }
+            format!(
+                "    let cell_{axis} = approximate_cell(points[point_base + {axis}u], POSITION_SCALE_{axis}_HI, GRID_ORIGIN_{axis}, FINE_{axis}_F32, FINE_{axis});\n"
+            )
         })
         .collect();
     // Axis-zero-fastest bin index, nested from the last axis inward.
@@ -529,22 +447,9 @@ fn generate_bin_count_wgsl(
     for axis in (0..dimensions - 1).rev() {
         bin = format!("cell_{axis} / BIN_SIDE_{axis} + BINS_{axis} * ({bin})");
     }
-    let record = if exact {
-        // The point that overfills a small bin flags the large-bin sort,
-        // behind the counts and their trailing zero.
-        "    let rank = atomicAdd(&bin_counts[bin], 1u);
-    point_slots[point_index] = vec2<u32>(bin, rank);
-    if (rank == SMALL_BIN) {
-        atomicMax(&bin_counts[arrayLength(&bin_counts) - 1u], 1u);
-    }
-"
-    } else {
-        "    point_slots[point_index] = vec2<u32>(bin, atomicAdd(&bin_counts[bin], 1u));\n"
-    };
     let entry = format!(
         r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
 const POINT_DIMENSIONS: u32 = {dimensions}u;
-const SMALL_BIN: u32 = {SMALL_BIN}u;
 {constants}
 @group(0) @binding(0) var<storage, read> points: array<f32>;
 @group(0) @binding(1) var<storage, read_write> bin_counts: array<atomic<u32>>;
@@ -572,7 +477,8 @@ fn main(
 
     let point_base = point_index * POINT_DIMENSIONS;
 {cells}    let bin = {bin};
-{record}}}
+    point_slots[point_index] = vec2<u32>(bin, atomicAdd(&bin_counts[bin], 1u));
+}}
 "#,
     );
     format!("{}\n{position_wgsl}\n{entry}", wgpu_fft::kernels::DF64_WGSL)
@@ -682,46 +588,15 @@ fn prepare_statements(dimensions: usize) -> String {
     format!("{axes}    prepared_starts[slot] = vec4<i32>({starts}, bitcast<i32>(point_index));\n")
 }
 
-/// Prepares binned points in slot order. In stable mode the scatter left
-/// small bins in atomic order: each of their points then takes the slot of
-/// its rank by original index within the bin, while [`LargeBinSort`] already
-/// ordered the larger bins, whose points keep their slots.
-fn generate_prepare_wgsl(
-    kernel: EsKernel,
-    dimensions: usize,
-    stable: bool,
-    position_wgsl: &str,
-) -> String {
+/// Prepares binned points in slot order.
+fn generate_prepare_wgsl(kernel: EsKernel, dimensions: usize, position_wgsl: &str) -> String {
     let header = prepare_header(kernel, dimensions, 2);
     let statements = prepare_statements(dimensions);
-    let (rank_bindings, rank) = if stable {
-        (
-            "@group(0) @binding(4) var<storage, read> point_slots: array<vec2<u32>>;
-@group(0) @binding(5) var<storage, read> bin_offsets: array<u32>;
-",
-            format!(
-                "    var slot = record;
-    let bin = point_slots[point_index].x;
-    let bin_start = bin_offsets[bin];
-    let bin_end = bin_offsets[bin + 1u];
-    if (bin_end - bin_start <= {SMALL_BIN}u) {{
-        var rank = 0u;
-        for (var other = bin_start; other < bin_end; other = other + 1u) {{
-            if (sorted_indices[other] < point_index) {{ rank = rank + 1u; }}
-        }}
-        slot = bin_start + rank;
-    }}
-"
-            ),
-        )
-    } else {
-        ("", "    let slot = record;\n".to_string())
-    };
     let entry = format!(
         r#"{header}
 @group(0) @binding(0) var<storage, read> points: array<f32>;
 @group(0) @binding(1) var<storage, read> sorted_indices: array<u32>;
-{rank_bindings}
+
 @compute @workgroup_size({WORKGROUP_SIZE})
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -735,7 +610,8 @@ fn main(
     if (record >= total) {{ return; }}
 
     let point_index = sorted_indices[record];
-{rank}    let point_base = point_index * POINT_DIMENSIONS;
+    let slot = record;
+    let point_base = point_index * POINT_DIMENSIONS;
 {statements}}}
 "#,
     );
@@ -784,14 +660,12 @@ mod tests {
     #[test]
     fn one_axis_binning_shaders_validate_with_the_1d_position_adapter() {
         let kernel = EsKernel::for_tolerance(1.0e-6, 2.0).unwrap();
-        let position = crate::gpu_type1::generate_binned_position_wgsl(128);
-        for exact in [false, true] {
-            let count = generate_bin_count_wgsl(&[8], &[16], exact, &position);
-            assert!(count.contains("let bin = cell_0 / BIN_SIDE_0;"));
-            assert_valid_wgsl(&count);
-        }
+        let position = crate::gpu::generate_binned_position_wgsl(128);
+        let count = generate_bin_count_wgsl(&[8], &[16], &position);
+        assert!(count.contains("let bin = cell_0 / BIN_SIDE_0;"));
+        assert_valid_wgsl(&count);
         for source in [
-            generate_prepare_wgsl(kernel, 1, true, &position),
+            generate_prepare_wgsl(kernel, 1, &position),
             generate_scatter_prepare_wgsl(kernel, 1, &position),
         ] {
             assert!(source.contains("vec4<i32>(start_0, 0, 0, bitcast<i32>(point_index))"));
@@ -807,22 +681,18 @@ mod tests {
         let kernel = EsKernel::for_tolerance(1.0e-6, 2.0).unwrap();
         let position_2d = crate::gpu_type1_2d::generate_position_wgsl([40, 24]);
         let position_3d = crate::gpu_type1_3d::generate_position_wgsl([40, 24, 32]);
-        for exact in [false, true] {
-            let count_2d = generate_bin_count_wgsl(&[8, 8], &[5, 3], exact, &position_2d);
-            assert!(count_2d
-                .contains("let bin = cell_0 / BIN_SIDE_0 + BINS_0 * (cell_1 / BIN_SIDE_1);"));
-            assert_eq!(
-                count_2d.contains("floor_df64_to_i32(fold_position_0"),
-                exact
-            );
-            let count_3d = generate_bin_count_wgsl(&[4, 4, 4], &[10, 6, 8], exact, &position_3d);
-            assert!(count_3d.contains(
-                "let bin = cell_0 / BIN_SIDE_0 + BINS_0 * (cell_1 / BIN_SIDE_1 + BINS_1 * (cell_2 / BIN_SIDE_2));"
-            ));
-            assert_valid_wgsl(&count_2d);
-            assert_valid_wgsl(&count_3d);
-        }
-        let prepare_2d = generate_prepare_wgsl(kernel, 2, false, &position_2d);
+        let count_2d = generate_bin_count_wgsl(&[8, 8], &[5, 3], &position_2d);
+        assert!(
+            count_2d.contains("let bin = cell_0 / BIN_SIDE_0 + BINS_0 * (cell_1 / BIN_SIDE_1);")
+        );
+        assert!(count_2d.contains("approximate_cell(points[point_base + 0u]"));
+        let count_3d = generate_bin_count_wgsl(&[4, 4, 4], &[10, 6, 8], &position_3d);
+        assert!(count_3d.contains(
+            "let bin = cell_0 / BIN_SIDE_0 + BINS_0 * (cell_1 / BIN_SIDE_1 + BINS_1 * (cell_2 / BIN_SIDE_2));"
+        ));
+        assert_valid_wgsl(&count_2d);
+        assert_valid_wgsl(&count_3d);
+        let prepare_2d = generate_prepare_wgsl(kernel, 2, &position_2d);
         assert!(prepare_2d.contains("vec4<i32>(start_0, start_1, 0, bitcast<i32>(point_index))"));
         let prepare_3d = generate_scatter_prepare_wgsl(kernel, 3, &position_3d);
         assert!(
@@ -836,7 +706,7 @@ mod tests {
         for source in [
             prepare_2d,
             prepare_3d,
-            generate_prepare_wgsl(kernel, 3, true, &position_3d),
+            generate_prepare_wgsl(kernel, 3, &position_3d),
             generate_scatter_prepare_wgsl(kernel, 2, &position_2d),
             generate_bin_scatter_wgsl(),
         ] {

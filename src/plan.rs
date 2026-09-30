@@ -10,7 +10,6 @@ use crate::gpu_nd::Type2GpuPlanNd;
 #[cfg(feature = "gpu-profiling")]
 use crate::gpu_profile::NufftGpuProfileLayout;
 use crate::gpu_recorder::GpuRecorder;
-use crate::gpu_type1::Type1GpuPlan;
 use crate::gpu_type1_2d::{Type1Gather2d, Type1GpuPlan2d};
 use crate::gpu_type1_3d::{Type1Gather3d, Type1GpuPlan3d};
 use crate::gpu_type1_nd::Type1GpuPlanNd;
@@ -27,7 +26,6 @@ pub enum NufftKind {
 // One boxed execution per plan; every variant embeds an FFT plan.
 #[allow(clippy::large_enum_variant)]
 enum Type1GpuExecution {
-    OneD(Type1GpuPlan),
     TwoD(Type1GpuPlan2d),
     ThreeD(Type1GpuPlan3d),
     Nd(Type1GpuPlanNd),
@@ -46,15 +44,6 @@ impl Type1GpuExecution {
         output: &wgpu::Buffer,
     ) -> Result<()> {
         match self {
-            Self::OneD(plan) => plan.encode_batch(
-                device,
-                recorder,
-                active_batch,
-                point_count,
-                points,
-                strengths,
-                output,
-            ),
             Self::TwoD(plan) => plan.encode_batch(
                 device,
                 recorder,
@@ -93,7 +82,6 @@ impl Type1GpuExecution {
         points: &wgpu::Buffer,
     ) -> Result<()> {
         match self {
-            Self::OneD(plan) => plan.set_points(device, recorder, point_count, points),
             Self::TwoD(plan) => plan.set_points(device, recorder, point_count, points),
             Self::ThreeD(plan) => plan.set_points(device, recorder, point_count, points),
             Self::Nd(plan) => plan.set_points(device, recorder, point_count, points),
@@ -112,15 +100,6 @@ impl Type1GpuExecution {
         output: &wgpu::Buffer,
     ) -> Result<()> {
         match self {
-            Self::OneD(plan) => plan.encode_batch_with_recorded_points(
-                device,
-                recorder,
-                active_batch,
-                point_count,
-                points,
-                strengths,
-                output,
-            ),
             Self::TwoD(plan) => plan.encode_batch_with_recorded_points(
                 device,
                 recorder,
@@ -165,16 +144,6 @@ impl Type1GpuExecution {
         first_query: u32,
     ) -> Result<NufftGpuProfileLayout> {
         match self {
-            Self::OneD(plan) => plan.encode_profiled(
-                device,
-                recorder,
-                point_count,
-                points,
-                strengths,
-                output,
-                query_set,
-                first_query,
-            ),
             Self::TwoD(plan) => plan.encode_profiled(
                 device,
                 recorder,
@@ -211,7 +180,6 @@ impl Type1GpuExecution {
     #[cfg(feature = "gpu-profiling")]
     fn fft_diagnostics(&self) -> wgpu_fft::FftDiagnostics {
         match self {
-            Self::OneD(plan) => plan.fft_diagnostics(),
             Self::TwoD(plan) => plan.fft_diagnostics(),
             Self::ThreeD(plan) => plan.fft_diagnostics(),
             Self::Nd(plan) => plan.fft_diagnostics(),
@@ -491,13 +459,7 @@ impl NufftPlan {
         queue: &wgpu::Queue,
         config: NufftConfig,
     ) -> Result<Self> {
-        Self::type1_gpu_with_gathers(
-            device,
-            queue,
-            config,
-            Type1Gather2d::Block,
-            Type1Gather3d::Block,
-        )
+        Self::type1_gpu_with_gathers(device, queue, config, None, None)
     }
 
     /// Benchmark-only constructor retaining the original one-cell-per-lane 2D
@@ -516,13 +478,7 @@ impl NufftPlan {
                 supported: 2,
             });
         }
-        Self::type1_gpu_with_gathers(
-            device,
-            queue,
-            config,
-            Type1Gather2d::Global,
-            Type1Gather3d::Global,
-        )
+        Self::type1_gpu_with_gathers(device, queue, config, Some(Type1Gather2d::Global), None)
     }
 
     /// Benchmark-only constructor selecting the 16x16 shared-memory 2D gather
@@ -541,17 +497,11 @@ impl NufftPlan {
                 supported: 2,
             });
         }
-        Self::type1_gpu_with_gathers(
-            device,
-            queue,
-            config,
-            Type1Gather2d::Tiled16,
-            Type1Gather3d::Global,
-        )
+        Self::type1_gpu_with_gathers(device, queue, config, Some(Type1Gather2d::Tiled16), None)
     }
 
     /// Benchmark-only constructor retaining the one-cell-per-lane 3D gather
-    /// as a deterministic comparison path for the tiled default.
+    /// as a deterministic comparison path for the tiled gather.
     #[doc(hidden)]
     #[cfg(feature = "type1-3d-tile-prototype")]
     pub fn type1_gpu_with_global_3d_gather_for_testing(
@@ -566,18 +516,11 @@ impl NufftPlan {
                 supported: 3,
             });
         }
-        Self::type1_gpu_with_gathers(
-            device,
-            queue,
-            config,
-            Type1Gather2d::Tiled16,
-            Type1Gather3d::Global,
-        )
+        Self::type1_gpu_with_gathers(device, queue, config, None, Some(Type1Gather3d::Global))
     }
 
-    /// Benchmark-only constructor explicitly requesting the `8x8x4`
-    /// shared-memory 3D gather used by the public default. Devices without the
-    /// required limits use the global fallback.
+    /// Benchmark-only constructor requesting the `8x8x4` shared-memory 3D
+    /// gather. Devices without the required limits use the global gather.
     #[doc(hidden)]
     #[cfg(feature = "type1-3d-tile-prototype")]
     pub fn type1_gpu_with_tiled_3d_gather_for_testing(
@@ -592,49 +535,24 @@ impl NufftPlan {
                 supported: 3,
             });
         }
-        Self::type1_gpu_with_gathers(
-            device,
-            queue,
-            config,
-            Type1Gather2d::Tiled16,
-            Type1Gather3d::Tiled8x8x4,
-        )
+        Self::type1_gpu_with_gathers(device, queue, config, None, Some(Type1Gather3d::Tiled8x8x4))
     }
 
     fn type1_gpu_with_gathers(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         config: NufftConfig,
-        gather_2d: Type1Gather2d,
-        gather_3d: Type1Gather3d,
+        gather_2d: Option<Type1Gather2d>,
+        gather_3d: Option<Type1Gather3d>,
     ) -> Result<Self> {
         validate_device_precision(device, config.precision(), "type-1 GPU plan")?;
         let mut plan = Self::new(NufftKind::Type1, config)?;
         validate_gpu_dimensions("type-1", plan.config.dimensions())?;
         validate_f32_rounding(&plan.config, &plan.centered_kernel_fourier_coefficients)?;
-        // The prototype gathers are explicit requests. The tuned spreaders
-        // leave every precision, grid and device they cannot serve to the
-        // rank-generic plan.
-        let tuned = match plan.config.dimensions() {
-            2 if gather_2d != Type1Gather2d::Block => true,
-            3 if gather_3d != Type1Gather3d::Block => true,
-            _ => tuned_type1_spread(
-                plan.config.precision(),
-                plan.kernel,
-                &plan.fine_grid_shape,
-                &device.limits(),
-            ),
-        };
-        let gpu = match plan.config.dimensions() {
-            1 if tuned => Type1GpuExecution::OneD(Type1GpuPlan::new(
-                device,
-                queue,
-                &plan.config,
-                plan.kernel,
-                plan.fine_grid_shape[0],
-                &plan.centered_kernel_fourier_coefficients[0],
-            )?),
-            2 if tuned => Type1GpuExecution::TwoD(Type1GpuPlan2d::new(
+        // Every public plan spreads through the rank-generic plan; only the
+        // benchmark-only gather comparisons build a per-rank plan.
+        let gpu = match (plan.config.dimensions(), gather_2d, gather_3d) {
+            (2, Some(gather), _) => Type1GpuExecution::TwoD(Type1GpuPlan2d::new(
                 device,
                 queue,
                 &plan.config,
@@ -644,9 +562,9 @@ impl NufftPlan {
                     plan.centered_kernel_fourier_coefficients[0].as_slice(),
                     plan.centered_kernel_fourier_coefficients[1].as_slice(),
                 ],
-                gather_2d,
+                gather,
             )?),
-            3 if tuned => Type1GpuExecution::ThreeD(Type1GpuPlan3d::new(
+            (3, _, Some(gather)) => Type1GpuExecution::ThreeD(Type1GpuPlan3d::new(
                 device,
                 queue,
                 &plan.config,
@@ -661,7 +579,7 @@ impl NufftPlan {
                     plan.centered_kernel_fourier_coefficients[1].as_slice(),
                     plan.centered_kernel_fourier_coefficients[2].as_slice(),
                 ],
-                gather_3d,
+                gather,
             )?),
             _ => Type1GpuExecution::Nd(Type1GpuPlanNd::new(
                 device,
@@ -1474,22 +1392,6 @@ impl NufftPlan {
             NufftKind::Type1 => reference_type1_f64(&self.config, coordinates, input),
             NufftKind::Type2 => reference_type2_f64(&self.config, coordinates, input),
         }
-    }
-}
-
-/// Whether a type-1 spread of this grid runs through the tuned per-rank
-/// plan: the `F32` block spreader in 3D, where it serves the grid and
-/// device. Every other spread, in every rank and precision, uses the
-/// rank-generic plan, which is faster in one and two dimensions.
-pub(crate) fn tuned_type1_spread(
-    precision: wgpu_fft::FftPrecision,
-    kernel: EsKernel,
-    fine_shape: &[usize],
-    limits: &wgpu::Limits,
-) -> bool {
-    match *fine_shape {
-        [x, y, z] => Type1GpuPlan3d::block_spread_available(precision, kernel, [x, y, z], limits),
-        _ => false,
     }
 }
 

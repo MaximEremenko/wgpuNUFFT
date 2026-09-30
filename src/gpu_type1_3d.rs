@@ -37,33 +37,29 @@ const F32_BYTES: u64 = 4;
 const F64_BYTES: u64 = 8;
 const U32_BYTES: u64 = 4;
 
-mod block;
-
-use block::{BlockLayout, BlockSpread3d};
-
+/// The per-cell gathers of the benchmark-only comparison plans; public plans
+/// spread through the rank-generic plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Type1Gather3d {
     #[cfg_attr(not(feature = "type1-3d-tile-prototype"), allow(dead_code))]
     Global,
+    #[cfg_attr(not(feature = "type1-3d-tile-prototype"), allow(dead_code))]
     Tiled8x8x4,
-    /// Output-stationary blocks over coarse bins; falls back to
-    /// [`Self::Tiled8x8x4`] where the precision, grid, or device cannot run it.
-    Block,
 }
 
 /// Device-specific resources for deterministic, atomics-free 3D spreading.
 ///
-/// Points are point-major `x, y, z` triples. The block spreader (F32) sorts
-/// points into coarse bins once per point set and lets each workgroup own a
-/// block of fine-grid cells; the per-cell gather builds one bin per fine-grid
-/// cell on every execution. Both sum each cell's contributions in original
-/// point order within a bin, so repeated executions are bitwise identical.
+/// Points are point-major `x, y, z` triples. The per-cell gathers build one
+/// bin per fine-grid cell on every execution and sum each cell's
+/// contributions in original point order, so repeated executions are bitwise
+/// identical. Only the benchmark-only gather comparisons use this plan;
+/// public plans spread through the rank-generic plan.
 pub(crate) struct Type1GpuPlan3d {
     fft: FftPlan,
     amplitudes: wgpu::Buffer,
     fine_input: wgpu::Buffer,
     fine_output: wgpu::Buffer,
-    spread: Spread3d,
+    spread: PerCellSpread3d,
     deconvolution_pipeline: wgpu::ComputePipeline,
     deconvolution_layout: wgpu::BindGroupLayout,
     max_workgroups_per_dimension: u32,
@@ -73,11 +69,6 @@ pub(crate) struct Type1GpuPlan3d {
     precision: FftPrecision,
     max_storage_binding_bytes: u64,
     max_buffer_bytes: u64,
-}
-
-enum Spread3d {
-    Block(Box<BlockSpread3d>),
-    PerCell(Box<PerCellSpread3d>),
 }
 
 /// One bin per fine-grid cell, rebuilt by every spread, gathered by one
@@ -235,26 +226,8 @@ impl Type1GpuPlan3d {
             }
         })?;
 
-        let block_layout = match (precision, gather) {
-            (FftPrecision::F32, Type1Gather3d::Block) => {
-                BlockLayout::for_grid(kernel, fine_shape, &limits)
-            }
-            _ => None,
-        };
-        let spread = match block_layout {
-            Some(layout) => Spread3d::Block(Box::new(BlockSpread3d::new(
-                device, kernel, fine_shape, layout,
-            )?)),
-            None => {
-                let gather = match gather {
-                    Type1Gather3d::Block => Type1Gather3d::Tiled8x8x4,
-                    other => other,
-                };
-                Spread3d::PerCell(Box::new(PerCellSpread3d::new(
-                    device, kernel, fine_shape, fine_count, precision, gather,
-                )?))
-            }
-        };
+        let spread =
+            PerCellSpread3d::new(device, kernel, fine_shape, fine_count, precision, gather)?;
         let max_workgroups_per_dimension = limits.max_compute_workgroups_per_dimension;
         let deconvolution_pipeline = create_compute_pipeline(
             device,
@@ -279,18 +252,6 @@ impl Type1GpuPlan3d {
             max_storage_binding_bytes: limits.max_storage_buffer_binding_size,
             max_buffer_bytes: limits.max_buffer_size,
         })
-    }
-
-    /// Whether the block spreader serves this precision, grid and device.
-    /// Public plans route the others to the rank-generic plan.
-    pub(crate) fn block_spread_available(
-        precision: FftPrecision,
-        kernel: EsKernel,
-        fine_shape: [usize; DIMENSIONS],
-        limits: &wgpu::Limits,
-    ) -> bool {
-        precision == FftPrecision::F32
-            && BlockLayout::for_grid(kernel, fine_shape, limits).is_some()
     }
 
     pub(crate) fn point_buffer_size_bytes_for_precision(
@@ -355,7 +316,6 @@ impl Type1GpuPlan3d {
             point_count,
             points,
             strengths,
-            true,
             #[cfg(feature = "gpu-profiling")]
             GpuProfileQueryWriter::disabled(),
         )
@@ -411,40 +371,26 @@ impl Type1GpuPlan3d {
             points,
             strengths,
             output,
-            true,
             #[cfg(feature = "gpu-profiling")]
             GpuProfileQueryWriter::disabled(),
         )
     }
 
-    /// Records the point-dependent preparation (the stable coarse-bin order of
-    /// the block spreader) for later [`Self::encode_batch_with_recorded_points`]
-    /// calls with the same `points` contents. The per-cell gather prepares
-    /// nothing here and rebuilds its bins on every execution.
+    /// Validates `points` for later [`Self::encode_batch_with_recorded_points`]
+    /// calls. The per-cell gathers prepare nothing and rebuild their bins on
+    /// every execution.
     pub(crate) fn set_points(
         &self,
-        device: &wgpu::Device,
-        recorder: &mut GpuRecorder<'_>,
+        _device: &wgpu::Device,
+        _recorder: &mut GpuRecorder<'_>,
         point_count: usize,
         points: &wgpu::Buffer,
     ) -> Result<()> {
-        let point_bytes = self.validate_points(point_count, points)?;
-        if let (Spread3d::Block(block), true) = (&self.spread, point_count > 0) {
-            block.encode_bins(
-                device,
-                recorder,
-                point_count,
-                points,
-                point_bytes,
-                #[cfg(feature = "gpu-profiling")]
-                GpuProfileQueryWriter::disabled(),
-            )?;
-        }
-        Ok(())
+        self.validate_points(point_count, points).map(|_| ())
     }
 
-    /// Like [`Self::encode_batch`], but reuses the preparation recorded by the
-    /// most recent [`Self::set_points`] for these `points`.
+    /// Like [`Self::encode_batch`]: the per-cell gathers keep no preparation
+    /// from [`Self::set_points`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_batch_with_recorded_points(
         &self,
@@ -465,7 +411,6 @@ impl Type1GpuPlan3d {
             points,
             strengths,
             output,
-            false,
             #[cfg(feature = "gpu-profiling")]
             GpuProfileQueryWriter::disabled(),
         )
@@ -520,7 +465,6 @@ impl Type1GpuPlan3d {
             points,
             strengths,
             output,
-            true,
             GpuProfileQueryWriter::enabled(query_set, &layout),
         )?;
         Ok(layout)
@@ -536,7 +480,6 @@ impl Type1GpuPlan3d {
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
         output: &wgpu::Buffer,
-        record_points: bool,
         #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
         let output_elements =
@@ -580,7 +523,6 @@ impl Type1GpuPlan3d {
             point_count,
             points,
             strengths,
-            record_points,
             #[cfg(feature = "gpu-profiling")]
             profile,
         )?;
@@ -606,7 +548,6 @@ impl Type1GpuPlan3d {
         point_count: usize,
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
-        record_points: bool,
         #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
         if point_count == 0 {
@@ -641,50 +582,23 @@ impl Type1GpuPlan3d {
             self.precision,
         )?;
 
-        match &self.spread {
-            Spread3d::Block(block) => {
-                if record_points {
-                    block.encode_bins(
-                        device,
-                        recorder,
-                        point_count,
-                        points,
-                        point_bytes,
-                        #[cfg(feature = "gpu-profiling")]
-                        profile,
-                    )?;
-                }
-                block.encode_spread(
-                    device,
-                    recorder,
-                    active_batch,
-                    point_count,
-                    strengths,
-                    strength_bytes,
-                    &self.fine_input,
-                    active_fine_bytes,
-                    #[cfg(feature = "gpu-profiling")]
-                    profile,
-                )?;
-            }
-            Spread3d::PerCell(per_cell) => per_cell.encode(
-                device,
-                recorder,
-                active_batch,
-                point_count,
-                points,
-                point_bytes,
-                strengths,
-                strength_bytes,
-                &self.fine_input,
-                active_fine_bytes,
-                self.max_workgroups_per_dimension,
-                self.max_storage_binding_bytes,
-                self.max_buffer_bytes,
-                #[cfg(feature = "gpu-profiling")]
-                profile,
-            )?,
-        }
+        self.spread.encode(
+            device,
+            recorder,
+            active_batch,
+            point_count,
+            points,
+            point_bytes,
+            strengths,
+            strength_bytes,
+            &self.fine_input,
+            active_fine_bytes,
+            self.max_workgroups_per_dimension,
+            self.max_storage_binding_bytes,
+            self.max_buffer_bytes,
+            #[cfg(feature = "gpu-profiling")]
+            profile,
+        )?;
         if active_batch < self.batch_capacity {
             recorder.clear_buffer(
                 &self.fine_input,
@@ -816,7 +730,7 @@ impl PerCellSpread3d {
                     generate_gather_wgsl(kernel, fine_shape),
                     workgroups_for_elements(fine_count)?,
                 ),
-                Type1Gather3d::Tiled8x8x4 | Type1Gather3d::Block => {
+                Type1Gather3d::Tiled8x8x4 => {
                     let configuration =
                         tiled_gather_halo_shape(kernel.width()).and_then(|halo_shape| {
                             let cache_capacity = tiled_gather_cache_capacity(kernel.width())?;
@@ -1240,12 +1154,12 @@ pub(crate) fn create_compute_pipeline(
         module: &shader,
         entry_point: Some("main"),
         compilation_options: wgpu::PipelineCompilationOptions {
-            // The tiled gather and the block spreaders declare workgroup
-            // memory. The tiled gather writes every halo-prefix element before
-            // its first barrier and reads cached point slots only below the
-            // current batch length; the block spreaders write every segment
-            // entry and chunk slot, and the listed heavy block, before reading
-            // them. WebGPU's workgroup zero fill is therefore redundant and
+            // The tiled gathers and the rank-generic spreader declare
+            // workgroup memory. The tiled gather writes every halo-prefix
+            // element before its first barrier and reads cached point slots
+            // only below the current batch length; the rank-generic spreader
+            // writes every row entry and chunk slot, and the listed heavy
+            // block, before reading them. WebGPU's workgroup zero fill is therefore redundant and
             // only slows native shader compilation (notably DX12's FXC).
             // Browsers always zero-fill.
             zero_initialize_workgroup_memory: false,

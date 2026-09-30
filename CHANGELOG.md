@@ -36,16 +36,16 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   points are split into parts added in a fixed order, so results stay
   bitwise repeatable. Type 2 interpolates the binned points with lanes that
   read contiguous rows.
-- Type-1 GPU plans in `F64` and `Df64`, and on grids or devices the tuned
-  `F32` spreaders of 1D to 3D cannot serve, spread through the same
-  rank-generic block spreader, as does the type-3 outer spread. The per-cell
-  gather they used made every fine-grid cell walk its points serially, so
+- Every type-1 GPU plan, in every rank and precision, now spreads through
+  the same rank-generic block spreader, as does the type-3 outer spread
+  unless its outer grid is small and densely populated. It replaces the
+  tuned `F32` spreaders of 1D to 3D, which slowed down sharply on clustered
+  points, and the per-cell gathers of the other precisions, grids, and
+  devices, which made every fine-grid cell walk its points serially, so
   dense or clustered points were slow and could also run past the watchdog.
-- One- and two-dimensional type-1 GPU plans in every precision now spread
-  through the rank-generic spreader, which is faster than the former 1D and
-  2D gathers on dense and clustered points. That spreader sizes the parts of
-  every crowded block from its actual points, so a dense cluster spreads
-  over many workgroups, and sizes its workgroups per rank and precision.
+  The spreader sizes the parts of every crowded block from its actual
+  points, so a dense cluster spreads over many workgroups, and chooses its
+  workgroup sizes, run lengths, and bins per rank and precision.
 - `NufftPlan::set_points_gpu` now prepares 4D and higher point sets once,
   so later executions skip the binning, as they do in 1D to 3D.
 - Large executions of the rank-generic paths are recorded as several

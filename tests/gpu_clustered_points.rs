@@ -39,7 +39,7 @@ async fn run() {
         &[32, 40],
         &clustered(20_000, &[0.3, -1.1], 2),
     );
-    // Two merge stages through the 3D block spreader.
+    // A dense 3D cluster, whose large bins take the parallel merge sort.
     check(
         device,
         queue,

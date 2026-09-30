@@ -18,9 +18,10 @@ from [wgpu-fft](https://github.com/MaximEremenko/wgpuFFT), pinned here as the
 - **All three transform types**: type 1 (nonuniform points to Fourier modes),
   type 2 (modes to points), and type 3 (nonuniform points to nonuniform
   frequencies).
-- **One to eight dimensions on the GPU**, in all three precisions: tuned
-  1D, 2D, and 3D paths, and a rank-generic path for 4D to 8D that also
-  spreads every lower-rank type 1 the tuned `F32` spreaders do not cover.
+- **One to eight dimensions on the GPU**, in all three precisions: type 1
+  spreads through one rank-generic spreader in every rank, and type 2
+  interpolates through tuned 1D, 2D, and 3D paths and a rank-generic path
+  for 4D to 8D.
   The direct `f64` reference transforms cover eight dimensions too. See
   [Higher dimensions](#higher-dimensions) for what is practical where.
 - **Three precisions**: `f32`, native `f64` (devices with `SHADER_F64`), and
@@ -314,7 +315,8 @@ this rounding exceeds both ten times the tolerance and `1e-5`; use
 
 **Type 2** deconvolves and zero-pads the modes onto an oversampled grid, runs
 a `wgpu-fft` C2C transform on it, and interpolates the grid at every point
-with the exponential-of-semicircle (ES) kernel.
+with the exponential-of-semicircle (ES) kernel. In 1D to 3D it visits the
+points in bin order for cache locality.
 
 **Type 1** reverses these steps: it spreads the points onto the fine grid,
 transforms the grid, and deconvolves and truncates it into the mode buffer.
@@ -323,26 +325,19 @@ restores input order inside every bin. Each fine-grid cell is then written by
 exactly one invocation, which adds its points in that fixed order, so no
 floating-point atomics are needed.
 
-- **3D block spreader.** `F32` 3D plans whose fine grid is large enough
-  (at least 32 x 32 x 22 cells at `eps = 1e-6`) group the points into coarse
-  bins and prepare every point's support once. Each workgroup owns a
-  16 x 16 x 8 block whose rows stay in registers while nearby points stream
-  through workgroup memory. Type 2 interpolates the points in bin order for
-  cache locality in 1D to 3D.
-- **Everything else.** Every 1D and 2D type-1 plan, `F64` and `Df64` 3D
-  plans, smaller 3D grids, and devices without the 3D block spreader's
-  workgroup limits spread through the rank-generic block spreader of the
-  higher dimensions, below.
+- **One spreader for every rank.** Every type-1 plan, from 1D to 8D and in
+  every precision, spreads through the rank-generic block spreader
+  described with the higher dimensions below.
 - **Clustered points.** Bins of more than 64 points are sorted by a parallel
   merge sort. A block that reaches too many points goes to heavy passes that
   split its points across workgroups; partial sums are added in a fixed
-  order. The rank-generic spreader sizes each crowded block's parts from the
-  points actually in its reach, so a single dense cluster still spreads over
+  order. The spreader sizes each crowded block's parts from the points
+  actually in its reach, so a single dense cluster still spreads over
   thousands of workgroups.
 
 **Four to eight dimensions** use one rank-generic implementation, whose
 shaders are generated per rank and precision; its type-1 spreader also
-serves the lower-rank plans above. Points are binned once per point set
+serves every lower-rank plan. Points are binned once per point set
 into coarse bins, in original order for type 1, and every point's support
 is prepared. For type 1, each workgroup owns a block of fine-grid cells:
 every invocation keeps a run of cells along axis zero in registers, while
@@ -364,7 +359,7 @@ uniform grid, evaluates that grid through an inner type-2 plan, and applies
 the kernel correction and post-phase at the targets. The small, densely
 populated outer grids of `F32` 1D and 2D plans use a spreader that sums
 fixed groups of sources into partial grids and adds the partial grids in
-group order; the other outer grids use the type-1 spreaders above.
+group order; the other outer grids use the rank-generic type-1 spreader.
 
 A GPU plan cannot read device buffers while it is created, so
 `NufftType3Config` takes conservative source and target intervals, and every

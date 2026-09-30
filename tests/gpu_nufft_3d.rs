@@ -513,8 +513,8 @@ fn validate_large_256_cubed_type2(device: &wgpu::Device, queue: &wgpu::Queue) {
     assert!(error <= 2.0e-5);
 }
 
-/// Mode shapes whose fine grids are large enough for the F32 block spreader:
-/// a clean `32x40x24` grid and a `36x40x26` grid with partial blocks and bins.
+/// Mode shapes whose fine grids span several spreading blocks per axis: a
+/// clean `32x40x24` grid and a `36x40x26` grid with partial blocks and bins.
 const BLOCK_SPREAD_SHAPES: [[usize; DIMENSIONS]; 2] = [[16, 20, 12], [17, 19, 13]];
 
 fn validate_block_type1_oracle_matrix(device: &wgpu::Device, queue: &wgpu::Queue) {
