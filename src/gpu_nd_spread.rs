@@ -33,17 +33,24 @@ use crate::gpu_dispatch::{split_workgroups, RangedDispatch, DISPATCH_RANGE_WGSL}
 use crate::gpu_nd_bins::NdPreparedPoints;
 use crate::gpu_nd_wgsl::{position_wgsl, weight_wgsl, NdWgsl};
 use crate::gpu_point_bins::GrowOnlyBuffer;
+#[cfg(feature = "gpu-profiling")]
+use crate::gpu_profile::GpuProfileQueryWriter;
 use crate::gpu_recorder::GpuRecorder;
 use crate::gpu_type1_3d::{binding_entry, create_compute_pipeline, encode_pass};
 use crate::kernel::EsKernel;
 
 /// Invocations of a spreading workgroup when the device allows them.
 const TARGET_WORKGROUP_SIZE: usize = 256;
+const TARGET_WORKGROUP_SIZE_1D: usize = 64;
 /// Largest block edge along an axis other than zero.
 const MAX_BLOCK_EDGE: usize = 16;
-/// Cells per invocation along axis zero: `F32` sums fit more registers.
+/// Cells per invocation along axis zero. From three dimensions on, long runs
+/// reuse every staged record over more cells, and `F32` sums fit more
+/// registers. One and two dimensions reach few cells of a long run, so short
+/// runs, and more blocks, keep more invocations busy.
 const MAX_RUN_F32: usize = 16;
 const MAX_RUN_WIDE: usize = 8;
+const MAX_RUN_LOW_RANK: usize = 2;
 /// Bin rows gathered and scanned at a time.
 const MAX_ROW_BATCH: usize = 128;
 /// Records staged in workgroup memory at a time.
@@ -55,14 +62,23 @@ const LIGHT_WORK_BUDGET: u64 = 1 << 29;
 /// Bounds of the per-plan record limit of a light block.
 const MIN_HEAVY_RECORDS: u64 = 1 << 10;
 const MAX_HEAVY_RECORDS: u64 = 1 << 18;
-/// Upper bound on the heavy parts of one block.
+/// Workgroups that keep a large GPU busy. A grid with fewer blocks than this
+/// lowers its record limit so dense blocks are split into parts too.
+const TARGET_PARALLEL_WORKGROUPS: u64 = 4096;
+/// The smallest record limit, so parts stay worth their partial sums.
+const MIN_PART_RECORDS: u64 = 256;
+/// Heavy parts of one block when many blocks are heavy, and when few are.
 const MAX_HEAVY_PARTS: u64 = 32;
+const MAX_DENSE_HEAVY_PARTS: u64 = 256;
 /// Scratch that bounds the part count: parts shrink as the possible heavy
 /// blocks and the batch grow.
 const HEAVY_SCRATCH_BUDGET_BYTES: u64 = 64 << 20;
 /// Invocation steps one spreading dispatch may take; larger workloads are
 /// split into consecutive dispatches.
 const DISPATCH_WORK_BUDGET: u64 = 1 << 36;
+/// Workgroups below which a dispatch is never split further, so that every
+/// dispatch still fills a large GPU.
+const MIN_WORKGROUPS_PER_DISPATCH: u64 = 4096;
 /// Invocations of the classify pass, one block each.
 const CLASSIFY_WORKGROUP_SIZE: u32 = 64;
 /// Invocations of the heavy reduce pass, one cell each.
@@ -71,7 +87,7 @@ const REDUCE_WORKGROUP_SIZE: u32 = 256;
 const HEAVY_STATE: u32 = u32::MAX;
 
 /// Static geometry of the spreader for one plan.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct NdSpreadLayout {
     width: usize,
     /// Cells per invocation along axis zero.
@@ -95,6 +111,11 @@ pub(crate) struct NdSpreadLayout {
     chunk: usize,
     /// Records in reach above which a block goes to the heavy passes.
     heavy_records: u32,
+    /// The record limit is at most `point_count / dense_divisor`: grids with
+    /// few blocks split dense blocks into parts to use the whole GPU.
+    dense_divisor: u32,
+    /// The share of evenly spread points whose support reaches one block.
+    block_fraction: f64,
     fine_shape: Vec<usize>,
     /// Invocation steps a workgroup spends on one staged record.
     record_steps: u64,
@@ -114,38 +135,47 @@ impl NdSpreadLayout {
         let max_invocations = limits
             .max_compute_invocations_per_workgroup
             .min(limits.max_compute_workgroup_size_x) as usize;
-        let target = TARGET_WORKGROUP_SIZE.min(max_invocations).max(1);
+        // One dimension spreads its invocations along the only axis, where a
+        // record reaches few of them: smaller blocks waste less.
+        let target = if dimensions == 1 {
+            TARGET_WORKGROUP_SIZE_1D
+        } else {
+            TARGET_WORKGROUP_SIZE
+        }
+        .min(max_invocations)
+        .max(1);
         // Support starts relative to a block stay unique while the block edge
         // plus the kernel width fits the axis.
-        let edge_limit = |axis: usize| fine_shape[axis] + 1 - width;
-        let max_run = match precision {
-            FftPrecision::F32 => MAX_RUN_F32,
-            FftPrecision::F64 | FftPrecision::Df64 => MAX_RUN_WIDE,
+        let edge_limit = |axis: usize| (fine_shape[axis] + 1).saturating_sub(width).max(1);
+        let max_run = match (dimensions, precision) {
+            (1 | 2, _) => MAX_RUN_LOW_RANK,
+            (_, FftPrecision::F32) => MAX_RUN_F32,
+            (_, FftPrecision::F64 | FftPrecision::Df64) => MAX_RUN_WIDE,
         };
         let run = largest_power_of_two_at_most(max_run.min(edge_limit(0)));
         let mut block = vec![1usize; dimensions];
+        // Double the thinnest axis first: a point reaches about
+        // `(edge + width) / edge` blocks along each axis.
+        let mut invocations = 1usize;
+        loop {
+            let candidate = (1..dimensions)
+                .filter(|&axis| {
+                    block[axis] * 2 <= edge_limit(axis).min(MAX_BLOCK_EDGE)
+                        && invocations * 2 <= target
+                })
+                .min_by_key(|&axis| (block[axis], usize::MAX - fine_shape[axis]));
+            let Some(axis) = candidate else {
+                break;
+            };
+            block[axis] *= 2;
+            invocations *= 2;
+        }
+        // Axes too short for more invocations leave room for several runs
+        // along axis zero.
         let mut groups_0 = 1usize;
-        if dimensions == 1 {
-            while groups_0 * 2 <= target && run * groups_0 * 2 <= edge_limit(0) {
-                groups_0 *= 2;
-            }
-        } else {
-            // Double the thinnest axis first: a point reaches about
-            // `(edge + width) / edge` blocks along each axis.
-            let mut invocations = 1usize;
-            loop {
-                let candidate = (1..dimensions)
-                    .filter(|&axis| {
-                        block[axis] * 2 <= edge_limit(axis).min(MAX_BLOCK_EDGE)
-                            && invocations * 2 <= target
-                    })
-                    .min_by_key(|&axis| (block[axis], usize::MAX - fine_shape[axis]));
-                let Some(axis) = candidate else {
-                    break;
-                };
-                block[axis] *= 2;
-                invocations *= 2;
-            }
+        while invocations * 2 <= target && run * groups_0 * 2 <= edge_limit(0) {
+            groups_0 *= 2;
+            invocations *= 2;
         }
         block[0] = run * groups_0;
         let workgroup_size = groups_0 * block[1..].iter().product::<usize>();
@@ -223,6 +253,14 @@ impl NdSpreadLayout {
             .zip(&block)
             .map(|(&length, &edge)| length.div_ceil(edge))
             .collect::<Vec<_>>();
+        // Record visits over all blocks per point, for evenly spread points.
+        let block_fraction = (0..dimensions)
+            .map(|axis| ((block[axis] + width - 1) as f64 / fine_shape[axis] as f64).min(1.0))
+            .product::<f64>();
+        let visits_per_point = block_fraction * blocks.iter().product::<usize>() as f64;
+        let dense_divisor = (TARGET_PARALLEL_WORKGROUPS as f64 / visits_per_point)
+            .ceil()
+            .clamp(1.0, f64::from(u32::MAX)) as u32;
         let layout = Self {
             width,
             run,
@@ -237,6 +275,8 @@ impl NdSpreadLayout {
             row_batch,
             chunk,
             heavy_records,
+            dense_divisor,
+            block_fraction,
             fine_shape: fine_shape.to_vec(),
             record_steps,
         };
@@ -262,30 +302,47 @@ impl NdSpreadLayout {
         self.blocks.iter().product()
     }
 
+    /// Records whose support reaches one block, for `point_count` evenly
+    /// spread points: the block edge plus the kernel width along every axis.
+    fn block_records(&self, point_count: usize) -> u64 {
+        (point_count as f64 * self.block_fraction).ceil() as u64
+    }
+
+    /// Records in reach above which a block goes to the heavy passes, for
+    /// `point_count` points; the classify pass derives the same value.
+    fn light_limit(&self, point_count: usize) -> u64 {
+        (point_count as u64 / u64::from(self.dense_divisor))
+            .clamp(MIN_PART_RECORDS, u64::from(self.heavy_records))
+    }
+
+    /// Invocations that stage one record and share its kernel weights.
+    /// `F32` weights are cheap, and one invocation per record measured
+    /// fastest; `F64` and `Df64` Horner weights are shared by the workgroup.
+    fn record_lanes(&self, precision: FftPrecision) -> usize {
+        match precision {
+            FftPrecision::F32 => 1,
+            FftPrecision::F64 | FftPrecision::Df64 => (self.workgroup_size / self.chunk).max(1),
+        }
+    }
+
     /// Light workgroups per dispatch for `point_count` evenly spread points:
     /// each block's reach then holds its share of the grid volume, and never
     /// more than the heavy limit.
     fn light_workgroups_per_dispatch(&self, point_count: usize) -> u64 {
-        let fraction = (0..self.block.len())
-            .map(|axis| {
-                ((self.reach_bins[axis] * self.bin_side[axis]) as f64
-                    / self.fine_shape[axis] as f64)
-                    .min(1.0)
-            })
-            .product::<f64>();
-        let records = ((point_count as f64 * fraction).ceil() as u64)
-            .min(u64::from(self.heavy_records))
+        let records = self
+            .block_records(point_count)
+            .min(self.light_limit(point_count))
             .max(1);
         let rows = self.reach_bins[1..].iter().product::<usize>().max(1) as u64;
         let steps = records * self.record_steps + rows * self.workgroup_size as u64;
-        (DISPATCH_WORK_BUDGET / steps).max(1)
+        (DISPATCH_WORK_BUDGET / steps).max(MIN_WORKGROUPS_PER_DISPATCH)
     }
 
     /// Heavy part workgroups per dispatch: a part holds at most
     /// `ceil(point_count / parts)` records.
     fn part_workgroups_per_dispatch(&self, point_count: usize, parts: u64) -> u64 {
         let records = (point_count as u64).div_ceil(parts).max(1);
-        (DISPATCH_WORK_BUDGET / (records * self.record_steps)).max(1)
+        (DISPATCH_WORK_BUDGET / (records * self.record_steps)).max(MIN_WORKGROUPS_PER_DISPATCH)
     }
 
     fn block_cells(&self) -> usize {
@@ -328,8 +385,9 @@ impl HeavyGeometry {
     /// All reaches hold at most `blocks_per_bin * point_count` records, so at
     /// most `bound / (limit + 1)` blocks exceed the limit. The capacity also
     /// keeps one part per listed block within `max_scratch_bytes`; when that
-    /// binds, the classify pass raises its limit to `bound / (capacity + 1)`,
-    /// so it never lists more blocks than the scratch holds.
+    /// binds below the block count, the classify pass raises its limit to
+    /// `bound / (capacity + 1)`, so it never lists more blocks than the
+    /// scratch holds.
     fn new(
         layout: &NdSpreadLayout,
         point_count: usize,
@@ -339,11 +397,14 @@ impl HeavyGeometry {
     ) -> Self {
         let bound = layout.blocks_per_bin().saturating_mul(point_count as u64);
         let per_block = active_batch as u64 * layout.block_cells() as u64 * complex_bytes;
-        let capacity = (bound / (u64::from(layout.heavy_records) + 1))
+        let capacity = (bound / (layout.light_limit(point_count) + 1))
             .min(layout.block_count() as u64)
             .min(max_scratch_bytes / per_block);
         let budget = HEAVY_SCRATCH_BUDGET_BYTES.min(max_scratch_bytes);
-        let parts = (budget / (capacity.max(1) * per_block)).clamp(1, MAX_HEAVY_PARTS);
+        // Few heavy blocks get more parts, so they still fill the GPU.
+        let most_parts = (TARGET_PARALLEL_WORKGROUPS / capacity.max(1))
+            .clamp(MAX_HEAVY_PARTS, MAX_DENSE_HEAVY_PARTS);
+        let parts = (budget / (capacity.max(1) * per_block)).clamp(1, most_parts);
         Self { capacity, parts }
     }
 }
@@ -437,9 +498,42 @@ impl NdBlockSpread {
 
     /// Spreads `active_batch` transform-major strength vectors of the
     /// `point_count > 0` points prepared in `prepared` and `bin_offsets` into
-    /// `fine_grid`, overwriting every active cell.
+    /// `fine_grid`, overwriting every active cell. With profiling, the end of
+    /// the spread is written at offset 5 of the type-1 layout.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_spread(
+        &self,
+        device: &wgpu::Device,
+        recorder: &mut GpuRecorder<'_>,
+        active_batch: usize,
+        point_count: usize,
+        prepared: &NdPreparedPoints,
+        bin_offsets: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        strength_bytes: u64,
+        fine_grid: &wgpu::Buffer,
+        active_fine_bytes: u64,
+        #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
+    ) -> Result<()> {
+        self.encode_spread_passes(
+            device,
+            recorder,
+            active_batch,
+            point_count,
+            prepared,
+            bin_offsets,
+            strengths,
+            strength_bytes,
+            fine_grid,
+            active_fine_bytes,
+        )?;
+        #[cfg(feature = "gpu-profiling")]
+        profile.encode_marker(recorder, None, Some(5));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_spread_passes(
         &self,
         device: &wgpu::Device,
         recorder: &mut GpuRecorder<'_>,
@@ -851,17 +945,35 @@ const FULL_{axis}: bool = {full};
                 )
             })
             .collect();
-        let weights: String = (0..dimensions)
-            .map(|axis| {
-                format!(
-                    "                    let offset_{axis} = prepared_offsets[sorted_slot * DIMS + {axis}u];
+
+        // The record's kernel weights, shared by its lanes.
+        let weights = if types.precision() == FftPrecision::F32 {
+            // Constant loops let the compiler overlap the `exp` evaluations.
+            (0..dimensions)
+                .map(|axis| {
+                    format!(
+                        "                    let offset_{axis} = prepared_offsets[sorted_slot * DIMS + {axis}u];
                     for (var support = 0u; support < WIDTH; support = support + 1u) {{
                         chunk_weights[(slot * DIMS + {axis}u) * WIDTH + support] = support_weight(offset_{axis}, support);
                     }}
 "
-                )
-            })
-            .collect();
+                    )
+                })
+                .collect()
+        } else {
+            // One loop over every (axis, support) weight, with a bound the
+            // compiler cannot unroll: unrolled Horner evaluations made these
+            // shaders slow to compile on DX12.
+            "                    for (var entry = lane; entry < weight_entries; entry = entry + RECORD_LANES) {{
+                        let axis = entry / WIDTH;
+                        chunk_weights[slot * DIMS * WIDTH + entry] = support_weight(
+                            prepared_offsets[sorted_slot * DIMS + axis],
+                            entry - axis * WIDTH,
+                        );
+                    }}
+"
+            .to_owned()
+        };
 
         // Adding one staged record to this invocation's cells.
         let deltas: String = (1..dimensions)
@@ -991,6 +1103,7 @@ const FULL_{axis}: bool = {full};
             r#"const WORKGROUP_SIZE: u32 = {workgroup_size}u;
 const ROW_BATCH: u32 = {row_batch}u;
 const CHUNK: u32 = {chunk}u;
+const RECORD_LANES: u32 = {record_lanes}u;
 // The relative start of a staged record whose support misses the block.
 const SKIPPED: i32 = 0x3fffffff;
 {geometry}
@@ -1028,6 +1141,9 @@ fn main(
     let wg_flat = dispatch_range.first + (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
     let total_vectors = arrayLength(&fine_grid) / FINE_COUNT;
     let point_count = arrayLength(&prepared_starts) / STRIDE;
+    // DIMS * WIDTH, but not a constant the compiler can unroll loops by:
+    // point counts stay below 2^31.
+    let weight_entries = DIMS * WIDTH + (point_count >> 31u);
 {locate}{origins}{locals}{reach}    if (records_end == 0u) {{ rows = 0u; }}
 {initialize}
     // Records already walked in earlier row batches.
@@ -1070,8 +1186,13 @@ fn main(
         }}
         for (var chunk_first = local_first; chunk_first < local_last; chunk_first = chunk_first + CHUNK) {{
             let chunk_length = min(CHUNK, local_last - chunk_first);
-            // Every chunk slot is filled, whether or not CHUNK exceeds WORKGROUP_SIZE.
-            for (var slot = invocation; slot < chunk_length; slot = slot + WORKGROUP_SIZE) {{
+            // RECORD_LANES invocations stage each record and share its kernel
+            // weights; every chunk slot is filled, whether or not CHUNK exceeds
+            // the workgroup.
+            for (var lane_index = invocation; lane_index < chunk_length * RECORD_LANES;
+                 lane_index = lane_index + WORKGROUP_SIZE) {{
+                let slot = lane_index / RECORD_LANES;
+                let lane = lane_index - slot * RECORD_LANES;
                 let record = chunk_first + slot;
                 // First row whose inclusive prefix exceeds `record`.
                 var low = 0u;
@@ -1088,17 +1209,22 @@ fn main(
                 }}
                 let start_base = sorted_slot * STRIDE;
 {relatives}                let keep = {keep};
-{store_relatives}                if (keep) {{
-                    let point_index = bitcast<u32>(prepared_starts[start_base + DIMS]);
-                    chunk_values[slot] = strengths[vector_index * point_count + point_index];
+                if (lane == 0u) {{
+{store_relatives}                    if (keep) {{
+                        let point_index = bitcast<u32>(prepared_starts[start_base + DIMS]);
+                        chunk_values[slot] = strengths[vector_index * point_count + point_index];
+                    }}
+                }}
+                if (keep) {{
 {weights}                }}
             }}
             workgroupBarrier();
             for (var slot = 0u; slot < chunk_length; slot = slot + 1u) {{
                 let base = slot * DIMS;
-{deltas}                if ({inside}) {{
+                let delta_0 = run_origin - chunk_starts[base];
+{deltas}                // The record's support must overlap this invocation's run.
+                if (u32(delta_0 + RUN - 1) < WIDTH + u32(RUN) - 1u && {inside}) {{
                     let value = {value};
-                    let delta_0 = run_origin - chunk_starts[base];
                     let weights_0 = base * WIDTH;
 {accumulate}                }}
             }}
@@ -1113,6 +1239,7 @@ fn main(
             workgroup_size = layout.workgroup_size,
             row_batch = layout.row_batch,
             chunk = layout.chunk,
+            record_lanes = layout.record_lanes(types.precision()),
             geometry = self.geometry_constants(),
             offset_type = types.offset_type(),
             weight_type = types.weight_type(),
@@ -1141,6 +1268,8 @@ fn main(
         let entry = format!(
             r#"const WORKGROUP_SIZE: u32 = {CLASSIFY_WORKGROUP_SIZE}u;
 const HEAVY_RECORDS: u32 = {heavy_records}u;
+const MIN_PART_RECORDS: u32 = {MIN_PART_RECORDS}u;
+const DENSE_DIVISOR: u32 = {dense_divisor}u;
 const BLOCKS_PER_BIN: u32 = {blocks_per_bin}u;
 {geometry}
 @group(0) @binding(0) var<storage, read> bin_offsets: array<u32>;
@@ -1167,11 +1296,18 @@ fn main(
 
     let point_count = bin_offsets[arrayLength(&bin_offsets) - 1u];
     let capacity = (arrayLength(&heavy_list) - 1u) / 2u;
+    // The same limit as the host's: lower on grids with few blocks. A list
+    // with room for every block needs no raise.
+    let base_limit = clamp(point_count / DENSE_DIVISOR, MIN_PART_RECORDS, HEAVY_RECORDS);
     var limit = HEAVY_STATE;
-    let per_entry = point_count / (capacity + 1u);
-    if (capacity > 0u && per_entry < 0xffffffffu / BLOCKS_PER_BIN) {{
-        limit = max(HEAVY_RECORDS, BLOCKS_PER_BIN * per_entry
-            + BLOCKS_PER_BIN * (point_count % (capacity + 1u)) / (capacity + 1u));
+    if (capacity >= BLOCK_COUNT) {{
+        limit = base_limit;
+    }} else {{
+        let per_entry = point_count / (capacity + 1u);
+        if (capacity > 0u && per_entry < 0xffffffffu / BLOCKS_PER_BIN) {{
+            limit = max(base_limit, BLOCKS_PER_BIN * per_entry
+                + BLOCKS_PER_BIN * (point_count % (capacity + 1u)) / (capacity + 1u));
+        }}
     }}
     var state = min(total, HEAVY_STATE - 1u);
     if (total > limit) {{
@@ -1186,6 +1322,7 @@ fn main(
 }}
 "#,
             heavy_records = self.layout.heavy_records,
+            dense_divisor = self.layout.dense_divisor,
             blocks_per_bin = u32::try_from(self.layout.blocks_per_bin()).unwrap_or(u32::MAX),
             geometry = self.geometry_constants(),
             origins = self.origin_statements(),
@@ -1367,5 +1504,18 @@ mod tests {
         assert_eq!(layout.workgroup_size, 256);
         assert_eq!(layout.block, vec![16, 8, 8, 4]);
         assert_eq!(layout.block_cells(), 4096);
+    }
+
+    #[test]
+    fn low_rank_layouts_use_short_runs() {
+        let kernel = EsKernel::for_tolerance(1.0e-6, 2.0).unwrap();
+        let limits = wgpu::Limits::default();
+        let one = NdSpreadLayout::for_grid(kernel, &[4096], FftPrecision::Df64, &limits).unwrap();
+        assert_eq!((one.run, one.workgroup_size), (2, 64));
+        assert_eq!(one.block, vec![128]);
+        let two =
+            NdSpreadLayout::for_grid(kernel, &[512, 512], FftPrecision::F32, &limits).unwrap();
+        assert_eq!((two.run, two.workgroup_size), (2, 256));
+        assert_eq!(two.block, vec![32, 16]);
     }
 }

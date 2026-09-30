@@ -3,8 +3,8 @@
 A standalone research prototype of rank-generic N-dimensional NUFFTs in which
 every dimension chooses how to pay its translation rank `r(eps)`. It is not
 part of the `wgpu-fft` or `wgpu-nufft` crates. It is kept as a reference
-oracle and as the record of the design behind `wgpu-nufft`'s 4D and 5D GPU
-paths.
+oracle and as the record of the design study behind `wgpu-nufft`'s
+rank-generic GPU paths.
 
 ## Placements
 
@@ -104,9 +104,14 @@ memory allows.
 ## Outcome
 
 The prototype led to the hybrid design in `wgpu-nufft`: generated
-rank-generic kernels for 4D and 5D (`MAX_GPU_NUFFT_DIMENSIONS`), with the
-tuned 1D, 2D, and 3D paths kept for lower ranks. The production path reuses
-the crate's cell binning, scan, and sort instead of host duplication,
-supports `f32`, native `f64`, and `Df64`, and uses sigma = 2 unless
-`NufftConfig::with_sigma` selects another oversampling factor. The
+rank-generic kernels for 4D to 8D (`MAX_GPU_NUFFT_DIMENSIONS`), with the
+tuned 1D, 2D, and 3D paths kept for lower ranks, where the rank-generic
+type-1 spreader serves what the tuned `f32` spreaders do not. The production
+type-1 spreader follows the output-tile design above, with register runs
+along axis zero and points streamed through workgroup memory, but reads the
+coarse bins in each block's reach instead of duplicating points on the host,
+and splits blocks with too many points into parts. It supports `f32`, native
+`f64`, and `Df64`, and uses sigma = 2 unless `NufftConfig::with_sigma`
+selects another oversampling factor; `f32` plans reject tolerances that the
+deconvolution conditioning described above makes unreachable. The
 measurements above describe the prototype, not the production code.

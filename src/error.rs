@@ -31,6 +31,15 @@ pub enum NufftError {
         width: usize,
         maximum: usize,
     },
+    /// An `F32` plan whose rounding, amplified by the deconvolution, would
+    /// miss the requested tolerance by far: small `sigma` makes the kernel's
+    /// Fourier transform fall steeply towards the edge of the mode box, and
+    /// the gain compounds over the dimensions.
+    F32ToleranceUnreachable {
+        eps: f64,
+        sigma: f64,
+        estimated_error: f64,
+    },
     InvalidKernelWidth {
         width: usize,
         minimum: usize,
@@ -221,6 +230,16 @@ impl fmt::Display for NufftError {
             } => write!(
                 f,
                 "NUFFT tolerance {eps} requires ES kernel width {width}, exceeding maximum {maximum}"
+            ),
+            Self::F32ToleranceUnreachable {
+                eps,
+                sigma,
+                estimated_error,
+            } => write!(
+                f,
+                "an F32 NUFFT with upsampling factor {sigma} cannot reach tolerance {eps}: its \
+                 rounding, amplified by the deconvolution, is about {estimated_error:.1e}; use \
+                 sigma 2, a larger tolerance, or F64 or Df64 precision"
             ),
             Self::InvalidKernelWidth {
                 width,

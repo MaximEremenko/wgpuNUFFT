@@ -26,6 +26,8 @@ use crate::gpu_bin_sort::{LargeBinSort, SMALL_BIN};
 use crate::gpu_dispatch::split_workgroups;
 use crate::gpu_nd_wgsl::{linear_index, position_wgsl, NdWgsl};
 use crate::gpu_point_bins::GrowOnlyBuffer;
+#[cfg(feature = "gpu-profiling")]
+use crate::gpu_profile::GpuProfileQueryWriter;
 use crate::gpu_recorder::GpuRecorder;
 use crate::gpu_scan::GpuExclusiveScanU32;
 use crate::gpu_type1_3d::{
@@ -63,7 +65,6 @@ pub(crate) struct NdPreparedPoints {
 pub(crate) struct NdPointBins {
     dimensions: usize,
     types: NdWgsl,
-    bin_count: usize,
     /// One count per bin plus a trailing zero, so the scan also yields the
     /// total, and behind them the flag stable counting sets when a bin holds
     /// more than [`SMALL_BIN`] points.
@@ -170,7 +171,6 @@ impl NdPointBins {
         Ok(Self {
             dimensions,
             types,
-            bin_count,
             bin_counts,
             bin_offsets,
             point_slots: GrowOnlyBuffer::new(device, "wgpu_nufft.nd_bins.point_slots"),
@@ -195,11 +195,6 @@ impl NdPointBins {
     /// terminal total, in axis-zero-fastest bin order.
     pub(crate) fn bin_offsets(&self) -> &wgpu::Buffer {
         &self.bin_offsets
-    }
-
-    #[allow(dead_code)]
-    pub(crate) const fn bin_count(&self) -> usize {
-        self.bin_count
     }
 
     fn scratch(
@@ -256,6 +251,11 @@ impl NdPointBins {
     /// Records the bin order and prepared data of `point_count > 0` points.
     /// Both stay valid for consumers until the next call; executions must
     /// keep queue order.
+    ///
+    /// With profiling, stable mode writes the start marker and the ends of
+    /// the count, scan, scatter, and sort-and-prepare stages at offsets 0-4
+    /// of the type-1 layout. Grouped mode writes the start marker at offset 0
+    /// and the end of the last pass at offset 1.
     pub(crate) fn encode(
         &self,
         device: &wgpu::Device,
@@ -263,7 +263,10 @@ impl NdPointBins {
         point_count: usize,
         points: &wgpu::Buffer,
         point_bytes: u64,
+        #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
+        #[cfg(feature = "gpu-profiling")]
+        let stable = self.sort.is_some();
         debug_assert!(point_count > 0);
         let point_count_u32 =
             u32::try_from(point_count).map_err(|_| NufftError::LengthOverflow {
@@ -297,6 +300,8 @@ impl NdPointBins {
                 binding_entry(2, &point_slots, slot_bytes),
             ],
         });
+        #[cfg(feature = "gpu-profiling")]
+        profile.encode_start_marker(recorder);
         recorder.clear_buffer(&self.bin_counts, 0, None);
         encode_pass(
             recorder,
@@ -305,10 +310,16 @@ impl NdPointBins {
             &count_bind_group,
             point_dispatch,
             #[cfg(feature = "gpu-profiling")]
-            None,
+            stable
+                .then(|| profile.timestamp_writes(None, Some(1)))
+                .flatten(),
         );
         self.prefix_scan
             .encode(device, recorder, &self.bin_counts, &self.bin_offsets)?;
+        #[cfg(feature = "gpu-profiling")]
+        if stable {
+            profile.encode_marker(recorder, None, Some(2));
+        }
 
         let scatter_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.nd_bins.scatter.bind_group"),
@@ -326,7 +337,9 @@ impl NdPointBins {
             &scatter_bind_group,
             point_dispatch,
             #[cfg(feature = "gpu-profiling")]
-            None,
+            stable
+                .then(|| profile.timestamp_writes(None, Some(3)))
+                .flatten(),
         );
         if let Some(sort) = &self.sort {
             // The count pass left the large-bin flag in the last count word.
@@ -363,7 +376,7 @@ impl NdPointBins {
             &prepare_bind_group,
             point_dispatch,
             #[cfg(feature = "gpu-profiling")]
-            None,
+            profile.timestamp_writes(None, Some(if stable { 4 } else { 1 })),
         );
         Ok(())
     }

@@ -25,7 +25,7 @@ use crate::gpu_nd::{
 use crate::gpu_nd_bins::{NdBinOrder, NdPointBins};
 use crate::gpu_nd_spread::{NdBlockSpread, NdSpreadLayout};
 #[cfg(feature = "gpu-profiling")]
-use crate::gpu_profile::NufftGpuProfileLayout;
+use crate::gpu_profile::{GpuProfileQueryWriter, NufftGpuProfileLayout};
 use crate::gpu_recorder::GpuRecorder;
 use crate::kernel::EsKernel;
 
@@ -275,6 +275,8 @@ impl Type1GpuPlanNd {
             strengths,
             output,
             true,
+            #[cfg(feature = "gpu-profiling")]
+            GpuProfileQueryWriter::disabled(),
         )
     }
 
@@ -293,8 +295,15 @@ impl Type1GpuPlanNd {
             return Ok(());
         }
         let point_bytes = self.validate_points(point_count, points)?;
-        self.bins
-            .encode(device, recorder, point_count, points, point_bytes)
+        self.bins.encode(
+            device,
+            recorder,
+            point_count,
+            points,
+            point_bytes,
+            #[cfg(feature = "gpu-profiling")]
+            GpuProfileQueryWriter::disabled(),
+        )
     }
 
     /// Like [`Self::encode_batch`], but reuses the preparation recorded by the
@@ -319,6 +328,8 @@ impl Type1GpuPlanNd {
             strengths,
             output,
             false,
+            #[cfg(feature = "gpu-profiling")]
+            GpuProfileQueryWriter::disabled(),
         )
     }
 
@@ -333,6 +344,7 @@ impl Type1GpuPlanNd {
         strengths: &wgpu::Buffer,
         output: &wgpu::Buffer,
         record_points: bool,
+        #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
         self.validate_active_batch(active_batch)?;
         let output_elements = checked_product(
@@ -363,6 +375,8 @@ impl Type1GpuPlanNd {
             points,
             strengths,
             record_points,
+            #[cfg(feature = "gpu-profiling")]
+            profile,
         )?;
 
         self.fft
@@ -376,6 +390,8 @@ impl Type1GpuPlanNd {
                 stage: "rank-generic type-1 oversampled-grid C2C transform",
                 source,
             })?;
+        #[cfg(feature = "gpu-profiling")]
+        profile.encode_marker(recorder, None, Some(6));
 
         let deconvolution_elements_u32 =
             u32::try_from(output_elements).map_err(|_| NufftError::LengthOverflow {
@@ -400,10 +416,13 @@ impl Type1GpuPlanNd {
                 binding_entry(2, output, output_bytes),
             ],
         });
-        recorder.dispatch(
+        recorder.dispatch_profiled(
+            "wgpu_nufft.type1_nd.deconvolution.pass",
             &self.deconvolution_pipeline,
             &deconvolution_bind_group,
             deconvolution_dispatch,
+            #[cfg(feature = "gpu-profiling")]
+            profile.timestamp_writes(None, Some(7)),
         );
         Ok(())
     }
@@ -412,19 +431,37 @@ impl Type1GpuPlanNd {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_profiled(
         &self,
-        _device: &wgpu::Device,
-        _recorder: &mut GpuRecorder<'_>,
-        _point_count: usize,
-        _points: &wgpu::Buffer,
-        _strengths: &wgpu::Buffer,
-        _output: &wgpu::Buffer,
-        _query_set: &wgpu::QuerySet,
-        _first_query: u32,
+        device: &wgpu::Device,
+        recorder: &mut GpuRecorder<'_>,
+        point_count: usize,
+        points: &wgpu::Buffer,
+        strengths: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        query_set: &wgpu::QuerySet,
+        first_query: u32,
     ) -> Result<NufftGpuProfileLayout> {
-        Err(NufftError::GpuExecutionUnavailable {
-            kind: "rank-generic type-1 stage profiling",
-            reason: "stage profiling is not yet instrumented above three dimensions",
-        })
+        if point_count == 0 {
+            return Err(NufftError::GpuExecutionUnavailable {
+                kind: "rank-generic type-1 stage profiling",
+                reason: "at least one point is required",
+            });
+        }
+        let layout =
+            NufftGpuProfileLayout::type1(first_query).map_err(|_| NufftError::LengthOverflow {
+                context: "rank-generic type-1 stage-profile query range",
+            })?;
+        self.encode_impl(
+            device,
+            recorder,
+            self.batch_capacity,
+            point_count,
+            points,
+            strengths,
+            output,
+            true,
+            GpuProfileQueryWriter::enabled(query_set, &layout),
+        )?;
+        Ok(layout)
     }
 
     #[cfg(feature = "gpu-profiling")]
@@ -454,6 +491,8 @@ impl Type1GpuPlanNd {
             points,
             strengths,
             true,
+            #[cfg(feature = "gpu-profiling")]
+            GpuProfileQueryWriter::disabled(),
         )
     }
 
@@ -477,6 +516,7 @@ impl Type1GpuPlanNd {
         points: &wgpu::Buffer,
         strengths: &wgpu::Buffer,
         record_points: bool,
+        #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
         if point_count == 0 {
             recorder.clear_buffer(&self.fine_input, 0, None);
@@ -509,8 +549,15 @@ impl Type1GpuPlanNd {
             self.precision.complex_size_bytes(),
         )?;
         if record_points {
-            self.bins
-                .encode(device, recorder, point_count, points, point_bytes)?;
+            self.bins.encode(
+                device,
+                recorder,
+                point_count,
+                points,
+                point_bytes,
+                #[cfg(feature = "gpu-profiling")]
+                profile,
+            )?;
         }
         let prepared = self.bins.prepared(point_count)?;
         self.spread.encode_spread(
@@ -524,6 +571,8 @@ impl Type1GpuPlanNd {
             strength_bytes,
             &self.fine_input,
             active_fine_bytes,
+            #[cfg(feature = "gpu-profiling")]
+            profile,
         )?;
         // The spread writes the active vectors only; the batched FFT reads
         // the whole grid, so clear the tail.

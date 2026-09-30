@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use wgpu_fft::{CpuFftPlan, FftConfig, FftDirection, FftPrecision, Normalization};
 
-use crate::config::{NufftConfig, NufftSign};
+use crate::config::{validate_f32_rounding, NufftConfig, NufftSign};
 use crate::error::{NufftError, Result};
 use crate::kernel::{select_fine_grid_size, EsKernel};
 use crate::plan::NufftKind;
@@ -264,6 +264,7 @@ impl CpuNufftPlan {
             .iter()
             .map(|&length| kernel.centered_fourier_coefficients_horner(length, &table))
             .collect::<Result<Vec<_>>>()?;
+        validate_f32_rounding(&config, &coefficients)?;
         let direction = match config.sign() {
             NufftSign::Positive => FftDirection::Inverse,
             NufftSign::Negative => FftDirection::Forward,

@@ -180,7 +180,7 @@ function relativeL2(actual, expected) {
 function tolerance(kind, dimensions, precisionName) {
   if (precisionName === "Df64") return 24 * DF64_EPS;
   if (kind === "type-3") return 100 * F32_EPS;
-  return [0, 4, 20, 32][dimensions] * F32_EPS;
+  return (dimensions <= 3 ? [0, 4, 20, 32][dimensions] : 40) * F32_EPS;
 }
 
 function type12Points(dimensions) {
@@ -396,10 +396,14 @@ async function runMatrix() {
     await runType12(context, module, [17], 1, precision, accuracy);
     await runType12(context, module, [8, 12], -1, precision, accuracy);
     await runType12(context, module, [4, 6, 8], 1, precision, accuracy);
+    await runType12(context, module, [4, 3, 5, 4], -1, precision, accuracy);
     await runType3(context, module, 1, -1, precision, accuracy);
     await runType3(context, module, 2, 1, precision, accuracy);
     await runType3(context, module, 3, -1, precision, accuracy);
   }
+  // Six dimensions in F32; a Df64 grid at DF64_EPS would exceed the default
+  // binding limit.
+  await runType12(context, module, [3, 2, 3, 2, 2, 3], 1, "F32", accuracy);
   const extra = {};
   await runPhaseBoundary(context, module, extra);
   const f64Rejection = await assertBrowserF64Rejected(context, module);

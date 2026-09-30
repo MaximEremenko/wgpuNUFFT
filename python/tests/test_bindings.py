@@ -151,6 +151,25 @@ def test_non_square_2d_numpy_axis_order(context):
     _assert_gpu_close(values, direct_type2(points, coefficients, n_modes, 1, "centered"))
 
 
+@pytest.mark.parametrize("n_modes", [(3, 2, 4, 3), (2, 3, 2, 2, 3, 2)])
+def test_higher_rank_numpy_axis_order(context, n_modes):
+    rng = np.random.default_rng(len(n_modes))
+    points = rng.uniform(-np.pi, np.pi, (9, len(n_modes))).astype(np.float32)
+    strengths = (rng.standard_normal(9) + 1j * rng.standard_normal(9)).astype(np.complex64)
+    type1 = wgpu_nufft.Type1Plan(context, n_modes, eps=1e-4, isign=-1)
+    modes = type1.execute(points, strengths)
+    assert modes.shape == n_modes
+    _assert_gpu_close(modes, direct_type1(points, strengths, n_modes, -1, "centered"))
+
+    coefficients = (
+        rng.standard_normal(n_modes) + 1j * rng.standard_normal(n_modes)
+    ).astype(np.complex64)
+    type2 = wgpu_nufft.Type2Plan(context, n_modes, eps=1e-4, isign=-1)
+    values = type2.execute(points, coefficients)
+    assert values.shape == (9,)
+    _assert_gpu_close(values, direct_type2(points, coefficients, n_modes, -1, "centered"))
+
+
 def test_batched_reuse_and_explicit_batch_axis(context):
     points = np.array([-1.3, -0.2, 0.5, 1.7], dtype=np.float32)
     strengths = np.array(

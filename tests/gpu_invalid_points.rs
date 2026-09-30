@@ -6,7 +6,10 @@
 //! of the plan intact, and, when they are finite but far away, type-1 modes
 //! exactly as without them. The binned F32 paths also give non-finite and
 //! out-of-reach points zero weight: type-1 modes then equal those of the
-//! remaining points exactly, and type-2 interpolates zero at them.
+//! remaining points exactly, and type-2 interpolates zero at them. The
+//! rank-generic spreader gives them zero weight too, but splits the points of
+//! a crowded block into parts by count, so zero-weight points can move the
+//! part boundaries and the modes match up to rounding.
 
 use std::f32::consts::PI;
 use std::sync::mpsc;
@@ -60,8 +63,8 @@ async fn run() {
         case.check_type2_zero_at(&invalid);
         eprintln!("NUFFT_INVALID_POINTS shape={shape:?} binned F32 ok");
     }
-    // These are too small for the binned spreaders, so F32 falls back to
-    // per-cell spreading, the only spreader of Df64.
+    // These are too small for the binned spreaders, so their type-1 plans
+    // spread through the rank-generic path, like every Df64 one.
     for shape in [vec![4], vec![6, 5], vec![12, 10, 8]] {
         let invalid = Points::new(shape.len(), &INVALID);
         let far = Points::new(shape.len(), &FAR);
@@ -73,8 +76,8 @@ async fn run() {
                 precision,
             };
             case.check_others_kept(&invalid);
-            case.check_type1_ignores(&far);
-            eprintln!("NUFFT_INVALID_POINTS shape={shape:?} per-cell {precision:?} ok");
+            case.check_type1_nearly_ignores(&far);
+            eprintln!("NUFFT_INVALID_POINTS shape={shape:?} small {precision:?} ok");
         }
     }
     // The rank-generic paths bin and prepare every point, in every precision.
@@ -89,8 +92,8 @@ async fn run() {
                 precision,
             };
             case.check_others_kept(&invalid);
-            case.check_type1_ignores(&far);
-            case.check_type1_ignores(&invalid);
+            case.check_type1_nearly_ignores(&far);
+            case.check_type1_nearly_ignores(&invalid);
             case.check_type2_zero_at(&invalid);
             eprintln!("NUFFT_INVALID_POINTS shape={shape:?} rank-generic {precision:?} ok");
         }
@@ -249,6 +252,40 @@ impl Case<'_> {
         );
     }
 
+    /// Type-1 modes equal those of the valid points alone up to the rounding
+    /// of another summation grouping, as the rank-generic spreader gives.
+    fn check_type1_nearly_ignores(&self, points: &Points) {
+        let shape = self.shape;
+        let precision = self.precision;
+        let type1 = NufftPlan::type1_gpu(self.device, self.queue, self.config()).unwrap();
+        let strengths = values(points.mixed_count(), 1.5);
+        let valid_strengths = points.valid_part(&strengths, 2);
+        let valid = self.execute(&type1, VALID_POINTS, &points.valid, &valid_strengths);
+        let mixed = self.execute(&type1, points.mixed_count(), &points.mixed, &strengths);
+        let error = relative_l2(&self.wide(&mixed), &self.wide(&valid));
+        let tolerance = match precision {
+            FftPrecision::F32 => 1.0e-5,
+            _ => 1.0e-11,
+        };
+        assert!(
+            error <= tolerance,
+            "{shape:?} {precision:?}: invalid points changed type-1 modes by {error:e}"
+        );
+    }
+
+    /// Stored words as values; `Df64` adds each low word to its high word.
+    fn wide(&self, words: &[f32]) -> Vec<f64> {
+        match self.precision {
+            FftPrecision::Df64 => words
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&[hi, lo]| f64::from(hi) + f64::from(lo))
+                .collect(),
+            _ => words.iter().map(|&word| f64::from(word)).collect(),
+        }
+    }
+
     /// Type-2 interpolates exactly zero at every invalid point.
     fn check_type2_zero_at(&self, points: &Points) {
         let shape = self.shape;
@@ -277,6 +314,16 @@ fn values(count: usize, seed: f32) -> Vec<f32> {
             [x.sin() * 0.7 + 0.1, (x * 0.61).cos() * 0.5 - 0.2]
         })
         .collect()
+}
+
+fn relative_l2(actual: &[f64], reference: &[f64]) -> f64 {
+    let error = actual
+        .iter()
+        .zip(reference)
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum::<f64>();
+    let norm = reference.iter().map(|b| b * b).sum::<f64>();
+    (error / norm).sqrt()
 }
 
 fn bits(values: &[f32]) -> Vec<u32> {

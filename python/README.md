@@ -4,8 +4,8 @@ Python binding of [wgpu-nufft](https://github.com/MaximEremenko/wgpuNUFFT):
 portable GPU and CPU nonuniform FFTs for NumPy arrays. It is a native
 CPython extension built with PyO3 and maturin, with no separate C ABI.
 
-- Reusable type-1, type-2, and type-3 plans: on the GPU in one to five
-  dimensions, and on the CPU in one to eight.
+- Reusable type-1, type-2, and type-3 plans in one to eight dimensions, on
+  the GPU and on the CPU.
 - GPU plans take `float32` coordinates and `complex64` values. CPU plans
   take either those or `float64` coordinates and `complex128` values.
 - A `Context` holds one GPU device, and GPU plans keep their context,

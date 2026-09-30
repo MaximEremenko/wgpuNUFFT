@@ -19,6 +19,10 @@ const POINT_COUNT_2D: usize = 1_021;
 const MODE_SHAPE_3D: [usize; 3] = [16, 20, 12];
 const MODE_COUNT_3D: usize = MODE_SHAPE_3D[0] * MODE_SHAPE_3D[1] * MODE_SHAPE_3D[2];
 const POINT_COUNT_3D: usize = 997;
+const MODE_SHAPE_4D: [usize; 4] = [8, 6, 6, 4];
+const MODE_COUNT_4D: usize =
+    MODE_SHAPE_4D[0] * MODE_SHAPE_4D[1] * MODE_SHAPE_4D[2] * MODE_SHAPE_4D[3];
+const POINT_COUNT_4D: usize = 499;
 
 const TYPE1_STAGES: &[NufftGpuStage] = &[
     NufftGpuStage::BinClearCount,
@@ -127,6 +131,9 @@ async fn run_gpu_stage_profile_test() {
     run_type1_case_2d(&device, &queue, &points_2d, period_ns);
     run_type2_case_2d(&device, &queue, &points_2d, period_ns);
     run_binned_type2_case_3d(&device, &queue, &test_points_3d(), period_ns);
+    let points_4d = test_points_4d();
+    run_type1_case_4d(&device, &queue, &points_4d, period_ns);
+    run_binned_type2_case_4d(&device, &queue, &points_4d, period_ns);
     if let Some(error) = validation_scope.pop().await {
         panic!("GPU stage-profile validation scope captured an unexpected error: {error}");
     }
@@ -447,6 +454,143 @@ fn run_binned_type2_case_3d(
     );
 }
 
+/// The rank-generic type-1 path marks its binning, spread, FFT and
+/// deconvolution stages.
+fn run_type1_case_4d(device: &wgpu::Device, queue: &wgpu::Queue, points: &[f32], period_ns: f64) {
+    const FIRST_QUERY: u32 = 1;
+
+    assert_eq!(points.len(), POINT_COUNT_4D * MODE_SHAPE_4D.len());
+    let config = NufftConfig::new(MODE_SHAPE_4D, 1.0e-6)
+        .with_sign(NufftSign::Negative)
+        .with_mode_order(ModeOrder::Centered);
+    let plan = NufftPlan::type1_gpu(device, queue, config).unwrap();
+    assert_eq!(plan.gpu_profile_query_count(), 8);
+    let strengths = test_complex_values(POINT_COUNT_4D, 0.21, 0.13);
+    let point_buffer = create_storage_buffer(device, "type1_4d.points", points);
+    let strength_buffer = create_storage_buffer(device, "type1_4d.strengths", &strengths);
+    let output_bytes = plan.required_type1_output_buffer_size_bytes().unwrap();
+    let ordinary_output = create_output_buffer(device, "type1_4d.ordinary_output", output_bytes);
+    let profiled_output = create_output_buffer(device, "type1_4d.profiled_output", output_bytes);
+    let query_count = plan.gpu_profile_query_count();
+    let query_set = create_timestamp_query_set(
+        device,
+        "type1_4d",
+        FIRST_QUERY.checked_add(query_count).unwrap(),
+    );
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_nufft.stage_profile.type1_4d.encoder"),
+    });
+    plan.encode_type1_gpu(
+        device,
+        &mut encoder,
+        POINT_COUNT_4D,
+        &point_buffer,
+        &strength_buffer,
+        &ordinary_output,
+    )
+    .unwrap();
+    let layout = plan
+        .encode_type1_gpu_profiled(
+            device,
+            &mut encoder,
+            POINT_COUNT_4D,
+            &point_buffer,
+            &strength_buffer,
+            &profiled_output,
+            &query_set,
+            FIRST_QUERY,
+        )
+        .unwrap();
+    assert_eq!(layout.query_count(), query_count);
+    assert_eq!(layout.query_range(), FIRST_QUERY..FIRST_QUERY + query_count);
+    finish_case(
+        device,
+        queue,
+        encoder,
+        "type-1-4d",
+        &ordinary_output,
+        &profiled_output,
+        output_bytes,
+        &query_set,
+        &layout,
+        TYPE1_STAGES,
+        TYPE1_LABELS,
+        period_ns,
+    );
+}
+
+fn run_binned_type2_case_4d(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    points: &[f32],
+    period_ns: f64,
+) {
+    const FIRST_QUERY: u32 = 4;
+
+    assert_eq!(points.len(), POINT_COUNT_4D * MODE_SHAPE_4D.len());
+    let config = NufftConfig::new(MODE_SHAPE_4D, 1.0e-6)
+        .with_sign(NufftSign::Positive)
+        .with_mode_order(ModeOrder::Fft);
+    let plan = NufftPlan::type2_gpu(device, queue, config).unwrap();
+    assert_eq!(plan.gpu_profile_query_count(), 5);
+    let coefficients = test_complex_values(MODE_COUNT_4D, 0.23, 0.37);
+    let point_buffer = create_storage_buffer(device, "type2_4d.points", points);
+    let coefficient_buffer = create_storage_buffer(device, "type2_4d.coefficients", &coefficients);
+    let output_bytes = plan
+        .required_type2_output_buffer_size_bytes(POINT_COUNT_4D)
+        .unwrap();
+    let ordinary_output = create_output_buffer(device, "type2_4d.ordinary_output", output_bytes);
+    let profiled_output = create_output_buffer(device, "type2_4d.profiled_output", output_bytes);
+    let query_count = plan.gpu_profile_query_count();
+    let query_set = create_timestamp_query_set(
+        device,
+        "type2_4d",
+        FIRST_QUERY.checked_add(query_count).unwrap(),
+    );
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_nufft.stage_profile.type2_4d.encoder"),
+    });
+    plan.encode_type2_gpu(
+        device,
+        &mut encoder,
+        POINT_COUNT_4D,
+        &point_buffer,
+        &coefficient_buffer,
+        &ordinary_output,
+    )
+    .unwrap();
+    let layout = plan
+        .encode_type2_gpu_profiled(
+            device,
+            &mut encoder,
+            POINT_COUNT_4D,
+            &point_buffer,
+            &coefficient_buffer,
+            &profiled_output,
+            &query_set,
+            FIRST_QUERY,
+        )
+        .unwrap();
+    assert_eq!(layout.query_count(), query_count);
+    assert_eq!(layout.query_range(), FIRST_QUERY..FIRST_QUERY + query_count);
+    finish_case(
+        device,
+        queue,
+        encoder,
+        "type-2-4d",
+        &ordinary_output,
+        &profiled_output,
+        output_bytes,
+        &query_set,
+        &layout,
+        BINNED_TYPE2_STAGES,
+        BINNED_TYPE2_LABELS,
+        period_ns,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finish_case(
     device: &wgpu::Device,
@@ -610,6 +754,20 @@ fn test_points_3d() -> Vec<f32> {
         points.push(x_fraction * TAU - PI);
         points.push(y_fraction * TAU - PI);
         points.push(z_fraction * TAU - PI);
+    }
+    points
+}
+
+fn test_points_4d() -> Vec<f32> {
+    let mut points = Vec::with_capacity(POINT_COUNT_4D * MODE_SHAPE_4D.len());
+    for index in 0..POINT_COUNT_4D {
+        for (axis, (step, modulus)) in [(37, 1_019), (53, 1_021), (71, 1_031), (89, 1_033)]
+            .into_iter()
+            .enumerate()
+        {
+            let fraction = ((index * step + 7 * axis) % modulus) as f32 / modulus as f32;
+            points.push(fraction * TAU - PI);
+        }
     }
     points
 }

@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use crate::config::{validate_gpu_dimensions, NufftConfig};
+use crate::config::{validate_f32_rounding, validate_gpu_dimensions, NufftConfig};
 use crate::direct::{reference_type1_f64, reference_type2_f64};
 use crate::error::{NufftError, Result};
 use crate::gpu::Type2GpuPlan;
@@ -219,6 +219,8 @@ impl Type1GpuExecution {
     }
 }
 
+// One boxed execution per plan; every variant embeds an FFT plan.
+#[allow(clippy::large_enum_variant)]
 enum Type2GpuExecution {
     OneD(Type2GpuPlan),
     TwoD(Type2GpuPlan2d),
@@ -350,11 +352,11 @@ impl Type2GpuExecution {
             Self::OneD(plan) => plan.profile_layout(first_query),
             Self::TwoD(plan) => plan.profile_layout(first_query),
             Self::ThreeD(plan) => plan.profile_layout(first_query),
-            Self::Nd(_) => {
-                NufftGpuProfileLayout::type2(first_query).map_err(|_| NufftError::LengthOverflow {
+            Self::Nd(_) => NufftGpuProfileLayout::type2_binned(first_query).map_err(|_| {
+                NufftError::LengthOverflow {
                     context: "type-2 stage-profile query range",
-                })
-            }
+                }
+            }),
         }
     }
 
@@ -609,8 +611,22 @@ impl NufftPlan {
         validate_device_precision(device, config.precision(), "type-1 GPU plan")?;
         let mut plan = Self::new(NufftKind::Type1, config)?;
         validate_gpu_dimensions("type-1", plan.config.dimensions())?;
+        validate_f32_rounding(&plan.config, &plan.centered_kernel_fourier_coefficients)?;
+        // The prototype gathers are explicit requests. The tuned spreaders
+        // leave every precision, grid and device they cannot serve to the
+        // rank-generic plan.
+        let tuned = match plan.config.dimensions() {
+            2 if gather_2d != Type1Gather2d::Block => true,
+            3 if gather_3d != Type1Gather3d::Block => true,
+            _ => tuned_type1_spread(
+                plan.config.precision(),
+                plan.kernel,
+                &plan.fine_grid_shape,
+                &device.limits(),
+            ),
+        };
         let gpu = match plan.config.dimensions() {
-            1 => Type1GpuExecution::OneD(Type1GpuPlan::new(
+            1 if tuned => Type1GpuExecution::OneD(Type1GpuPlan::new(
                 device,
                 queue,
                 &plan.config,
@@ -618,7 +634,7 @@ impl NufftPlan {
                 plan.fine_grid_shape[0],
                 &plan.centered_kernel_fourier_coefficients[0],
             )?),
-            2 => Type1GpuExecution::TwoD(Type1GpuPlan2d::new(
+            2 if tuned => Type1GpuExecution::TwoD(Type1GpuPlan2d::new(
                 device,
                 queue,
                 &plan.config,
@@ -630,7 +646,7 @@ impl NufftPlan {
                 ],
                 gather_2d,
             )?),
-            3 => Type1GpuExecution::ThreeD(Type1GpuPlan3d::new(
+            3 if tuned => Type1GpuExecution::ThreeD(Type1GpuPlan3d::new(
                 device,
                 queue,
                 &plan.config,
@@ -677,6 +693,7 @@ impl NufftPlan {
         validate_device_precision(device, config.precision(), "type-2 GPU plan")?;
         let mut plan = Self::new(NufftKind::Type2, config)?;
         validate_gpu_dimensions("type-2", plan.config.dimensions())?;
+        validate_f32_rounding(&plan.config, &plan.centered_kernel_fourier_coefficients)?;
         let gpu = match plan.config.dimensions() {
             1 => Type2GpuExecution::OneD(Type2GpuPlan::new(
                 device,
@@ -1457,6 +1474,24 @@ impl NufftPlan {
             NufftKind::Type1 => reference_type1_f64(&self.config, coordinates, input),
             NufftKind::Type2 => reference_type2_f64(&self.config, coordinates, input),
         }
+    }
+}
+
+/// Whether a type-1 spread of this grid runs through the tuned per-rank
+/// plan: the `F32` segment gather in 1D or block spreader in 2D and 3D,
+/// where it serves the grid and device. Every other spread, and every rank
+/// above three, uses the rank-generic plan.
+pub(crate) fn tuned_type1_spread(
+    precision: wgpu_fft::FftPrecision,
+    kernel: EsKernel,
+    fine_shape: &[usize],
+    limits: &wgpu::Limits,
+) -> bool {
+    match *fine_shape {
+        [x] => Type1GpuPlan::segment_gather_available(precision, kernel, x),
+        [x, y] => Type1GpuPlan2d::block_spread_available(precision, kernel, [x, y], limits),
+        [x, y, z] => Type1GpuPlan3d::block_spread_available(precision, kernel, [x, y, z], limits),
+        _ => false,
     }
 }
 

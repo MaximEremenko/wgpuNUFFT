@@ -240,6 +240,26 @@ impl<'a> GpuProfileQueryWriter<'a> {
         })
     }
 
+    /// Encodes an empty pass writing timestamps at the given layout offsets,
+    /// for stage boundaries between dispatches that carry no timestamps of
+    /// their own.
+    pub(crate) fn encode_marker(
+        &self,
+        recorder: &mut GpuRecorder<'_>,
+        beginning_offset: Option<u32>,
+        end_offset: Option<u32>,
+    ) {
+        let Some(timestamp_writes) = self.timestamp_writes(beginning_offset, end_offset) else {
+            return;
+        };
+        let _pass = recorder
+            .encoder()
+            .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("wgpu_nufft.profile.marker"),
+                timestamp_writes: Some(timestamp_writes),
+            });
+    }
+
     /// Encodes an empty pass whose end timestamp precedes the buffer clears
     /// that open the first stage.
     pub(crate) fn encode_start_marker(&self, recorder: &mut GpuRecorder<'_>) {

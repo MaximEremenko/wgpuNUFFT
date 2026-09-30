@@ -235,6 +235,54 @@ impl Default for NufftConfig {
     }
 }
 
+/// Estimated error beyond which an `F32` plan misses its tolerance by far:
+/// ten times the tolerance, and never less than ordinary `f32` rounding.
+const F32_ROUNDING_TOLERANCE_FACTOR: f64 = 10.0;
+const F32_ROUNDING_FLOOR: f64 = 1.0e-5;
+
+/// Rejects an `F32` plan whose rounding, amplified by the deconvolution,
+/// would miss the tolerance by far. `coefficients` holds, per axis, the
+/// centered kernel Fourier coefficients by `|k|`.
+///
+/// Rounding in the fine grid reaches mode `k` scaled by
+/// `phi_hat(0) / phi_hat(k)` along every axis. The estimate is the `f32`
+/// unit roundoff times, per axis, the RMS of that gain over the modes; it
+/// matched measured errors within a factor of ten for `sigma = 1.25` in two
+/// to four dimensions, and stays near the plain roundoff for `sigma = 2`.
+pub(crate) fn validate_f32_rounding(config: &NufftConfig, coefficients: &[Vec<f64>]) -> Result<()> {
+    if config.precision() != FftPrecision::F32 {
+        return Ok(());
+    }
+    let mut estimate = f64::from(f32::EPSILON) / 2.0;
+    for (&modes, axis) in config.n_modes().iter().zip(coefficients) {
+        let Some(&center) = axis.first() else {
+            continue;
+        };
+        let half = modes / 2;
+        let mean = (0..modes)
+            .map(|index| {
+                let magnitude = index.abs_diff(half);
+                let value = axis.get(magnitude).copied().unwrap_or(0.0).abs();
+                if value > 0.0 {
+                    (center / value).powi(2)
+                } else {
+                    f64::INFINITY
+                }
+            })
+            .sum::<f64>()
+            / modes as f64;
+        estimate *= mean.sqrt();
+    }
+    if estimate > F32_ROUNDING_TOLERANCE_FACTOR * config.eps() && estimate > F32_ROUNDING_FLOOR {
+        return Err(NufftError::F32ToleranceUnreachable {
+            eps: config.eps(),
+            sigma: config.sigma(),
+            estimated_error: estimate,
+        });
+    }
+    Ok(())
+}
+
 /// Rejects ranks above [`MAX_GPU_NUFFT_DIMENSIONS`] for a GPU plan of `kind`.
 pub(crate) fn validate_gpu_dimensions(kind: &'static str, dimensions: usize) -> Result<()> {
     if dimensions > MAX_GPU_NUFFT_DIMENSIONS {
@@ -250,6 +298,47 @@ pub(crate) fn validate_gpu_dimensions(kind: &'static str, dimensions: usize) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rounding_check(
+        n_modes: &[usize],
+        eps: f64,
+        sigma: f64,
+        precision: FftPrecision,
+    ) -> Result<()> {
+        let config = NufftConfig::new(n_modes.to_vec(), eps)
+            .with_sigma(sigma)
+            .with_precision(precision);
+        let kernel = EsKernel::for_tolerance(eps, sigma).unwrap();
+        let coefficients = n_modes
+            .iter()
+            .map(|&modes| {
+                let fine = crate::kernel::select_fine_grid_size(modes, sigma, kernel.width())?;
+                kernel.centered_fourier_coefficients(fine)
+            })
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        validate_f32_rounding(&config, &coefficients)
+    }
+
+    #[test]
+    fn f32_plans_reject_tolerances_their_rounding_misses_by_far() {
+        // sigma = 1.25 at 1e-6 measured 2e-5 in 2D, 3e-4 in 3D and 1e-2 in 4D.
+        for n_modes in [vec![256, 256], vec![64; 3], vec![16; 4]] {
+            assert!(matches!(
+                rounding_check(&n_modes, 1.0e-6, 1.25, FftPrecision::F32),
+                Err(NufftError::F32ToleranceUnreachable { .. })
+            ));
+            for precision in [FftPrecision::F64, FftPrecision::Df64] {
+                assert!(rounding_check(&n_modes, 1.0e-6, 1.25, precision).is_ok());
+            }
+        }
+        // Reachable: a looser tolerance, or sigma = 2 at any tolerance.
+        assert!(rounding_check(&[16; 4], 1.0e-4, 1.25, FftPrecision::F32).is_ok());
+        assert!(rounding_check(&[6, 5, 4, 4], 1.0e-3, 1.25, FftPrecision::F32).is_ok());
+        for n_modes in [vec![1 << 20], vec![1024, 1024], vec![128; 3], vec![16; 6]] {
+            assert!(rounding_check(&n_modes, 1.0e-9, 2.0, FftPrecision::F32).is_ok());
+        }
+    }
 
     #[test]
     fn batch_defaults_to_one_and_rejects_zero() {

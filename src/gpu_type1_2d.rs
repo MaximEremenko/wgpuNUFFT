@@ -248,6 +248,18 @@ impl Type1GpuPlan2d {
         })
     }
 
+    /// Whether the block spreader serves this precision, grid and device.
+    /// Public plans route the others to the rank-generic plan.
+    pub(crate) fn block_spread_available(
+        precision: FftPrecision,
+        kernel: EsKernel,
+        fine_shape: [usize; DIMENSIONS],
+        limits: &wgpu::Limits,
+    ) -> bool {
+        precision == FftPrecision::F32
+            && BlockLayout2d::for_grid(kernel, fine_shape, limits).is_some()
+    }
+
     pub(crate) fn point_buffer_size_bytes_for_precision(
         point_count: usize,
         precision: FftPrecision,

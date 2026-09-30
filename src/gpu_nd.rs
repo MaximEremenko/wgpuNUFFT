@@ -38,6 +38,9 @@ const TYPE2_MAX_BINS: usize = 1 << 24;
 /// Lane loads one interpolation dispatch may take; larger workloads are
 /// split into consecutive dispatches.
 const DISPATCH_LOAD_BUDGET: u64 = 1 << 33;
+/// Workgroups below which a dispatch is never split further, so that every
+/// dispatch still fills a large GPU.
+const MIN_WORKGROUPS_PER_DISPATCH: u64 = 4096;
 
 pub(crate) struct Type2GpuPlanNd {
     fft: FftPlan,
@@ -304,8 +307,15 @@ impl Type2GpuPlanNd {
             return Ok(());
         }
         let point_bytes = self.validate_points(point_count, points)?;
-        self.bins
-            .encode(device, recorder, point_count, points, point_bytes)
+        self.bins.encode(
+            device,
+            recorder,
+            point_count,
+            points,
+            point_bytes,
+            #[cfg(feature = "gpu-profiling")]
+            GpuProfileQueryWriter::disabled(),
+        )
     }
 
     /// Like [`Self::encode_batch`], but reuses the preparation recorded by the
@@ -354,10 +364,11 @@ impl Type2GpuPlanNd {
                 reason: "at least one point is required",
             });
         }
-        let layout =
-            NufftGpuProfileLayout::type2(first_query).map_err(|_| NufftError::LengthOverflow {
+        let layout = NufftGpuProfileLayout::type2_binned(first_query).map_err(|_| {
+            NufftError::LengthOverflow {
                 context: "rank-generic type-2 stage-profile query range",
-            })?;
+            }
+        })?;
         self.encode_impl(
             device,
             recorder,
@@ -453,11 +464,18 @@ impl Type2GpuPlanNd {
         };
         let interpolation_per_dispatch = (DISPATCH_LOAD_BUDGET
             / (u64::from(INTERPOLATION_WORKGROUP_SIZE) * self.lane_loads * precision_factor))
-            .max(1);
+            .max(MIN_WORKGROUPS_PER_DISPATCH);
 
         if record_points {
-            self.bins
-                .encode(device, recorder, point_count, points, point_bytes)?;
+            self.bins.encode(
+                device,
+                recorder,
+                point_count,
+                points,
+                point_bytes,
+                #[cfg(feature = "gpu-profiling")]
+                profile,
+            )?;
         }
         let prepared = self.bins.prepared(point_count)?;
 
@@ -478,8 +496,6 @@ impl Type2GpuPlanNd {
                 },
             ],
         });
-        #[cfg(feature = "gpu-profiling")]
-        profile.encode_start_marker(recorder);
         recorder.clear_buffer(&self.fine_input, 0, None);
         recorder.dispatch_profiled(
             "wgpu_nufft.type2_nd.mode_scatter.pass",
@@ -487,7 +503,7 @@ impl Type2GpuPlanNd {
             &scatter_bind_group,
             scatter_dispatch,
             #[cfg(feature = "gpu-profiling")]
-            profile.timestamp_writes(None, Some(1)),
+            profile.timestamp_writes(None, Some(2)),
         );
 
         self.fft
@@ -516,7 +532,7 @@ impl Type2GpuPlanNd {
             ],
         });
         #[cfg(feature = "gpu-profiling")]
-        encode_profile_marker(recorder, profile, Some(2), None);
+        profile.encode_marker(recorder, None, Some(3));
         self.ranged.encode(
             device,
             recorder,
@@ -526,32 +542,13 @@ impl Type2GpuPlanNd {
             interpolation_per_dispatch,
         )?;
         #[cfg(feature = "gpu-profiling")]
-        encode_profile_marker(recorder, profile, None, Some(3));
+        profile.encode_marker(recorder, None, Some(4));
         Ok(())
     }
 
     #[cfg(feature = "gpu-profiling")]
     pub(crate) fn fft_diagnostics(&self) -> wgpu_fft::FftDiagnostics {
         self.fft.diagnostics()
-    }
-}
-
-/// Writes profiling timestamps from an empty pass, around dispatches that
-/// cannot carry them themselves.
-#[cfg(feature = "gpu-profiling")]
-fn encode_profile_marker(
-    recorder: &mut GpuRecorder<'_>,
-    profile: GpuProfileQueryWriter<'_>,
-    beginning: Option<u32>,
-    end: Option<u32>,
-) {
-    if let Some(timestamp_writes) = profile.timestamp_writes(beginning, end) {
-        let _pass = recorder
-            .encoder()
-            .begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("wgpu_nufft.profile.marker"),
-                timestamp_writes: Some(timestamp_writes),
-            });
     }
 }
 
@@ -671,11 +668,12 @@ fn main(
 ///
 /// `LANES` invocations evaluate one point for one vector. Lane `j` owns
 /// axis-zero support offset `j`, so the lanes of a point read each fine-grid
-/// row as one contiguous run. Each lane sums its column over the other axes,
-/// nested from the last axis inward, with the axis-one sum unrolled; loops
-/// over the outer axes use a bound the compiler cannot unroll, which keeps
-/// shader compilation fast for high ranks. The lane sums are then added in
-/// lane order through workgroup memory.
+/// row as one contiguous run. Each lane evaluates the point's kernel weights
+/// once, then sums its column over the other axes, nested from the last axis
+/// inward, with the axis-one sum unrolled. The weight loop and the loops over
+/// the outer axes use a bound the compiler cannot unroll, which keeps shader
+/// compilation fast for high ranks and precise kernels. The lane sums are
+/// then added in lane order through workgroup memory.
 fn generate_interpolation_wgsl(
     kernel: EsKernel,
     fine_shape: &[usize],
@@ -698,15 +696,26 @@ fn generate_interpolation_wgsl(
         .chain(row_terms)
         .collect::<Vec<_>>()
         .join(" + ");
+    // Every (axis, support) weight of the point, from one loop.
+    let _ = writeln!(
+        column,
+        "            var weights: array<{weight_type}, {weight_count}>;
+            for (var entry = 0u; entry < weight_entries; entry = entry + 1u) {{
+                let axis = entry / WIDTH;
+                weights[entry] = support_weight(prepared_offsets[slot * DIMS + axis], entry - axis * WIDTH);
+            }}",
+        weight_type = types.weight_type(),
+        weight_count = dimensions * width,
+    );
     if dimensions >= 2 {
         let _ = writeln!(
             column,
-            "            let start_1 = prepared_starts[base + 1u];\n            let offset_1 = prepared_offsets[slot * DIMS + 1u];"
+            "            let start_1 = prepared_starts[base + 1u];"
         );
         for support in 0..width {
             let _ = writeln!(
                 column,
-                "            let weight_1_{support} = support_weight(offset_1, {support}u);\n            let index_1_{support} = wrap_index(start_1 + {support}, FINE_1_I32) * FINE_STRIDE_1;"
+                "            let weight_1_{support} = weights[WIDTH + {support}u];\n            let index_1_{support} = wrap_index(start_1 + {support}, FINE_1_I32) * FINE_STRIDE_1;"
             );
         }
         for axis in (2..dimensions).rev() {
@@ -714,7 +723,6 @@ fn generate_interpolation_wgsl(
             let _ = writeln!(
                 column,
                 "{indent}let start_{axis} = prepared_starts[base + {axis}u];
-{indent}let offset_{axis} = prepared_offsets[slot * DIMS + {axis}u];
 {indent}var sum_{axis} = {zero};
 {indent}for (var support_{axis} = 0u; support_{axis} < loop_width; support_{axis} = support_{axis} + 1u) {{
 {indent}    let index_{axis} = wrap_index(start_{axis} + i32(support_{axis}), FINE_{axis}_I32) * FINE_STRIDE_{axis};"
@@ -747,7 +755,7 @@ fn generate_interpolation_wgsl(
                     &format!("sum_{axis}"),
                     &types.complex_scale(
                         &inner,
-                        &format!("support_weight(offset_{axis}, support_{axis})")
+                        &format!("weights[{axis}u * WIDTH + support_{axis}]")
                     ),
                 )
             );
@@ -755,19 +763,13 @@ fn generate_interpolation_wgsl(
         let _ = writeln!(
             column,
             "            lane_sum = {};",
-            types.complex_scale(
-                &format!("sum_{}", dimensions - 1),
-                "support_weight(prepared_offsets[slot * DIMS], lane)"
-            )
+            types.complex_scale(&format!("sum_{}", dimensions - 1), "weights[lane]")
         );
     } else {
         let _ = writeln!(
             column,
             "            lane_sum = {};",
-            types.complex_scale(
-                "fine_grid[grid_base]",
-                "support_weight(prepared_offsets[slot * DIMS], lane)"
-            )
+            types.complex_scale("fine_grid[grid_base]", "weights[lane]")
         );
     }
     let lane_total = types.complex_add("sum", "lane_sums[invocation + support]");
@@ -798,9 +800,10 @@ fn main(
     let lane = invocation % LANES;
     let work_index = wg_flat * POINTS_PER_WORKGROUP + invocation / LANES;
     let has_work = work_index < total;
-    // WIDTH, but not a constant the compiler can unroll loops by: point
-    // counts stay below 2^31.
+    // WIDTH and DIMS * WIDTH, but not constants the compiler can unroll
+    // loops by: point counts stay below 2^31.
     let loop_width = WIDTH + (point_count >> 31u);
+    let weight_entries = DIMS * WIDTH + (point_count >> 31u);
 
     var lane_sum = {zero};
     var batch_index = 0u;
@@ -1091,7 +1094,8 @@ mod tests {
         assert!(source.contains("for (var support_3 = 0u; support_3 < loop_width;"));
         assert!(source.contains("for (var support_2 = 0u; support_2 < loop_width;"));
         assert!(!source.contains("support_1 < loop_width"));
-        assert!(source.contains("let weight_1_6 = support_weight(offset_1, 6u);"));
+        assert!(source.contains("let weight_1_6 = weights[WIDTH + 6u];"));
+        assert_eq!(source.matches("support_weight(").count(), 2);
         assert!(source.contains("let row = grid_base + index_2 + index_3;"));
     }
 

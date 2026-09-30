@@ -8,6 +8,15 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- GPU plans in six, seven, and eight dimensions: `MAX_GPU_NUFFT_DIMENSIONS`
+  is now 8, like `MAX_NUFFT_DIMENSIONS`, for type 1, 2, and 3 in all three
+  precisions. The README's new "Higher dimensions" section explains which
+  sizes and tolerances are practical.
+- `NufftError::F32ToleranceUnreachable`: `F32` plans, on the GPU and on the
+  CPU, reject tolerances their rounding would miss by far after the
+  deconvolution, which happens with an upsampling factor below 2 in two or
+  more dimensions.
+
 - `wgpu-web/build_standalone.py` builds `wgpu-web/dist/wgpu_web.js`, a
   standalone browser build: one classic script with the WebAssembly module
   embedded, loaded with `wgpuWeb.load()`. It works in pages opened from
@@ -16,6 +25,27 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - wgpu-web: `adapterVendorName` and `adapterArchitecture` report the
   browser's names for the GPU, and `adapterName`, which browsers usually
   leave empty, falls back to them. The demo shows the accelerator on load.
+
+### Changed
+
+- The 4D and 5D GPU paths are rewritten, and serve 4D to 8D. Type 1 no
+  longer lets every fine-grid cell walk its `8^d` neighbouring cells and
+  refold each point it finds, which made it slower than the CPU backend and,
+  with clustered points, able to run one dispatch past the Windows watchdog.
+  Points are binned once in original order, and workgroups spread blocks of
+  cells from the points whose support reaches them; blocks with too many
+  points are split into parts added in a fixed order, so results stay
+  bitwise repeatable. Type 2 interpolates the binned points with lanes that
+  read contiguous rows.
+- Type-1 GPU plans in `F64` and `Df64`, and on grids or devices the tuned
+  `F32` spreaders of 1D to 3D cannot serve, spread through the same
+  rank-generic block spreader, as does the type-3 outer spread. The per-cell
+  gather they used made every fine-grid cell walk its points serially, so
+  dense or clustered points were slow and could also run past the watchdog.
+- `NufftPlan::set_points_gpu` now prepares 4D and higher point sets once,
+  so later executions skip the binning, as they do in 1D to 3D.
+- Large executions of the rank-generic paths are recorded as several
+  dispatches of bounded work.
 
 ## [0.2.0] - 2026-09-28
 

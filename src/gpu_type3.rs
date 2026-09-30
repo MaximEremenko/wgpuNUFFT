@@ -12,7 +12,7 @@ use crate::gpu_type1_2d::{Type1Gather2d, Type1GpuPlan2d};
 use crate::gpu_type1_3d::{Type1Gather3d, Type1GpuPlan3d};
 use crate::gpu_type1_nd::Type1GpuPlanNd;
 use crate::kernel::{EsHornerTable, EsKernel};
-use crate::plan::NufftPlan;
+use crate::plan::{tuned_type1_spread, NufftPlan};
 use crate::type3::NufftType3Plan;
 use wgpu_fft::FftPrecision;
 
@@ -99,6 +99,7 @@ impl GpuType3Plan {
                 .map(|&length| kernel.centered_fourier_coefficients(length))
                 .collect::<Result<Vec<_>>>()?
         };
+        let tuned = tuned_type1_spread(precision, kernel, &outer_shape, &limits);
         // Small F32 outer grids hold many sources per cell; the dense
         // spreader parallelizes over point groups instead of cells.
         let raw_spread = match dimensions {
@@ -110,7 +111,7 @@ impl GpuType3Plan {
                     metadata.config().batch(),
                 )?)
             }
-            1 => RawSpreadPlan::OneD(Type1GpuPlan::new(
+            1 if tuned => RawSpreadPlan::OneD(Type1GpuPlan::new(
                 device,
                 queue,
                 &outer_config,
@@ -118,7 +119,7 @@ impl GpuType3Plan {
                 outer_shape[0],
                 &outer_coefficients[0],
             )?),
-            2 => RawSpreadPlan::TwoD(Type1GpuPlan2d::new(
+            2 if tuned => RawSpreadPlan::TwoD(Type1GpuPlan2d::new(
                 device,
                 queue,
                 &outer_config,
@@ -130,7 +131,7 @@ impl GpuType3Plan {
                 ],
                 Type1Gather2d::Block,
             )?),
-            3 => RawSpreadPlan::ThreeD(Type1GpuPlan3d::new(
+            3 if tuned => RawSpreadPlan::ThreeD(Type1GpuPlan3d::new(
                 device,
                 queue,
                 &outer_config,

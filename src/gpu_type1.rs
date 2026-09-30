@@ -205,6 +205,16 @@ impl Type1GpuPlan {
         })
     }
 
+    /// Whether the segment gather serves this precision and grid. Public
+    /// plans route the others to the rank-generic plan.
+    pub(crate) fn segment_gather_available(
+        precision: FftPrecision,
+        kernel: EsKernel,
+        fine_length: usize,
+    ) -> bool {
+        precision == FftPrecision::F32 && SegmentLayout1d::for_grid(kernel, fine_length).is_some()
+    }
+
     pub(crate) fn point_buffer_size_bytes_for_precision(
         point_count: usize,
         precision: FftPrecision,

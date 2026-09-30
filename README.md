@@ -18,9 +18,11 @@ from [wgpu-fft](https://github.com/MaximEremenko/wgpuFFT), pinned here as the
 - **All three transform types**: type 1 (nonuniform points to Fourier modes),
   type 2 (modes to points), and type 3 (nonuniform points to nonuniform
   frequencies).
-- **One to five dimensions on the GPU**: tuned 1D, 2D, and 3D paths plus a
-  rank-generic path for 4D and 5D. The direct `f64` reference transforms
-  cover up to eight dimensions.
+- **One to eight dimensions on the GPU**, in all three precisions: tuned
+  1D, 2D, and 3D paths, and a rank-generic path for 4D to 8D that also
+  spreads every lower-rank type 1 the tuned `F32` spreaders do not cover.
+  The direct `f64` reference transforms cover eight dimensions too. See
+  [Higher dimensions](#higher-dimensions) for what is practical where.
 - **Three precisions**: `f32`, native `f64` (devices with `SHADER_F64`), and
   portable double-float (`Df64`, about 44-48 significant bits on any device).
 - **Deterministic**: repeated executions give bitwise-identical results, also
@@ -281,6 +283,33 @@ tested, while Metal, whose shader compiler enables fast math by default, is
 untested. In the browser, `wgpu-web` runs all 96 canary words at start-up and
 disables only `Df64` if one fails.
 
+## Higher dimensions
+
+Work and memory grow exponentially with the dimension `d`. Every point
+touches `w^d` fine-grid cells, where the kernel width `w` is 7 at
+`eps = 1e-6` and 4 at `eps = 1e-3`, and the oversampled grid holds `2^d`
+times as many cells as there are modes. So:
+
+- 4D and 5D are practical at the tolerances used in lower dimensions.
+- 6D suits moderate tolerances and grids of about ten modes per axis.
+- 7D and 8D work, but only on small grids at tolerances near `1e-3`; with
+  so few modes per axis a direct sum over the modes costs about as much.
+
+Each axis costs at least `2w` fine-grid cells, however few modes it has. A
+plan returns an error when its fine grid exceeds the device's buffer or
+binding limits, which in a browser allow up to 32^4 modes in 4D at
+`sigma = 2`.
+
+`F32` plans with an upsampling factor below 2 lose accuracy quickly as the
+dimension grows: the kernel's Fourier transform then falls steeply towards
+the edge of the mode box, and deconvolution amplifies `f32` rounding by
+that fall along every axis. At `sigma = 1.25` and `eps = 1e-6`, `f32`
+reaches only about `2e-5` in 2D, `3e-4` in 3D, and `1e-2` in 4D, while
+`F64` and `Df64` stay near the tolerance. `F32` plans, on the GPU and on the
+CPU, therefore return `F32ToleranceUnreachable` when the estimated error of
+this rounding exceeds both ten times the tolerance and `1e-5`; use
+`sigma = 2`, a larger tolerance, or `F64` or `Df64` precision instead.
+
 ## How it works
 
 **Type 2** deconvolves and zero-pads the modes onto an oversampled grid, runs
@@ -302,26 +331,39 @@ floating-point atomics are needed.
   16 x 16 x 8 block whose rows stay in registers while nearby points stream
   through workgroup memory. Type 2 interpolates the points in bin order for
   cache locality.
-- **Per-cell gather.** `F64` and `Df64` plans, 4D and 5D plans, smaller
-  grids, and devices without the required workgroup limits bin the points by
-  fine-grid cell, and every cell gathers the points within the kernel's
-  reach. In 2D and 3D, `F32` plans gather through shared-memory tiles when the
-  device limits allow.
+- **Everything else.** `F64` and `Df64` plans in 1D to 3D, smaller grids,
+  and devices without the 2D and 3D block spreaders' workgroup limits spread
+  through the rank-generic block spreader of the higher dimensions, below.
 - **Clustered points.** Bins of more than 64 points are sorted by a parallel
   merge sort. A tile or block that reaches too many points goes to a heavy
   pass, in which a whole workgroup shares a 1D or 2D tile and a 3D block's
   points are split across workgroups; partial sums are added in a fixed order.
   4,194,304 points in a single bin take about 44 ms in 1D, 69 ms in 2D, and
   93 ms in 3D per execution, while evenly spread points pay a few
-  microseconds for the checks. The per-cell gather sorts in parallel too, but
-  still walks each cell's reach serially.
+  microseconds for the checks.
+
+**Four to eight dimensions** use one rank-generic implementation, whose
+shaders are generated per rank and precision; its type-1 spreader also
+serves the lower-rank plans above. Points are binned once per point set
+into coarse bins, in original order for type 1, and every point's support
+is prepared. For type 1, each workgroup owns a block of fine-grid cells:
+every invocation keeps a run of cells along axis zero in registers, while
+the workgroup streams the points whose support reaches the block through
+workgroup memory and evaluates their kernel weights once for all
+invocations. Blocks with too many points in reach are split into parts
+added in a fixed order, as in 3D. Type 2 scatters the deconvolved modes
+onto the fine grid and interpolates the binned points with one lane per
+axis-zero support offset, adding the lanes in lane order. Executions whose
+work would be large are recorded as several dispatches of bounded work,
+which keeps the operating system's GPU watchdog from firing on devices
+that preempt only between dispatches.
 
 **Type 3** rescales and pre-phases the sources, spreads them onto an outer
 uniform grid, evaluates that grid through an inner type-2 plan, and applies
 the kernel correction and post-phase at the targets. The small, densely
-populated outer grids of 1D and 2D plans use a spreader that sums fixed
-groups of sources into partial grids and adds the partial grids in group
-order; 3D plans use the 3D block spreader.
+populated outer grids of `F32` 1D and 2D plans use a spreader that sums
+fixed groups of sources into partial grids and adds the partial grids in
+group order; the other outer grids use the type-1 spreaders above.
 
 A GPU plan cannot read device buffers while it is created, so
 `NufftType3Config` takes conservative source and target intervals, and every
@@ -338,8 +380,8 @@ must stay in queue order.
 
 `NufftConfig::with_batch(n)` and `NufftType3Config::with_batch(n)` plan `n`
 transforms over one shared point set. Binning, scanning, and sorting run once
-for all of them, the per-cell spreading and direct interpolation kernels
-reuse each kernel weight for up to four vectors, and the fine-grid FFT uses
+for all of them, the 1D to 3D direct interpolation kernels reuse each
+kernel weight for up to four vectors, and the fine-grid FFT uses
 `wgpu-fft`'s batch dimension. The ordinary encode methods run all `n`
 transforms; the `*_batch` methods run any active count from 1 to `n` on the
 same plan. The FFT stays sized for `n`, so a smaller count does not reduce
@@ -349,7 +391,8 @@ FFT work proportionally.
 
 `NufftPlan::set_points_gpu` records the point-dependent work once (binning,
 sorting, and per-point preparation on the binned `F32` paths of 1D-3D
-type-1 and type-2 plans). `execute_type1_gpu[_batch]` and
+type-1 and type-2 plans and on the rank-generic paths).
+`execute_type1_gpu[_batch]` and
 `execute_type2_gpu[_batch]` then transform new strengths or coefficients at
 those points. The plan keeps a reference to the point buffer: its contents
 must not change while executions use it, and executions must be submitted
@@ -382,12 +425,12 @@ $env:WGPU_FFT_RUN_GPU_TESTS = '1'; cargo test --release
 |---|---|
 | `gpu_nufft` | 1D at `eps` from `1e-2` to `1e-6`, both signs and mode orders, and random, boundary, clustered, and duplicate points: relative L2 error at most `4*eps` overall and `8*eps` for each point class. |
 | `gpu_nufft_2d`, `gpu_nufft_3d` | The same in 2D (at most `20*eps`) and 3D (at most `32*eps`), with non-square grids, scratch reuse, determinism, and adjoint checks. |
-| `gpu_nufft_nd` | 4D and 5D in all three precisions. |
-| `gpu_nufft_type3` | Type 3 in 1D to 3D (at most `100*eps`). |
+| `gpu_nufft_nd` | 4D to 8D against the direct sums, in all three precisions, with batches, both signs and mode orders, adjoint checks, and bitwise point reuse. |
+| `gpu_nufft_type3` | Type 3 in 1D to 4D, and 5D and 6D on small intervals (at most `100*eps`). |
 | `gpu_nufft_batch` | Batched type 1, 2, and 3. |
 | `gpu_nufft_precision`, `gpu_nufft_df64` | Native `f64` and `Df64` accuracy, layouts, and device capabilities. |
-| `gpu_clustered_points` | Tightly clustered points, the large-bin sort, and the heavy passes. |
-| `gpu_invalid_points` | Coordinates outside the contract, NaN and infinities included. |
+| `gpu_clustered_points` | Tightly clustered points, the large-bin sort, and the heavy passes, in 1D to 6D. |
+| `gpu_invalid_points` | Coordinates outside the contract, NaN and infinities included, in 1D to 6D. |
 | `gpu_device_mismatch` | Buffers and devices from another `wgpu` device. |
 | `cpu_nufft`, `cpu_nufft_type3` | The CPU plans against the reference (types 1 and 2 in 1D to 5D, type 3 in 1D to 4D) in all three precisions, clustered and boundary points, bitwise repeatability across thread counts, and prepared point sets against one-shot executions. They run without a GPU. |
 
@@ -454,7 +497,7 @@ wgpuNUFFT/
 |-- wgpu-web/               browser package (wasm-bindgen)
 |-- python/                 Python binding (PyO3 + NumPy)
 |-- web/                    browser test harness
-`-- nd_prototype/           research prototype of the 4D/5D design
+`-- nd_prototype/           research prototype of the rank-generic design
 ```
 
 The Cargo packages are not published to crates.io (`publish = false`). See
