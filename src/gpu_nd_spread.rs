@@ -891,13 +891,17 @@ struct BinRanges {
     last_1: i32,
 }
 
+// Each function returns once, from a variable initialized where it is
+// declared: FXC, the DX12 shader compiler, rejects a struct returned from
+// several branches as possibly uninitialized.
 fn bin_ranges(low: i32, high: i32, fine_length: i32, side: i32, bins: i32, full: bool) -> BinRanges {
-    if (full) { return BinRanges(0, bins - 1, 0, -1); }
-    if (low < 0) { return BinRanges((low + fine_length) / side, bins - 1, 0, high / side); }
+    var ranges = BinRanges(low / side, high / side, 0, -1);
     if (high >= fine_length) {
-        return BinRanges(low / side, bins - 1, 0, (high - fine_length) / side);
+        ranges = BinRanges(low / side, bins - 1, 0, (high - fine_length) / side);
     }
-    return BinRanges(low / side, high / side, 0, -1);
+    if (low < 0) { ranges = BinRanges((low + fine_length) / side, bins - 1, 0, high / side); }
+    if (full) { ranges = BinRanges(0, bins - 1, 0, -1); }
+    return ranges;
 }
 
 fn bin_range_length(ranges: BinRanges) -> i32 {
@@ -906,8 +910,7 @@ fn bin_range_length(ranges: BinRanges) -> i32 {
 
 fn bin_range_item(ranges: BinRanges, item: i32) -> i32 {
     let first_length = ranges.last_0 - ranges.first_0 + 1;
-    if (item < first_length) { return ranges.first_0 + item; }
-    return ranges.first_1 + (item - first_length);
+    return select(ranges.first_1 + (item - first_length), ranges.first_0 + item, item < first_length);
 }
 "#;
 

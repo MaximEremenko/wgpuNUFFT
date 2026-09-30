@@ -77,6 +77,13 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Large executions of the rank-generic paths are recorded as several
   dispatches of bounded work.
 
+### Fixed
+
+- The rank-generic spreader's shaders compile with FXC, the default DX12
+  shader compiler, which rejected their block-reach helpers as returning
+  possibly uninitialized data; type-1 plans of two or more dimensions
+  failed on DX12.
+
 ### Removed
 
 - The `nd_prototype/` research prototype, whose design now ships as the
