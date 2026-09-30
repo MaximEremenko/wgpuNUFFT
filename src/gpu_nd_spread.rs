@@ -48,6 +48,12 @@ const MAX_ROW_BATCH: usize = 128;
 const MAX_CHUNK: usize = 64;
 /// Bin rows a block's reach may span.
 const MAX_ROWS: usize = 1 << 20;
+/// Bin rows a block's reach spans on average before the bins coarsen: every
+/// row costs a lookup, while coarser bins stage records outside the reach.
+const TARGET_REACH_ROWS: f64 = 1024.0;
+/// Bins a grid holds before the bins coarsen: every bin costs a count and a
+/// scan entry per point set.
+const MAX_BINS: usize = 1 << 23;
 /// Invocation steps a light workgroup may spend, which bounds its records.
 const LIGHT_WORK_BUDGET: u64 = 1 << 29;
 /// Bounds of the per-plan record limit of a light block.
@@ -160,18 +166,48 @@ impl NdSpreadLayout {
         block[0] = run * groups_0;
         let workgroup_size = groups_0 * block[1..].iter().product::<usize>();
 
-        // Finer bins stage fewer records outside a block's reach; the small
-        // two-dimensional F32 blocks gain from the finest.
-        let fine_bins = dimensions == 2 && precision == FftPrecision::F32;
-        let mut bin_side = (0..dimensions)
-            .map(|axis| match (axis, fine_bins) {
-                (0, true) => 1,
-                (0, false) => 2,
-                (_, true) => block[axis].clamp(1, 2),
-                (_, false) => block[axis].clamp(2, 4),
-            })
-            .collect::<Vec<_>>();
-        let reach_cells = |axis: usize| block[axis] + width + 2;
+        // Bins hold support starts, so a block's records are those of the
+        // bins over the block and the kernel width below it. Single-cell bins
+        // stage no other record, but every bin row of a reach costs a lookup
+        // and every bin a count and a scan entry: the axes above zero start
+        // from single cells and coarsen along the widest reach while a reach
+        // spans more than `TARGET_REACH_ROWS` rows on average or the grid
+        // holds more than `MAX_BINS` bins. Along axis zero a row is one
+        // contiguous range of records; two-cell bins measured best there,
+        // except for the small two-dimensional F32 blocks.
+        let reach_cells = |axis: usize| block[axis] + width - 1;
+        let mut bin_side = vec![1usize; dimensions];
+        if dimensions != 2 || precision != FftPrecision::F32 {
+            bin_side[0] = 2;
+        }
+        let mean_reach_bins = |bin_side: &[usize], axis: usize| {
+            ((reach_cells(axis) - 1) as f64 / bin_side[axis] as f64 + 1.0)
+                .min(fine_shape[axis].div_ceil(bin_side[axis]) as f64)
+        };
+        loop {
+            let rows = (1..dimensions)
+                .map(|axis| mean_reach_bins(&bin_side, axis))
+                .product::<f64>();
+            let bin_count = (0..dimensions)
+                .try_fold(1usize, |count, axis| {
+                    count.checked_mul(fine_shape[axis].div_ceil(bin_side[axis]))
+                })
+                .unwrap_or(usize::MAX);
+            if rows <= TARGET_REACH_ROWS && bin_count <= MAX_BINS {
+                break;
+            }
+            let widest = (1..dimensions)
+                .filter(|&axis| bin_side[axis] < fine_shape[axis])
+                .max_by(|&a, &b| {
+                    mean_reach_bins(&bin_side, a).total_cmp(&mean_reach_bins(&bin_side, b))
+                });
+            let axis = match widest {
+                Some(axis) => axis,
+                None if bin_count > MAX_BINS && bin_side[0] < fine_shape[0] => 0,
+                None => break,
+            };
+            bin_side[axis] *= 2;
+        }
         let reach_geometry = |bin_side: &[usize]| {
             let mut bins = Vec::with_capacity(dimensions);
             let mut full = Vec::with_capacity(dimensions);
@@ -858,10 +894,10 @@ const HEAVY_STATE: u32 = {HEAVY_STATE}u;
             groups_0 = layout.groups_0,
             block_count = layout.block_count(),
             block_cells = layout.block_cells(),
-            // One extra cell on each side covers a support start that rounding
-            // moved by one cell relative to the binned cell.
-            reach_below = width.div_ceil(2) + 1,
-            reach_above = width / 2 + 1,
+            // Bins hold support starts: a record reaches the block exactly
+            // when its start lies at most `width - 1` cells below the block.
+            reach_below = width - 1,
+            reach_above = 0,
         );
         let mut bin_stride = 1usize;
         for axis in 0..self.dimensions() {
@@ -1743,5 +1779,24 @@ mod tests {
             NdSpreadLayout::for_grid(kernel, &[512, 512], FftPrecision::F32, &limits).unwrap();
         assert_eq!((two.run, two.workgroup_size), (4, 32));
         assert_eq!(two.block, vec![8, 16]);
+    }
+
+    #[test]
+    fn bins_coarsen_to_bound_reach_rows_and_bin_count() {
+        let kernel = EsKernel::for_tolerance(1.0e-6, 2.0).unwrap();
+        let limits = wgpu::Limits::default();
+        let layout = |shape: &[usize]| {
+            NdSpreadLayout::for_grid(kernel, shape, FftPrecision::F32, &limits).unwrap()
+        };
+        // Single cells above axis zero while a reach spans few bin rows.
+        assert_eq!(layout(&[2000, 2000]).bin_side, vec![1, 1]);
+        assert_eq!(layout(&[200, 200, 200]).bin_side, vec![2, 1, 1]);
+        assert_eq!(layout(&[32; 4]).bin_side, vec![2, 1, 1, 1]);
+        // More than `MAX_BINS` bins coarsen along the widest reaches.
+        assert_eq!(layout(&[400, 400, 400]).bin_side, vec![2, 2, 2]);
+        // Single cells along four axes would span 6400 rows per reach.
+        let five = layout(&[24; 5]);
+        assert_eq!(five.block, vec![16, 4, 4, 2, 2]);
+        assert_eq!(five.bin_side, vec![2, 2, 2, 2, 2]);
     }
 }

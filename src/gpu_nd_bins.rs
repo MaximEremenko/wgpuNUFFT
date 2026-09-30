@@ -10,15 +10,21 @@
 //! `f32` pair, or an `f64`). Consumers evaluate the distance from support cell
 //! `start + j` as `j + offset` and never fold again.
 //!
+//! Bins hold support starts, wrapped onto the grid, rather than the cells of
+//! the positions: the records whose support reaches a block of cells are then
+//! exactly those of the bins that hold the kernel width of starts below the
+//! block, and the type-1 spreader stages no others.
+//!
 //! [`NdBinOrder::Stable`] restores original point order inside every bin, as
 //! the type-1 spreader needs for deterministic sums: [`LargeBinSort`] sorts
 //! bins above [`SMALL_BIN`] points, and preparation ranks the points of the
-//! smaller bins. [`NdBinOrder::Grouped`] keeps the order the scatter left,
-//! which suits type-2 interpolation, whose per-point results do not depend on
-//! it.
+//! smaller bins. Its preparation also keeps every start inside its point's
+//! bin, which the count pass derived in a separate shader. [`NdBinOrder::Grouped`]
+//! keeps the order the scatter left, which suits type-2 interpolation, whose
+//! per-point results do not depend on it.
 //!
-//! A coordinate the fold cannot bring onto the grid, NaN included, lands in a
-//! clamped bin with support start zero and offsets past the kernel support,
+//! A coordinate the fold cannot bring onto the grid, NaN included, lands in
+//! the first bin with support start zero and offsets past the kernel support,
 //! so every consumer reads inside the grid and weighs it by zero.
 
 use crate::error::{NufftError, Result};
@@ -166,7 +172,7 @@ impl NdPointBins {
         let prepare_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.nd_bins.prepare",
-            &generate_prepare_wgsl(types, dimensions, stable, &position),
+            &generate_prepare_wgsl(types, bin_shape, &bins, stable, &position),
         );
         Ok(Self {
             dimensions,
@@ -397,19 +403,24 @@ fn generate_count_wgsl(
     for (axis, count) in bins.iter().enumerate() {
         constants.push_str(&format!("const BINS_{axis}: u32 = {count}u;\n"));
     }
-    let cells: String = (0..dimensions)
+    let loads: String = (0..dimensions)
+        .map(|axis| format!("    let coordinate_{axis} = points[point_base + {axis}u];\n"))
+        .collect();
+    let in_reach = (0..dimensions)
+        .map(|axis| types.in_reach(&format!("coordinate_{axis}")))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    // The same start the prepare pass derives, wrapped onto the grid.
+    let starts: String = (0..dimensions)
         .map(|axis| {
             format!(
-                "    let cell_{axis} = {};\n",
-                types.cell(
-                    axis,
-                    &types.fold(axis, &format!("points[point_base + {axis}u]"))
-                )
+                "    let start_{axis} = wrapped_start(select(0, {start}, in_reach), FINE_{axis}_I32);\n",
+                start = types.start(&types.fold(axis, &format!("coordinate_{axis}"))),
             )
         })
         .collect();
     let terms = (0..dimensions)
-        .map(|axis| format!("cell_{axis} / BIN_SIDE_{axis}"))
+        .map(|axis| format!("start_{axis} / BIN_SIDE_{axis}"))
         .collect::<Vec<_>>();
     let lengths = (0..dimensions)
         .map(|axis| format!("BINS_{axis}"))
@@ -436,6 +447,12 @@ const SMALL_BIN: u32 = {SMALL_BIN}u;
 @group(0) @binding(1) var<storage, read_write> bin_counts: array<atomic<u32>>;
 @group(0) @binding(2) var<storage, read_write> point_slots: array<vec2<u32>>;
 
+// A support start wrapped onto the grid, clamped so that even a coordinate
+// outside the contract lands in a bin.
+fn wrapped_start(start: i32, fine_length: i32) -> u32 {{
+    return u32(clamp(select(start, start + fine_length, start < 0), 0, fine_length - 1));
+}}
+
 @compute @workgroup_size({WORKGROUP_SIZE})
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -449,7 +466,8 @@ fn main(
     if (point_index >= total) {{ return; }}
 
     let point_base = point_index * DIMS;
-{cells}    let bin = {bin};
+{loads}    let in_reach = {in_reach};
+{starts}    let bin = {bin};
 {record}}}
 "#,
         coordinate = types.coordinate_type(),
@@ -491,7 +509,26 @@ fn main(
 ///
 /// Every coordinate is loaded once, before any store, and the fallback for a
 /// coordinate out of the fold's reach is selected without branches.
-fn generate_prepare_wgsl(types: NdWgsl, dimensions: usize, stable: bool, position: &str) -> String {
+fn generate_prepare_wgsl(
+    types: NdWgsl,
+    bin_shape: &[usize],
+    bins: &[usize],
+    stable: bool,
+    position: &str,
+) -> String {
+    let dimensions = bin_shape.len();
+    let last = dimensions - 1;
+    let bin_axes: String = (0..dimensions)
+        .map(|axis| {
+            if axis == last {
+                format!("    let bin_{axis} = i32(bin_rest);\n")
+            } else {
+                format!(
+                    "    let bin_{axis} = i32(bin_rest % BINS_{axis});\n    bin_rest = bin_rest / BINS_{axis};\n"
+                )
+            }
+        })
+        .collect();
     let (rank_bindings, rank) = if stable {
         (
             "@group(0) @binding(4) var<storage, read> point_slots: array<vec2<u32>>;
@@ -509,7 +546,8 @@ fn generate_prepare_wgsl(types: NdWgsl, dimensions: usize, stable: bool, positio
         }}
         slot = bin_start + rank;
     }}
-"
+    var bin_rest = bin;
+{bin_axes}"
             ),
         )
     } else {
@@ -525,28 +563,62 @@ fn generate_prepare_wgsl(types: NdWgsl, dimensions: usize, stable: bool, positio
     let axes: String = (0..dimensions)
         .map(|axis| {
             let position_value = types.fold(axis, &format!("coordinate_{axis}"));
+            let start = format!(
+                "select(0, {}, in_reach)",
+                types.start(&format!("position_{axis}"))
+            );
+            let start = if stable {
+                format!("start_in_bin({start}, bin_{axis} * BIN_SIDE_{axis}, BIN_SIDE_{axis}, FINE_{axis}_I32)")
+            } else {
+                start
+            };
             format!(
                 "    let position_{axis} = {position_value};
-    let start_{axis} = select(0, {start}, in_reach);
+    let start_{axis} = {start};
     prepared_starts[STRIDE * slot + {axis}u] = start_{axis};
     prepared_offsets[DIMS * slot + {axis}u] = select({outside}, {offset}, in_reach);
 ",
-                start = types.start(&format!("position_{axis}")),
                 outside = types.outside_offset(),
                 offset = types.offset(&format!("start_{axis}"), &format!("position_{axis}")),
             )
         })
         .collect();
+    let bin_constants: String = if stable {
+        bin_shape
+            .iter()
+            .zip(bins)
+            .enumerate()
+            .map(|(axis, (side, count))| {
+                format!(
+                    "const BIN_SIDE_{axis}: i32 = {side}i;\nconst BINS_{axis}: u32 = {count}u;\n"
+                )
+            })
+            .collect()
+    } else {
+        String::new()
+    };
     let entry = format!(
         r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
 const DIMS: u32 = {dimensions}u;
 const STRIDE: u32 = {stride}u;
-
+{bin_constants}
 @group(0) @binding(0) var<storage, read> points: array<{coordinate}>;
 @group(0) @binding(1) var<storage, read> sorted_indices: array<u32>;
 @group(0) @binding(2) var<storage, read_write> prepared_starts: array<i32>;
 @group(0) @binding(3) var<storage, read_write> prepared_offsets: array<{offset_type}>;
 {rank_bindings}
+// The count pass binned this start in another shader, where rounding may
+// have carried it one cell across the edge of the bin. The nearest start of
+// the bin keeps the point in reach of every block it touches; the cell it
+// trades lies at the edge of the support, whose weight is about exp(-beta).
+fn start_in_bin(start: i32, low: i32, side: i32, fine_length: i32) -> i32 {{
+    let high = min(low + side, fine_length) - 1;
+    var delta = select(start, start + fine_length, start < 0) - low;
+    if (delta > fine_length / 2) {{ delta = delta - fine_length; }}
+    if (delta < -(fine_length / 2)) {{ delta = delta + fine_length; }}
+    return start + clamp(delta, 0, high - low) - delta;
+}}
+
 @compute @workgroup_size({WORKGROUP_SIZE})
 fn main(
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -590,9 +662,10 @@ mod tests {
                 for stable in [false, true] {
                     let count = generate_count_wgsl(types, &sides, &bins, stable, &position);
                     assert_valid_nd_wgsl(precision, &count);
-                    let prepare = generate_prepare_wgsl(types, dimensions, stable, &position);
+                    let prepare = generate_prepare_wgsl(types, &sides, &bins, stable, &position);
                     assert_valid_nd_wgsl(precision, &prepare);
                     assert_eq!(prepare.contains("rank = rank + 1u"), stable);
+                    assert_eq!(prepare.contains("let start_0 = start_in_bin("), stable);
                 }
             }
         }
@@ -611,7 +684,7 @@ mod tests {
             &position,
         );
         assert!(source.contains(
-            "let bin = cell_0 / BIN_SIDE_0 + BINS_0 * (cell_1 / BIN_SIDE_1 + BINS_1 * (cell_2 / BIN_SIDE_2 + BINS_2 * (cell_3 / BIN_SIDE_3)));"
+            "let bin = start_0 / BIN_SIDE_0 + BINS_0 * (start_1 / BIN_SIDE_1 + BINS_1 * (start_2 / BIN_SIDE_2 + BINS_2 * (start_3 / BIN_SIDE_3)));"
         ));
         assert!(source.contains("atomicMax(&bin_counts[arrayLength(&bin_counts) - 1u], 1u);"));
     }

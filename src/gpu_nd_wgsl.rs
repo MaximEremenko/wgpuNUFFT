@@ -144,16 +144,6 @@ impl NdWgsl {
         }
     }
 
-    /// The grid cell `floor(position)` of a folded position, clamped onto the
-    /// grid so that even a coordinate outside the contract lands in a bin.
-    pub(crate) fn cell(self, axis: usize, position: &str) -> String {
-        let floor = match self.precision {
-            FftPrecision::F32 | FftPrecision::Df64 => format!("floor_df64_to_i32({position})"),
-            FftPrecision::F64 => format!("i32(floor({position}))"),
-        };
-        format!("min(u32(max({floor}, 0)), FINE_{axis} - 1u)")
-    }
-
     /// The support start `ceil(position - w/2)` of a folded position.
     pub(crate) fn start(self, position: &str) -> String {
         match self.precision {
@@ -543,9 +533,8 @@ mod tests {
         for axis in 0..dimensions {
             let _ = writeln!(
                 body,
-                "    let position_{axis} = {};\n    let cell_{axis} = {};\n    let start_{axis} = {};\n    let offset_{axis} = {};\n    let inside_{axis} = {};\n    let weight_{axis} = support_weight(offset_{axis}, 3u);",
+                "    let position_{axis} = {};\n    let start_{axis} = {};\n    let offset_{axis} = {};\n    let inside_{axis} = {};\n    let weight_{axis} = support_weight(offset_{axis}, 3u);",
                 types.fold(axis, &format!("points[{axis}]")),
-                types.cell(axis, &format!("position_{axis}")),
                 types.start(&format!("position_{axis}")),
                 types.offset(&format!("start_{axis}"), &format!("position_{axis}")),
                 types.in_reach(&format!("points[{axis}]")),

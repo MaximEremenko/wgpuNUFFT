@@ -337,13 +337,15 @@ floating-point atomics are needed.
 
 **Four to eight dimensions** use one rank-generic implementation, whose
 shaders are generated per rank and precision; its type-1 spreader also
-serves every lower-rank plan. Points are binned once per point set
-into coarse bins, in original order for type 1, and every point's support
-is prepared. For type 1, each workgroup owns a block of fine-grid cells:
-every invocation keeps a run of cells along axis zero in registers, while
-the workgroup streams the points whose support reaches the block through
-workgroup memory and evaluates their kernel weights once for all
-invocations. Blocks with too many points in reach are split into parts
+serves every lower-rank plan. Points are binned once per point set by the
+first cell of their kernel support, in original order for type 1, and
+every point's support is prepared. For type 1, each workgroup owns a block
+of fine-grid cells: every invocation keeps a run of cells along axis zero
+in registers, while the workgroup streams the points whose support reaches
+the block through workgroup memory and evaluates their kernel weights once
+for all invocations. The bins over a block and the kernel width below it
+hold exactly those points; they are single cells along the axes above
+zero unless a block's reach would span too many of them. Blocks with too many points in reach are split into parts
 added in a fixed order: a plan pass sizes the parts from the points listed
 in every crowded block's reach, with an exact sum that does not depend on
 the order in which the blocks were listed. Workgroup sizes and run lengths

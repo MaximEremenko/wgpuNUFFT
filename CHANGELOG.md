@@ -46,6 +46,12 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The spreader sizes the parts of every crowded block from its actual
   points, so a dense cluster spreads over many workgroups, and chooses its
   workgroup sizes, run lengths, and bins per rank and precision.
+- The rank-generic spreader bins points by the first cell of their kernel
+  support rather than by the cell that holds them, so every block of the
+  fine grid reads exactly the points whose support reaches it, and uses
+  bins as fine as single cells where a block's reach spans few bin rows.
+  Type-1 plans spread faster in every rank, most in three to six
+  dimensions.
 - `NufftPlan::set_points_gpu` now prepares 4D and higher point sets once,
   so later executions skip the binning, as they do in 1D to 3D.
 - Large executions of the rank-generic paths are recorded as several
