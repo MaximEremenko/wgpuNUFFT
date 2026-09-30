@@ -41,6 +41,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rank-generic block spreader, as does the type-3 outer spread. The per-cell
   gather they used made every fine-grid cell walk its points serially, so
   dense or clustered points were slow and could also run past the watchdog.
+- One- and two-dimensional type-1 GPU plans in every precision now spread
+  through the rank-generic spreader, which is faster than the former 1D and
+  2D gathers on dense and clustered points. That spreader sizes the parts of
+  every crowded block from its actual points, so a dense cluster spreads
+  over many workgroups, and sizes its workgroups per rank and precision.
 - `NufftPlan::set_points_gpu` now prepares 4D and higher point sets once,
   so later executions skip the binning, as they do in 1D to 3D.
 - Large executions of the rank-generic paths are recorded as several

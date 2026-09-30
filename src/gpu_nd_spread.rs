@@ -16,12 +16,13 @@
 //!
 //! A classify pass first counts the records in every block's reach. Empty
 //! blocks write zeros at once. Blocks above a per-plan record limit, which
-//! keeps every light workgroup short, are listed instead: the heavy part
-//! pass splits each listed block's records, in reach order, into a fixed
-//! number of parts, one workgroup each, and the heavy reduce pass adds the
-//! parts of every cell in part order. The part count depends only on the
-//! plan, the point count and the batch, so those cells stay deterministic
-//! too.
+//! keeps every light workgroup short, are listed instead. A plan pass gives
+//! every listed block as many parts as its records need, at a record count
+//! per part that depends only on the plan, the point count and the batch;
+//! the heavy part pass then spreads each part, in reach order, in its own
+//! workgroup, and the heavy reduce pass adds the parts of every cell in part
+//! order. A dense cluster is therefore split across many workgroups, and its
+//! cells stay deterministic too.
 
 use std::fmt::Write as _;
 use std::sync::Mutex;
@@ -55,14 +56,14 @@ const MAX_HEAVY_RECORDS: u64 = 1 << 18;
 /// Workgroups that keep a large GPU busy. A grid with fewer blocks than this
 /// lowers its record limit so dense blocks are split into parts too.
 const TARGET_PARALLEL_WORKGROUPS: u64 = 4096;
-/// The smallest record limit, so parts stay worth their partial sums.
+/// The smallest record limit and the smallest heavy part, so parts stay
+/// worth their partial sums.
 const MIN_PART_RECORDS: u64 = 256;
-/// Heavy parts of one block when many blocks are heavy, and when few are.
-const MAX_HEAVY_PARTS: u64 = 32;
-const MAX_DENSE_HEAVY_PARTS: u64 = 256;
-/// Scratch that bounds the part count: parts shrink as the possible heavy
-/// blocks and the batch grow.
+/// Partial-sum scratch for the heavy parts: more parts fit when the block
+/// and the batch are small.
 const HEAVY_SCRATCH_BUDGET_BYTES: u64 = 64 << 20;
+/// Invocations of the heavy plan pass, a single workgroup.
+const PLAN_WORKGROUP_SIZE: u32 = 256;
 /// Invocation steps one spreading dispatch may take; larger workloads are
 /// split into consecutive dispatches.
 const DISPATCH_WORK_BUDGET: u64 = 1 << 36;
@@ -318,10 +319,10 @@ impl NdSpreadLayout {
     }
 
     /// Heavy part workgroups per dispatch: a part holds at most
-    /// `ceil(point_count / parts)` records.
-    fn part_workgroups_per_dispatch(&self, point_count: usize, parts: u64) -> u64 {
-        let records = (point_count as u64).div_ceil(parts).max(1);
-        (DISPATCH_WORK_BUDGET / (records * self.record_steps)).max(MIN_WORKGROUPS_PER_DISPATCH)
+    /// `part_records` records.
+    fn part_workgroups_per_dispatch(&self, part_records: u64) -> u64 {
+        let steps = part_records.max(1).saturating_mul(self.record_steps);
+        (DISPATCH_WORK_BUDGET / steps).max(MIN_WORKGROUPS_PER_DISPATCH)
     }
 
     fn block_cells(&self) -> usize {
@@ -384,7 +385,13 @@ fn largest_power_of_two_at_most(value: usize) -> usize {
 struct HeavyGeometry {
     /// Most blocks the classify pass can list.
     capacity: u64,
-    parts: u64,
+    /// Part slots per vector in the partial-sum scratch; every listed block
+    /// needs at least one.
+    max_parts: u64,
+    /// The most records one part can hold: the plan pass derives its part
+    /// size from the listed records, which never exceed the bound behind
+    /// [`part_records`], and may double it once to absorb `f32` rounding.
+    part_records: u64,
 }
 
 impl HeavyGeometry {
@@ -401,18 +408,47 @@ impl HeavyGeometry {
         complex_bytes: u64,
         max_scratch_bytes: u64,
     ) -> Self {
-        let bound = layout.blocks_per_bin().saturating_mul(point_count as u64);
+        let blocks_per_bin = layout.blocks_per_bin();
+        let bound = blocks_per_bin.saturating_mul(point_count as u64);
         let per_block = active_batch as u64 * layout.block_cells() as u64 * complex_bytes;
         let capacity = (bound / (layout.light_limit(point_count) + 1))
             .min(layout.block_count() as u64)
             .min(max_scratch_bytes / per_block);
         let budget = HEAVY_SCRATCH_BUDGET_BYTES.min(max_scratch_bytes);
-        // Few heavy blocks get more parts, so they still fill the GPU.
-        let most_parts = (TARGET_PARALLEL_WORKGROUPS / capacity.max(1))
-            .clamp(MAX_HEAVY_PARTS, MAX_DENSE_HEAVY_PARTS);
-        let parts = (budget / (capacity.max(1) * per_block)).clamp(1, most_parts);
-        Self { capacity, parts }
+        // A slot for every listable block, and the budget's worth of slots
+        // for a few heavy blocks to split into many parts; `(blocks_per_bin
+        // + 1) * spare` must fit a u32 for the plan pass's arithmetic.
+        let spare_limit = u64::from(u32::MAX) / (blocks_per_bin + 1);
+        let max_parts = (budget / per_block)
+            .min(max_scratch_bytes / per_block)
+            .min(capacity + spare_limit)
+            .max(capacity);
+        let part_records = part_records(point_count as u64, max_parts - capacity, blocks_per_bin)
+            .saturating_mul(2);
+        Self {
+            capacity,
+            max_parts,
+            part_records,
+        }
     }
+}
+
+/// Records per heavy part if every reach held its most records: all reaches
+/// hold at most `blocks_per_bin * point_count`, and each listed block adds at
+/// most one rounded-up part, so parts of this size never need more than
+/// `spare + capacity` slots. The plan pass sizes parts from the actual
+/// listed records, which is never larger.
+fn part_records(point_count: u64, spare: u64, blocks_per_bin: u64) -> u64 {
+    let unlimited = u64::from(u32::MAX);
+    if spare == 0 {
+        return unlimited;
+    }
+    let per = point_count / spare;
+    if per >= unlimited / blocks_per_bin.max(1) {
+        return unlimited;
+    }
+    let extra = (blocks_per_bin * (point_count % spare)).div_ceil(spare);
+    (blocks_per_bin * per + extra).clamp(MIN_PART_RECORDS, unlimited)
 }
 
 pub(crate) struct NdBlockSpread {
@@ -426,6 +462,8 @@ pub(crate) struct NdBlockSpread {
     classify_layout: wgpu::BindGroupLayout,
     reduce_pipeline: wgpu::ComputePipeline,
     reduce_layout: wgpu::BindGroupLayout,
+    plan_pipeline: wgpu::ComputePipeline,
+    plan_layout: wgpu::BindGroupLayout,
     reset_pipeline: wgpu::ComputePipeline,
     reset_layout: wgpu::BindGroupLayout,
     /// Records in each block's reach, or [`HEAVY_STATE`], rewritten by every
@@ -433,6 +471,8 @@ pub(crate) struct NdBlockSpread {
     block_state: wgpu::Buffer,
     /// A count, then `(block, records)` for every listed heavy block.
     heavy_list: GrowOnlyBuffer,
+    /// The first part slot of every listed block, then the total.
+    part_offsets: GrowOnlyBuffer,
     /// Partial sums of the heavy parts.
     partials: Mutex<Option<wgpu::Buffer>>,
     ranged: RangedDispatch,
@@ -472,6 +512,8 @@ impl NdBlockSpread {
             "wgpu_nufft.nd_spread.heavy_reduce",
             &shaders.reduce(),
         );
+        let plan_pipeline =
+            create_compute_pipeline(device, "wgpu_nufft.nd_spread.heavy_plan", &shaders.plan());
         let reset_pipeline =
             create_compute_pipeline(device, "wgpu_nufft.nd_spread.heavy_reset", HEAVY_RESET_WGSL);
         let block_state = device.create_buffer(&wgpu::BufferDescriptor {
@@ -490,10 +532,13 @@ impl NdBlockSpread {
             classify_pipeline,
             reduce_layout: reduce_pipeline.get_bind_group_layout(0),
             reduce_pipeline,
+            plan_layout: plan_pipeline.get_bind_group_layout(0),
+            plan_pipeline,
             reset_layout: reset_pipeline.get_bind_group_layout(0),
             reset_pipeline,
             block_state,
             heavy_list: GrowOnlyBuffer::new(device, "wgpu_nufft.nd_spread.heavy_list"),
+            part_offsets: GrowOnlyBuffer::new(device, "wgpu_nufft.nd_spread.part_offsets"),
             partials: Mutex::new(None),
             ranged: RangedDispatch::new(device),
             device: device.clone(),
@@ -629,7 +674,7 @@ impl NdBlockSpread {
 
         let block_cells = self.layout.block_cells() as u64;
         let partial_bytes =
-            heavy.capacity * heavy.parts * active_batch as u64 * block_cells * self.complex_bytes;
+            heavy.max_parts * active_batch as u64 * block_cells * self.complex_bytes;
         let partials = {
             let mut cached = self
                 .partials
@@ -649,6 +694,19 @@ impl NdBlockSpread {
                 }
             }
         };
+        let offset_bytes = (heavy.capacity + 1) * 4;
+        let part_offsets = self.part_offsets.get(offset_bytes);
+        let plan_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.nd_spread.heavy_plan.bind_group"),
+            layout: &self.plan_layout,
+            entries: &[
+                binding_entry(0, &heavy_list, heavy_bytes),
+                binding_entry(1, &part_offsets, offset_bytes),
+                binding_entry(2, &partials, partial_bytes),
+                binding_entry(3, fine_grid, active_fine_bytes),
+            ],
+        });
+        recorder.dispatch(&self.plan_pipeline, &plan_bind_group, (1, 1, 1));
         let part_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.nd_spread.heavy_part.bind_group"),
             layout: &self.part_layout,
@@ -660,6 +718,7 @@ impl NdBlockSpread {
                 binding_entry(4, fine_grid, active_fine_bytes),
                 binding_entry(5, &heavy_list, heavy_bytes),
                 binding_entry(6, &partials, partial_bytes),
+                binding_entry(7, &part_offsets, offset_bytes),
             ],
         });
         let reduce_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -669,9 +728,10 @@ impl NdBlockSpread {
                 binding_entry(0, fine_grid, active_fine_bytes),
                 binding_entry(1, &heavy_list, heavy_bytes),
                 binding_entry(2, &partials, partial_bytes),
+                binding_entry(3, &part_offsets, offset_bytes),
             ],
         });
-        let part_workgroups = heavy.capacity * heavy.parts * active_batch as u64;
+        let part_workgroups = heavy.max_parts * active_batch as u64;
         let reduce_workgroups = heavy.capacity
             * active_batch as u64
             * block_cells.div_ceil(u64::from(REDUCE_WORKGROUP_SIZE));
@@ -684,8 +744,7 @@ impl NdBlockSpread {
             &self.part_pipeline,
             &part_bind_group,
             u64::from(workgroup_count(part_workgroups)?),
-            self.layout
-                .part_workgroups_per_dispatch(point_count, heavy.parts),
+            self.layout.part_workgroups_per_dispatch(heavy.part_records),
         )?;
         encode_pass(
             recorder,
@@ -1078,18 +1137,31 @@ const FULL_{axis}: bool = {full};
                     format!(
                         "@group(0) @binding(5) var<storage, read> heavy_list: array<u32>;
 @group(0) @binding(6) var<storage, read_write> partials: array<{complex}>;
+@group(0) @binding(7) var<storage, read> part_offsets: array<u32>;
 "
                     ),
-                    "    // Workgroups enumerate (listed block, vector, part); the bindings fix the
-    // capacity of the list and, with the batch, the part count.
+                    "    // Workgroups enumerate (vector, part slot); slots past the planned parts
+    // return. The partials binding fixes the slots per vector.
     let capacity = (arrayLength(&heavy_list) - 1u) / 2u;
-    let parts = arrayLength(&partials) / (capacity * total_vectors * BLOCK_CELLS);
-    let entry = wg_flat / (parts * total_vectors);
-    if (entry >= min(heavy_list[0], capacity)) { return; }
+    let count = min(heavy_list[0], capacity);
+    let max_parts = arrayLength(&partials) / (total_vectors * BLOCK_CELLS);
+    let vector_index = wg_flat / max_parts;
+    let slot = wg_flat - vector_index * max_parts;
+    if (vector_index >= total_vectors || slot >= part_offsets[count]) { return; }
+    // The listed block of this slot: the last one whose parts start at or
+    // before it.
+    var low = 0u;
+    var high = count - 1u;
+    loop {
+        if (low >= high) { break; }
+        let middle = (low + high + 1u) / 2u;
+        if (part_offsets[middle] <= slot) { low = middle; } else { high = middle - 1u; }
+    }
+    let entry = low;
     let block = heavy_list[1u + 2u * entry];
     let block_records = heavy_list[2u + 2u * entry];
-    let vector_index = (wg_flat / parts) % total_vectors;
-    let part = wg_flat % parts;
+    let parts = part_offsets[entry + 1u] - part_offsets[entry];
+    let part = slot - part_offsets[entry];
     // Part `part` of `parts` equal runs of the reach, in reach order.
     let records_start = part * (block_records / parts) + min(part, block_records % parts);
     let records_end = (part + 1u) * (block_records / parts) + min(part + 1u, block_records % parts);
@@ -1097,8 +1169,7 @@ const FULL_{axis}: bool = {full};
                     .to_owned(),
                     format!(
                         "    // Partial sums of this part, RUN cells per invocation.
-    let partial_base = ((entry * total_vectors + vector_index) * parts + part) * BLOCK_CELLS
-        + invocation * u32(RUN);
+    let partial_base = (vector_index * max_parts + slot) * BLOCK_CELLS + invocation * u32(RUN);
 {writes}"
                     ),
                 )
@@ -1339,6 +1410,140 @@ fn main(
         self.types.with_library(&format!("{position}\n{entry}"))
     }
 
+    /// Plans the heavy parts in one workgroup. The part size comes from the
+    /// listed records, an exact 64-bit sum that does not depend on the list
+    /// order: it starts at the size that fills every part slot and grows in
+    /// small steps while the parts, `ceil(records / part size)` per block,
+    /// outgrow the slots, up to the size that leaves one slot per block for
+    /// rounding up, which always fits; doubling covers `f32` rounding. An
+    /// exclusive scan of the part counts then gives every block its first
+    /// part slot, then the total.
+    fn plan(&self) -> String {
+        let entry = format!(
+            r#"const WORKGROUP_SIZE: u32 = {PLAN_WORKGROUP_SIZE}u;
+const MIN_PART_RECORDS: u32 = {MIN_PART_RECORDS}u;
+const BLOCK_CELLS: u32 = {block_cells}u;
+const FINE_COUNT: u32 = {fine_count}u;
+
+@group(0) @binding(0) var<storage, read> heavy_list: array<u32>;
+@group(0) @binding(1) var<storage, read_write> part_offsets: array<u32>;
+@group(0) @binding(2) var<storage, read> partials: array<{complex}>;
+@group(0) @binding(3) var<storage, read> fine_grid: array<{complex}>;
+
+var<workgroup> scan: array<u32, {PLAN_WORKGROUP_SIZE}>;
+var<workgroup> scan_high: array<u32, {PLAN_WORKGROUP_SIZE}>;
+var<workgroup> shared_count: u32;
+var<workgroup> shared_records: u32;
+var<workgroup> shared_safe: u32;
+var<workgroup> running: u32;
+
+fn saturating_add(a: u32, b: u32) -> u32 {{
+    return select(a + b, 0xffffffffu, a > 0xffffffffu - b);
+}}
+
+fn parts_of(total: u32, records: u32) -> u32 {{
+    return max(1u, total / records + select(0u, 1u, total % records != 0u));
+}}
+
+@compute @workgroup_size({PLAN_WORKGROUP_SIZE})
+fn main(@builtin(local_invocation_index) lid: u32) {{
+    let capacity = (arrayLength(&heavy_list) - 1u) / 2u;
+    let vectors = arrayLength(&fine_grid) / FINE_COUNT;
+    let max_parts = arrayLength(&partials) / (vectors * BLOCK_CELLS);
+    if (lid == 0u) {{
+        shared_count = min(heavy_list[0], capacity);
+        running = 0u;
+    }}
+    let count = workgroupUniformLoad(&shared_count);
+
+    // Exact 64-bit sum of the listed records.
+    var low = 0u;
+    var high = 0u;
+    for (var entry = lid; entry < count; entry = entry + WORKGROUP_SIZE) {{
+        let sum = low + heavy_list[2u + 2u * entry];
+        high = high + select(0u, 1u, sum < low);
+        low = sum;
+    }}
+    scan[lid] = low;
+    scan_high[lid] = high;
+    workgroupBarrier();
+    for (var half = WORKGROUP_SIZE / 2u; half > 0u; half = half / 2u) {{
+        if (lid < half) {{
+            let sum = scan[lid] + scan[lid + half];
+            scan_high[lid] = scan_high[lid] + scan_high[lid + half] + select(0u, 1u, sum < scan[lid]);
+            scan[lid] = sum;
+        }}
+        workgroupBarrier();
+    }}
+    if (lid == 0u) {{
+        // First the part size that fills every slot, which fits when the
+        // blocks divide evenly; then the one that leaves a slot per block for
+        // rounding up, which always fits. `count` never exceeds `capacity`,
+        // nor `capacity` the slots.
+        let listed = f32(scan_high[0]) * 4294967296.0 + f32(scan[0]);
+        let spare = max_parts - count;
+        var safe = 0xffffffffu;
+        if (spare > 0u) {{
+            safe = u32(clamp(ceil(listed / f32(spare)), f32(MIN_PART_RECORDS), 4294967040.0));
+        }}
+        shared_records = u32(clamp(ceil(listed / f32(max_parts)), f32(MIN_PART_RECORDS), 4294967040.0));
+        shared_safe = safe;
+    }}
+    var records = workgroupUniformLoad(&shared_records);
+    let safe = workgroupUniformLoad(&shared_safe);
+    for (var attempt = 0u; attempt < 64u; attempt = attempt + 1u) {{
+        var parts = 0u;
+        for (var entry = lid; entry < count; entry = entry + WORKGROUP_SIZE) {{
+            parts = saturating_add(parts, parts_of(heavy_list[2u + 2u * entry], records));
+        }}
+        workgroupBarrier();
+        scan[lid] = parts;
+        workgroupBarrier();
+        for (var half = WORKGROUP_SIZE / 2u; half > 0u; half = half / 2u) {{
+            if (lid < half) {{ scan[lid] = saturating_add(scan[lid], scan[lid + half]); }}
+            workgroupBarrier();
+        }}
+        let needed = workgroupUniformLoad(&scan[0]);
+        if (needed <= max_parts) {{ break; }}
+        if (records < safe) {{
+            // Grow by about 3%: the smallest fitting part size keeps the most
+            // parts, and every wave of workgroups short.
+            records = min(safe, max(records + 1u, records + records / 32u));
+        }} else {{
+            records = select(records * 2u, 0xffffffffu, records >= 0x80000000u);
+        }}
+    }}
+
+    for (var first = 0u; first < count; first = first + WORKGROUP_SIZE) {{
+        let entry = first + lid;
+        var parts = 0u;
+        if (entry < count) {{ parts = parts_of(heavy_list[2u + 2u * entry], records); }}
+        workgroupBarrier();
+        scan[lid] = parts;
+        workgroupBarrier();
+        for (var offset = 1u; offset < WORKGROUP_SIZE; offset = offset * 2u) {{
+            var addend = 0u;
+            if (lid >= offset) {{ addend = scan[lid - offset]; }}
+            workgroupBarrier();
+            scan[lid] = scan[lid] + addend;
+            workgroupBarrier();
+        }}
+        let before = workgroupUniformLoad(&running);
+        if (entry < count) {{ part_offsets[entry] = before + scan[lid] - parts; }}
+        workgroupBarrier();
+        if (lid == WORKGROUP_SIZE - 1u) {{ running = before + scan[lid]; }}
+    }}
+    let total = workgroupUniformLoad(&running);
+    if (lid == 0u) {{ part_offsets[count] = total; }}
+}}
+"#,
+            block_cells = self.layout.block_cells(),
+            fine_count = self.fine_shape.iter().product::<usize>(),
+            complex = self.types.complex_type(),
+        );
+        self.types.with_library(&entry)
+    }
+
     /// Adds the parts of every cell of every listed block in part order and
     /// writes the cell, one invocation per (listed block, vector, cell).
     fn reduce(&self) -> String {
@@ -1355,13 +1560,14 @@ fn main(
             .chain((1..dimensions).map(|axis| format!("u32(cell_{axis}) * FINE_STRIDE_{axis}")))
             .collect::<Vec<_>>()
             .join(" + ");
-        let sum = types.complex_add("sum", "partials[base + part * BLOCK_CELLS]");
+        let sum = types.complex_add("sum", "partials[base + slot * BLOCK_CELLS]");
         let entry = format!(
             r#"const WORKGROUP_SIZE: u32 = {REDUCE_WORKGROUP_SIZE}u;
 {geometry}
 @group(0) @binding(0) var<storage, read_write> fine_grid: array<{complex}>;
 @group(0) @binding(1) var<storage, read> heavy_list: array<u32>;
 @group(0) @binding(2) var<storage, read> partials: array<{complex}>;
+@group(0) @binding(3) var<storage, read> part_offsets: array<u32>;
 
 @compute @workgroup_size({REDUCE_WORKGROUP_SIZE})
 fn main(
@@ -1372,16 +1578,16 @@ fn main(
     let wg_flat = (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
     let total_vectors = arrayLength(&fine_grid) / FINE_COUNT;
     let capacity = (arrayLength(&heavy_list) - 1u) / 2u;
-    let parts = arrayLength(&partials) / (capacity * total_vectors * BLOCK_CELLS);
+    let max_parts = arrayLength(&partials) / (total_vectors * BLOCK_CELLS);
     let groups = (BLOCK_CELLS + WORKGROUP_SIZE - 1u) / WORKGROUP_SIZE;
     let entry = wg_flat / (total_vectors * groups);
     if (entry >= min(heavy_list[0], capacity)) {{ return; }}
     let vector_index = (wg_flat / groups) % total_vectors;
     let cell = (wg_flat % groups) * WORKGROUP_SIZE + lid;
     if (cell >= BLOCK_CELLS) {{ return; }}
-    let base = (entry * total_vectors + vector_index) * parts * BLOCK_CELLS + cell;
+    let base = vector_index * max_parts * BLOCK_CELLS + cell;
     var sum = {zero};
-    for (var part = 0u; part < parts; part = part + 1u) {{
+    for (var slot = part_offsets[entry]; slot < part_offsets[entry + 1u]; slot = slot + 1u) {{
         sum = {sum};
     }}
     // Cells follow the spreading invocations: RUN cells per invocation.
@@ -1425,6 +1631,7 @@ mod tests {
             source.spread(SpreadMode::HeavyPart),
             source.classify(),
             source.reduce(),
+            source.plan(),
         ]
     }
 

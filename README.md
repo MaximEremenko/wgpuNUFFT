@@ -323,24 +323,22 @@ restores input order inside every bin. Each fine-grid cell is then written by
 exactly one invocation, which adds its points in that fixed order, so no
 floating-point atomics are needed.
 
-- **Binned spreaders.** `F32` plans whose fine grid is large enough (at
-  `eps = 1e-6`, at least 18 cells per axis in 1D and 2D and 32 x 32 x 22 in
-  3D) group the points into coarse bins and prepare every point's support
-  once. In 1D each invocation owns four consecutive cells and in 2D a 4 x 4
-  tile, and walks only the bins that reach them. In 3D each workgroup owns a
+- **3D block spreader.** `F32` 3D plans whose fine grid is large enough
+  (at least 32 x 32 x 22 cells at `eps = 1e-6`) group the points into coarse
+  bins and prepare every point's support once. Each workgroup owns a
   16 x 16 x 8 block whose rows stay in registers while nearby points stream
   through workgroup memory. Type 2 interpolates the points in bin order for
-  cache locality.
-- **Everything else.** `F64` and `Df64` plans in 1D to 3D, smaller grids,
-  and devices without the 2D and 3D block spreaders' workgroup limits spread
-  through the rank-generic block spreader of the higher dimensions, below.
+  cache locality in 1D to 3D.
+- **Everything else.** Every 1D and 2D type-1 plan, `F64` and `Df64` 3D
+  plans, smaller 3D grids, and devices without the 3D block spreader's
+  workgroup limits spread through the rank-generic block spreader of the
+  higher dimensions, below.
 - **Clustered points.** Bins of more than 64 points are sorted by a parallel
-  merge sort. A tile or block that reaches too many points goes to a heavy
-  pass, in which a whole workgroup shares a 1D or 2D tile and a 3D block's
-  points are split across workgroups; partial sums are added in a fixed order.
-  4,194,304 points in a single bin take about 44 ms in 1D, 69 ms in 2D, and
-  93 ms in 3D per execution, while evenly spread points pay a few
-  microseconds for the checks.
+  merge sort. A block that reaches too many points goes to heavy passes that
+  split its points across workgroups; partial sums are added in a fixed
+  order. The rank-generic spreader sizes each crowded block's parts from the
+  points actually in its reach, so a single dense cluster still spreads over
+  thousands of workgroups.
 
 **Four to eight dimensions** use one rank-generic implementation, whose
 shaders are generated per rank and precision; its type-1 spreader also
@@ -351,7 +349,10 @@ every invocation keeps a run of cells along axis zero in registers, while
 the workgroup streams the points whose support reaches the block through
 workgroup memory and evaluates their kernel weights once for all
 invocations. Blocks with too many points in reach are split into parts
-added in a fixed order, as in 3D. Type 2 scatters the deconvolved modes
+added in a fixed order: a plan pass sizes the parts from the points listed
+in every crowded block's reach, with an exact sum that does not depend on
+the order in which the blocks were listed. Workgroup sizes and run lengths
+are chosen per rank and precision. Type 2 scatters the deconvolved modes
 onto the fine grid and interpolates the binned points with one lane per
 axis-zero support offset, adding the lanes in lane order. Executions whose
 work would be large are recorded as several dispatches of bounded work,

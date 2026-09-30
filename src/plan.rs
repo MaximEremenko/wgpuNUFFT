@@ -1478,9 +1478,9 @@ impl NufftPlan {
 }
 
 /// Whether a type-1 spread of this grid runs through the tuned per-rank
-/// plan: the `F32` segment gather in 1D or block spreader in 2D and 3D,
-/// where it serves the grid and device. Every other spread, and every rank
-/// above three, uses the rank-generic plan.
+/// plan: the `F32` block spreader in 3D, where it serves the grid and
+/// device. Every other spread, in every rank and precision, uses the
+/// rank-generic plan, which is faster in one and two dimensions.
 pub(crate) fn tuned_type1_spread(
     precision: wgpu_fft::FftPrecision,
     kernel: EsKernel,
@@ -1488,8 +1488,6 @@ pub(crate) fn tuned_type1_spread(
     limits: &wgpu::Limits,
 ) -> bool {
     match *fine_shape {
-        [x] => Type1GpuPlan::segment_gather_available(precision, kernel, x),
-        [x, y] => Type1GpuPlan2d::block_spread_available(precision, kernel, [x, y], limits),
         [x, y, z] => Type1GpuPlan3d::block_spread_available(precision, kernel, [x, y, z], limits),
         _ => false,
     }
