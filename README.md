@@ -496,8 +496,7 @@ wgpuNUFFT/
 |-- wgpuFFT/                pinned wgpu-fft submodule
 |-- wgpu-web/               browser package (wasm-bindgen)
 |-- python/                 Python binding (PyO3 + NumPy)
-|-- web/                    browser test harness
-`-- nd_prototype/           research prototype of the rank-generic design
+`-- web/                    browser test harness
 ```
 
 The Cargo packages are not published to crates.io (`publish = false`). See

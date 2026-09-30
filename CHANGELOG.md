@@ -16,7 +16,6 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   CPU, reject tolerances their rounding would miss by far after the
   deconvolution, which happens with an upsampling factor below 2 in two or
   more dimensions.
-
 - `wgpu-web/build_standalone.py` builds `wgpu-web/dist/wgpu_web.js`, a
   standalone browser build: one classic script with the WebAssembly module
   embedded, loaded with `wgpuWeb.load()`. It works in pages opened from
@@ -46,6 +45,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so later executions skip the binning, as they do in 1D to 3D.
 - Large executions of the rank-generic paths are recorded as several
   dispatches of bounded work.
+
+### Removed
+
+- The `nd_prototype/` research prototype, whose design now ships as the
+  rank-generic GPU paths.
 
 ## [0.2.0] - 2026-09-28
 
