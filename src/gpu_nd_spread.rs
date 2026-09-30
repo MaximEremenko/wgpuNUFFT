@@ -39,18 +39,8 @@ use crate::gpu_recorder::GpuRecorder;
 use crate::gpu_type1_3d::{binding_entry, create_compute_pipeline, encode_pass};
 use crate::kernel::EsKernel;
 
-/// Invocations of a spreading workgroup when the device allows them.
-const TARGET_WORKGROUP_SIZE: usize = 256;
-const TARGET_WORKGROUP_SIZE_1D: usize = 64;
 /// Largest block edge along an axis other than zero.
 const MAX_BLOCK_EDGE: usize = 16;
-/// Cells per invocation along axis zero. From three dimensions on, long runs
-/// reuse every staged record over more cells, and `F32` sums fit more
-/// registers. One and two dimensions reach few cells of a long run, so short
-/// runs, and more blocks, keep more invocations busy.
-const MAX_RUN_F32: usize = 16;
-const MAX_RUN_WIDE: usize = 8;
-const MAX_RUN_LOW_RANK: usize = 2;
 /// Bin rows gathered and scanned at a time.
 const MAX_ROW_BATCH: usize = 128;
 /// Records staged in workgroup memory at a time.
@@ -135,24 +125,13 @@ impl NdSpreadLayout {
         let max_invocations = limits
             .max_compute_invocations_per_workgroup
             .min(limits.max_compute_workgroup_size_x) as usize;
-        // One dimension spreads its invocations along the only axis, where a
-        // record reaches few of them: smaller blocks waste less.
-        let target = if dimensions == 1 {
-            TARGET_WORKGROUP_SIZE_1D
-        } else {
-            TARGET_WORKGROUP_SIZE
-        }
-        .min(max_invocations)
-        .max(1);
+        let target = target_workgroup_size(dimensions, precision)
+            .min(max_invocations)
+            .max(1);
         // Support starts relative to a block stay unique while the block edge
         // plus the kernel width fits the axis.
         let edge_limit = |axis: usize| (fine_shape[axis] + 1).saturating_sub(width).max(1);
-        let max_run = match (dimensions, precision) {
-            (1 | 2, _) => MAX_RUN_LOW_RANK,
-            (_, FftPrecision::F32) => MAX_RUN_F32,
-            (_, FftPrecision::F64 | FftPrecision::Df64) => MAX_RUN_WIDE,
-        };
-        let run = largest_power_of_two_at_most(max_run.min(edge_limit(0)));
+        let run = largest_power_of_two_at_most(max_run(dimensions, precision).min(edge_limit(0)));
         let mut block = vec![1usize; dimensions];
         // Double the thinnest axis first: a point reaches about
         // `(edge + width) / edge` blocks along each axis.
@@ -363,6 +342,33 @@ impl NdSpreadLayout {
                 }
             })
             .product()
+    }
+}
+
+/// Invocations of a spreading workgroup, when the device allows them. Every
+/// invocation checks every staged record, so workgroups that are small
+/// relative to a record's reach waste fewer checks; `Df64` plans instead
+/// share their costly kernel weights across a large workgroup, as do native
+/// `F64` plans from four dimensions on. Chosen by measurement.
+fn target_workgroup_size(dimensions: usize, precision: FftPrecision) -> usize {
+    match (dimensions, precision) {
+        (1, _) => 64,
+        (2, FftPrecision::F32) => 32,
+        (2 | 3, FftPrecision::F64) | (_, FftPrecision::F32) => 64,
+        _ => 256,
+    }
+}
+
+/// Cells per invocation along axis zero. Long runs reuse every staged record
+/// over more cells, which pays from three dimensions on, and `F32` sums fit
+/// more registers; in one and two dimensions a record reaches few cells of a
+/// long run, so short runs keep more invocations busy.
+fn max_run(dimensions: usize, precision: FftPrecision) -> usize {
+    match (dimensions, precision) {
+        (1, _) | (2, FftPrecision::Df64) => 2,
+        (2, _) => 4,
+        (3, _) | (_, FftPrecision::F64 | FftPrecision::Df64) => 8,
+        _ => 16,
     }
 }
 
@@ -1491,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn four_dimensional_layout_uses_full_workgroups() {
+    fn four_dimensional_f32_layout_uses_long_runs() {
         let kernel = EsKernel::for_tolerance(1.0e-6, 2.0).unwrap();
         let layout = NdSpreadLayout::for_grid(
             kernel,
@@ -1501,9 +1507,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(layout.run, 16);
-        assert_eq!(layout.workgroup_size, 256);
-        assert_eq!(layout.block, vec![16, 8, 8, 4]);
-        assert_eq!(layout.block_cells(), 4096);
+        assert_eq!(layout.workgroup_size, 64);
+        assert_eq!(layout.block, vec![16, 4, 4, 4]);
+        assert_eq!(layout.block_cells(), 1024);
     }
 
     #[test]
@@ -1515,7 +1521,7 @@ mod tests {
         assert_eq!(one.block, vec![128]);
         let two =
             NdSpreadLayout::for_grid(kernel, &[512, 512], FftPrecision::F32, &limits).unwrap();
-        assert_eq!((two.run, two.workgroup_size), (2, 256));
-        assert_eq!(two.block, vec![32, 16]);
+        assert_eq!((two.run, two.workgroup_size), (4, 32));
+        assert_eq!(two.block, vec![8, 16]);
     }
 }
