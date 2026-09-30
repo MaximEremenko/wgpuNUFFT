@@ -52,6 +52,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bins as fine as single cells where a block's reach spans few bin rows.
   Type-1 plans spread faster in every rank, most in three to six
   dimensions.
+- Crowded blocks of the rank-generic spreader add the partial sums of
+  their parts in two parallel passes, over fixed segments of parts and then
+  over the segments in order, instead of one pass that walks every part of
+  a cell; dense clusters no longer leave most of the GPU idle while their
+  few blocks add up.
 - `NufftPlan::set_points_gpu` now prepares 4D and higher point sets once,
   so later executions skip the binning, as they do in 1D to 3D.
 - Large executions of the rank-generic paths are recorded as several

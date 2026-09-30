@@ -18,11 +18,12 @@
 //! blocks write zeros at once. Blocks above a per-plan record limit, which
 //! keeps every light workgroup short, are listed instead. A plan pass gives
 //! every listed block as many parts as its records need, at a record count
-//! per part that depends only on the plan, the point count and the batch;
-//! the heavy part pass then spreads each part, in reach order, in its own
-//! workgroup, and the heavy reduce pass adds the parts of every cell in part
-//! order. A dense cluster is therefore split across many workgroups, and its
-//! cells stay deterministic too.
+//! per part derived from the listed records alone; the heavy part pass then
+//! spreads each part, in reach order, in its own workgroup. A segment pass
+//! adds the partial sums of every run of consecutive parts, and the reduce
+//! pass adds the runs of every cell, both in part order. A dense cluster is
+//! therefore split across many workgroups, and its cells stay deterministic
+//! too.
 
 use std::fmt::Write as _;
 use std::sync::Mutex;
@@ -78,8 +79,16 @@ const DISPATCH_WORK_BUDGET: u64 = 1 << 36;
 const MIN_WORKGROUPS_PER_DISPATCH: u64 = 4096;
 /// Invocations of the classify pass, one block each.
 const CLASSIFY_WORKGROUP_SIZE: u32 = 64;
-/// Invocations of the heavy reduce pass, one cell each.
+/// Invocations of the heavy segment and reduce passes, one cell each.
 const REDUCE_WORKGROUP_SIZE: u32 = 256;
+/// Part slots per segment of the heavy reduction, about the square root of
+/// the slots: the segment pass and the reduce pass then add few partial sums
+/// per cell each, where one pass over every part of a dense cluster's few
+/// blocks would leave most of the GPU idle.
+const SEGMENT_LENGTH_WGSL: &str = "fn segment_length(max_parts: u32) -> u32 {
+    return 1u << ((firstLeadingBit(max(max_parts, 1u)) + 1u) / 2u);
+}
+";
 /// Block state of a block left to the heavy passes.
 const HEAVY_STATE: u32 = u32::MAX;
 
@@ -422,6 +431,12 @@ fn max_chunk(dimensions: usize, precision: FftPrecision) -> usize {
     }
 }
 
+/// Part slots per segment, as [`SEGMENT_LENGTH_WGSL`] derives them.
+fn segment_length(max_parts: u64) -> u64 {
+    let bit = 63 - max_parts.max(1).leading_zeros();
+    1 << bit.div_ceil(2)
+}
+
 fn largest_power_of_two_at_most(value: usize) -> usize {
     if value == 0 {
         1
@@ -509,6 +524,8 @@ pub(crate) struct NdBlockSpread {
     part_layout: wgpu::BindGroupLayout,
     classify_pipeline: wgpu::ComputePipeline,
     classify_layout: wgpu::BindGroupLayout,
+    segment_pipeline: wgpu::ComputePipeline,
+    segment_layout: wgpu::BindGroupLayout,
     reduce_pipeline: wgpu::ComputePipeline,
     reduce_layout: wgpu::BindGroupLayout,
     plan_pipeline: wgpu::ComputePipeline,
@@ -556,6 +573,11 @@ impl NdBlockSpread {
         );
         let classify_pipeline =
             create_compute_pipeline(device, "wgpu_nufft.nd_spread.classify", &shaders.classify());
+        let segment_pipeline = create_compute_pipeline(
+            device,
+            "wgpu_nufft.nd_spread.heavy_segment",
+            &shaders.segment(),
+        );
         let reduce_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.nd_spread.heavy_reduce",
@@ -579,6 +601,8 @@ impl NdBlockSpread {
             part_pipeline,
             classify_layout: classify_pipeline.get_bind_group_layout(0),
             classify_pipeline,
+            segment_layout: segment_pipeline.get_bind_group_layout(0),
+            segment_pipeline,
             reduce_layout: reduce_pipeline.get_bind_group_layout(0),
             reduce_pipeline,
             plan_layout: plan_pipeline.get_bind_group_layout(0),
@@ -770,6 +794,16 @@ impl NdBlockSpread {
                 binding_entry(7, &part_offsets, offset_bytes),
             ],
         });
+        let segment_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("wgpu_nufft.nd_spread.heavy_segment.bind_group"),
+            layout: &self.segment_layout,
+            entries: &[
+                binding_entry(0, fine_grid, active_fine_bytes),
+                binding_entry(1, &heavy_list, heavy_bytes),
+                binding_entry(2, &partials, partial_bytes),
+                binding_entry(3, &part_offsets, offset_bytes),
+            ],
+        });
         let reduce_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.nd_spread.heavy_reduce.bind_group"),
             layout: &self.reduce_layout,
@@ -781,6 +815,10 @@ impl NdBlockSpread {
             ],
         });
         let part_workgroups = heavy.max_parts * active_batch as u64;
+        let segment_workgroups = (heavy.max_parts.div_ceil(segment_length(heavy.max_parts))
+            * active_batch as u64
+            * block_cells)
+            .div_ceil(u64::from(REDUCE_WORKGROUP_SIZE));
         let reduce_workgroups = heavy.capacity
             * active_batch as u64
             * block_cells.div_ceil(u64::from(REDUCE_WORKGROUP_SIZE));
@@ -795,6 +833,18 @@ impl NdBlockSpread {
             u64::from(workgroup_count(part_workgroups)?),
             self.layout.part_workgroups_per_dispatch(heavy.part_records),
         )?;
+        encode_pass(
+            recorder,
+            "wgpu_nufft.nd_spread.heavy_segment.pass",
+            &self.segment_pipeline,
+            &segment_bind_group,
+            split_workgroups(
+                workgroup_count(segment_workgroups)?,
+                self.max_workgroups_per_dimension,
+            )?,
+            #[cfg(feature = "gpu-profiling")]
+            None,
+        );
         encode_pass(
             recorder,
             "wgpu_nufft.nd_spread.heavy_reduce.pass",
@@ -1595,6 +1645,83 @@ fn main(@builtin(local_invocation_index) lid: u32) {{
 
     /// Adds the parts of every cell of every listed block in part order and
     /// writes the cell, one invocation per (listed block, vector, cell).
+    /// Adds the partial sums of every segment of a listed block's parts in
+    /// place: segments hold `segment_length` consecutive parts counted from
+    /// the block's first slot, and each sum, added in slot order, goes to the
+    /// segment's first slot. Each invocation takes one cell of the segments
+    /// that start in one window of slots.
+    fn segment(&self) -> String {
+        let types = self.types;
+        let add = types.complex_add("sum", "partials[base + slot * BLOCK_CELLS]");
+        let entry = format!(
+            r#"const WORKGROUP_SIZE: u32 = {REDUCE_WORKGROUP_SIZE}u;
+{geometry}
+@group(0) @binding(0) var<storage, read> fine_grid: array<{complex}>;
+@group(0) @binding(1) var<storage, read> heavy_list: array<u32>;
+@group(0) @binding(2) var<storage, read_write> partials: array<{complex}>;
+@group(0) @binding(3) var<storage, read> part_offsets: array<u32>;
+
+{SEGMENT_LENGTH_WGSL}
+@compute @workgroup_size({REDUCE_WORKGROUP_SIZE})
+fn main(
+    @builtin(local_invocation_index) lid: u32,
+    @builtin(workgroup_id) wid: vec3<u32>,
+    @builtin(num_workgroups) nwg: vec3<u32>,
+) {{
+    let flat = ((wid.z * nwg.y + wid.y) * nwg.x + wid.x) * WORKGROUP_SIZE + lid;
+    let total_vectors = arrayLength(&fine_grid) / FINE_COUNT;
+    let capacity = (arrayLength(&heavy_list) - 1u) / 2u;
+    let count = min(heavy_list[0], capacity);
+    let max_parts = arrayLength(&partials) / (total_vectors * BLOCK_CELLS);
+    let segment_parts = segment_length(max_parts);
+    let segments = (max_parts + segment_parts - 1u) / segment_parts;
+    let cell = flat % BLOCK_CELLS;
+    let segment = (flat / BLOCK_CELLS) % segments;
+    let vector_index = flat / (BLOCK_CELLS * segments);
+    if (vector_index >= total_vectors || count == 0u) {{ return; }}
+    // This invocation owns the segments that start in its window of slots.
+    // Segments count from the first slot of their block, whose position
+    // depends on the order the classify pass listed the blocks in; the sums
+    // then depend only on the block's own parts.
+    let window = segment * segment_parts;
+    let window_end = min(window + segment_parts, part_offsets[count]);
+    if (window >= window_end) {{ return; }}
+    // The listed block of the window's first slot.
+    var entry = 0u;
+    var high = count - 1u;
+    loop {{
+        if (entry >= high) {{ break; }}
+        let middle = (entry + high + 1u) / 2u;
+        if (part_offsets[middle] <= window) {{ entry = middle; }} else {{ high = middle - 1u; }}
+    }}
+    let base = vector_index * max_parts * BLOCK_CELLS + cell;
+    // Each block has at most one segment start in a window of one segment.
+    loop {{
+        if (entry >= count) {{ break; }}
+        let block_start = part_offsets[entry];
+        if (block_start >= window_end) {{ break; }}
+        let block_end = part_offsets[entry + 1u];
+        let first = max(window, block_start);
+        let start = block_start + ((first - block_start + segment_parts - 1u) / segment_parts) * segment_parts;
+        if (start < min(window_end, block_end)) {{
+            let end = min(start + segment_parts, block_end);
+            var sum = partials[base + start * BLOCK_CELLS];
+            for (var slot = start + 1u; slot < end; slot = slot + 1u) {{
+                sum = {add};
+            }}
+            partials[base + start * BLOCK_CELLS] = sum;
+        }}
+        entry = entry + 1u;
+    }}
+}}
+"#,
+            geometry = self.geometry_constants(),
+            complex = types.complex_type(),
+        );
+        let position = position_wgsl(self.fine_shape, self.kernel, types.precision());
+        types.with_library(&format!("{position}\n{entry}"))
+    }
+
     fn reduce(&self) -> String {
         let types = self.types;
         let dimensions = self.dimensions();
@@ -1618,6 +1745,7 @@ fn main(@builtin(local_invocation_index) lid: u32) {{
 @group(0) @binding(2) var<storage, read> partials: array<{complex}>;
 @group(0) @binding(3) var<storage, read> part_offsets: array<u32>;
 
+{SEGMENT_LENGTH_WGSL}
 @compute @workgroup_size({REDUCE_WORKGROUP_SIZE})
 fn main(
     @builtin(local_invocation_index) lid: u32,
@@ -1635,9 +1763,17 @@ fn main(
     let cell = (wg_flat % groups) * WORKGROUP_SIZE + lid;
     if (cell >= BLOCK_CELLS) {{ return; }}
     let base = vector_index * max_parts * BLOCK_CELLS + cell;
+    let segment_parts = segment_length(max_parts);
+    let first = part_offsets[entry];
+    let end = part_offsets[entry + 1u];
     var sum = {zero};
-    for (var slot = part_offsets[entry]; slot < part_offsets[entry + 1u]; slot = slot + 1u) {{
-        sum = {sum};
+    if (first < end) {{
+        // The segment sums, one every `segment_parts` slots from the block's
+        // first slot, added in slot order.
+        sum = partials[base + first * BLOCK_CELLS];
+        for (var slot = first + segment_parts; slot < end; slot = slot + segment_parts) {{
+            sum = {sum};
+        }}
     }}
     // Cells follow the spreading invocations: RUN cells per invocation.
     let block = heavy_list[1u + 2u * entry];
@@ -1679,6 +1815,7 @@ mod tests {
             source.spread(SpreadMode::Light),
             source.spread(SpreadMode::HeavyPart),
             source.classify(),
+            source.segment(),
             source.reduce(),
             source.plan(),
         ]
@@ -1779,6 +1916,24 @@ mod tests {
             NdSpreadLayout::for_grid(kernel, &[512, 512], FftPrecision::F32, &limits).unwrap();
         assert_eq!((two.run, two.workgroup_size), (4, 32));
         assert_eq!(two.block, vec![8, 16]);
+    }
+
+    #[test]
+    fn segments_hold_about_the_square_root_of_the_part_slots() {
+        for (max_parts, expected) in [
+            (1, 1),
+            (2, 2),
+            (3, 2),
+            (4, 2),
+            (8, 4),
+            (4096, 64),
+            (16384, 128),
+            (65535, 256),
+            (65536, 256),
+            (131072, 512),
+        ] {
+            assert_eq!(segment_length(max_parts), expected, "{max_parts}");
+        }
     }
 
     #[test]
