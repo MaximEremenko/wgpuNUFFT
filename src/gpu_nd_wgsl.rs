@@ -14,7 +14,7 @@ use wgpu_fft::math::DoubleFloat;
 use wgpu_fft::FftPrecision;
 
 use crate::gpu_nd::{format_wgsl_f32, format_wgsl_f64};
-use crate::kernel::EsKernel;
+use crate::kernel::{EsHornerTable, EsKernel};
 
 /// Precision-dependent WGSL types and expressions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -398,34 +398,41 @@ fn support_weight(offset: vec2<f32>, j: u32) -> f32 {{
         }
         FftPrecision::F64 => {
             let table = kernel.horner_table();
-            let coefficients = table
-                .coefficients()
+            let (head, tail) = split_horner_rows(&table, kernel.eps());
+            let tail_coefficients = tail
                 .iter()
                 .map(|&value| format_wgsl_f64(value))
                 .collect::<Vec<_>>()
                 .join(", ");
             let _ = write!(
                 source,
-                r#"const HORNER_COEFFICIENT_COUNT: u32 = {count}u;
-const HORNER_COEFFICIENTS: array<f64, {total}> = array<f64, {total}>({coefficients});
+                r#"{head_wgsl}const HORNER_COEFFICIENT_COUNT: u32 = {tail_count}u;
+const HORNER_COEFFICIENTS: array<f64, {tail_total}> = array<f64, {tail_total}>({tail_coefficients});
 
-fn es_weight(distance: f64) -> f64 {{
-    if (abs(distance) >= HALF_WIDTH) {{ return 0.0lf; }}
-    let panel = u32(clamp(i32(ceil(distance + HALF_WIDTH)) - 1, 0, WIDTH_I32 - 1));
-    let local = 2.0lf * (distance - f64(panel)) + f64(WIDTH_I32 - 1);
-    var value = 0.0lf;
-    for (var coefficient = 0u; coefficient < HORNER_COEFFICIENT_COUNT; coefficient = coefficient + 1u) {{
-        value = value * local + HORNER_COEFFICIENTS[coefficient * WIDTH + panel];
+// Support cell `start + j` lies in panel `j` of the kernel's Horner table, at
+// the local coordinate `2 * (start - position) + w - 1` in [-1, 1], the same
+// for every j. The leading rows, whose coefficients are tiny, run in f32 and
+// the rest in f64. An offset past the support, which invalid points carry,
+// weighs zero.
+fn support_weight(offset: f64, j: u32) -> f64 {{
+    let local = 2.0lf * offset + f64(WIDTH_I32 - 1);
+    if (!(abs(local) <= 1.0lf)) {{ return 0.0lf; }}
+{head_eval}    var value = {head_value};
+    for (var row = 0u; row < HORNER_COEFFICIENT_COUNT; row = row + 1u) {{
+        value = value * local + HORNER_COEFFICIENTS[row * WIDTH + j];
     }}
     return value;
 }}
-
-fn support_weight(offset: f64, j: u32) -> f64 {{
-    return es_weight(f64(j) + offset);
-}}
 "#,
-                count = table.coefficient_count(),
-                total = table.coefficients().len(),
+                head_wgsl = head_rows_wgsl(&head, kernel.width()),
+                head_eval = head_evaluation_wgsl(&head),
+                head_value = if head.is_empty() {
+                    "0.0lf"
+                } else {
+                    "f64(head)"
+                },
+                tail_count = tail.len() / kernel.width(),
+                tail_total = tail.len(),
             );
         }
         FftPrecision::Df64 => {
@@ -443,49 +450,90 @@ fn support_weight(offset: f64, j: u32) -> f64 {{
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            let half_width = DoubleFloat::from_f64(kernel.half_width());
             let _ = write!(
                 source,
                 r#"const HORNER_COEFFICIENT_COUNT: u32 = {count}u;
 const HORNER_COEFFICIENTS: array<Df64, {total}> = array<Df64, {total}>({coefficients});
-const DF64_HALF_WIDTH: Df64 = Df64({half_width_hi}, {half_width_lo});
 
-fn df64_abs(value: Df64) -> Df64 {{
-    if (value.hi < 0.0 || (value.hi == 0.0 && value.lo < 0.0)) {{ return df64_neg(value); }}
-    return value;
-}}
-
-fn df64_at_least(left: Df64, right: Df64) -> bool {{
-    return left.hi > right.hi || (left.hi == right.hi && left.lo >= right.lo);
-}}
-
-fn es_weight(distance: Df64) -> Df64 {{
-    if (df64_at_least(df64_abs(distance), DF64_HALF_WIDTH)) {{ return Df64(0.0, 0.0); }}
-    let panel_i32 = clamp(ceil_df64_to_i32(df64_add(distance, DF64_HALF_WIDTH)) - 1, 0, WIDTH_I32 - 1);
-    let panel = u32(panel_i32);
-    let local = df64_add(
-        df64_mul(Df64(2.0, 0.0), df64_sub(distance, Df64(f32(panel_i32), 0.0))),
-        Df64(f32(WIDTH_I32 - 1), 0.0),
-    );
+// Support cell `start + j` lies in panel `j` of the kernel's Horner table, at
+// the local coordinate `2 * (start - position) + w - 1` in [-1, 1], the same
+// for every j. Unlike F64, every row runs in df64: its operations need
+// exactly rounded inputs, and a compiler may rewrite a plain f32 value that
+// feeds them. An offset past the support, which invalid points carry, weighs
+// zero.
+fn support_weight(offset: vec2<f32>, j: u32) -> Df64 {{
+    // Doubling a df64 value is exact.
+    let local = df64_add(Df64(2.0 * offset.x, 2.0 * offset.y), Df64(f32(WIDTH_I32 - 1), 0.0));
+    if (!(abs(local.hi) <= 1.0)) {{ return Df64(0.0, 0.0); }}
     var value = Df64(0.0, 0.0);
-    for (var coefficient = 0u; coefficient < HORNER_COEFFICIENT_COUNT; coefficient = coefficient + 1u) {{
-        value = df64_add(df64_mul(value, local), HORNER_COEFFICIENTS[coefficient * WIDTH + panel]);
+    for (var row = 0u; row < HORNER_COEFFICIENT_COUNT; row = row + 1u) {{
+        value = df64_add(df64_mul(value, local), HORNER_COEFFICIENTS[row * WIDTH + j]);
     }}
     return value;
-}}
-
-fn support_weight(offset: vec2<f32>, j: u32) -> Df64 {{
-    return es_weight(df64_add(Df64(f32(j), 0.0), Df64(offset.x, offset.y)));
 }}
 "#,
                 count = table.coefficient_count(),
                 total = table.coefficients().len(),
-                half_width_hi = format_wgsl_f32(half_width.hi),
-                half_width_lo = format_wgsl_f32(half_width.lo),
             );
         }
     }
     source
+}
+
+/// Splits the Horner rows (highest degree first) into a leading part that
+/// f32 evaluates within a hundredth of `tolerance` and the rest. With
+/// `|local| <= 1`, rounding `k` f32 Horner steps, their coefficients and the
+/// local coordinate costs at most `(3k + 1) * 2^-24` times the sum of the
+/// rows' largest coefficients. At least one row stays in full precision.
+fn split_horner_rows(table: &EsHornerTable, tolerance: f64) -> (Vec<f32>, Vec<f64>) {
+    let width = table.width();
+    let rows = table.coefficient_count();
+    let budget = 0.01 * tolerance;
+    let mut sum = 0.0f64;
+    let mut head_rows = 0;
+    while head_rows + 1 < rows {
+        let row = &table.coefficients()[head_rows * width..(head_rows + 1) * width];
+        let largest = row
+            .iter()
+            .fold(0.0f64, |largest, value| largest.max(value.abs()));
+        let steps = (head_rows + 1) as f64;
+        if (3.0 * steps + 1.0) * f64::from(f32::EPSILON) * 0.5 * (sum + largest) > budget {
+            break;
+        }
+        sum += largest;
+        head_rows += 1;
+    }
+    let (head, tail) = table.coefficients().split_at(head_rows * width);
+    (
+        head.iter().map(|&value| value as f32).collect(),
+        tail.to_vec(),
+    )
+}
+
+/// The f32 head rows as WGSL constants; nothing when there are none.
+fn head_rows_wgsl(head: &[f32], width: usize) -> String {
+    if head.is_empty() {
+        return String::new();
+    }
+    let values = head
+        .iter()
+        .map(|&value| format_wgsl_f32(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "const HORNER_HEAD_COUNT: u32 = {rows}u;\nconst HORNER_HEAD: array<f32, {total}> = array<f32, {total}>({values});\n",
+        rows = head.len() / width,
+        total = head.len(),
+    )
+}
+
+/// Statements evaluating the f32 head rows of panel `j` at `local` into
+/// `head`; nothing when there are none.
+fn head_evaluation_wgsl(head: &[f32]) -> String {
+    if head.is_empty() {
+        return String::new();
+    }
+    "    let local_32 = f32(local);\n    var head = 0.0;\n    for (var row = 0u; row < HORNER_HEAD_COUNT; row = row + 1u) {\n        head = head * local_32 + HORNER_HEAD[row * WIDTH + j];\n    }\n".to_owned()
 }
 
 /// `wrap_index(index, length)`: an index within one period of `[0, length)`
@@ -568,5 +616,160 @@ mod tests {
         let lengths = ["L0".to_owned(), "L1".to_owned(), "L2".to_owned()];
         assert_eq!(linear_index(&terms, &lengths), "a + L0 * (b + L1 * (c))");
         assert_eq!(linear_index(&terms[..1], &lengths[..1]), "a");
+    }
+
+    /// Evaluates `support_weight` on the GPU for many offsets and every
+    /// support cell, and compares it with the Horner table in f64.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn gpu_support_weights_match_the_horner_table() {
+        if std::env::var_os("WGPU_FFT_RUN_GPU_TESTS").is_none() {
+            eprintln!("skipping GPU test; set WGPU_FFT_RUN_GPU_TESTS=1 to run it");
+            return;
+        }
+        use wgpu::util::DeviceExt;
+        let context = pollster::block_on(wgpu_fft::device::request_default_device())
+            .expect("WGPU_FFT_RUN_GPU_TESTS was set but no suitable adapter was found");
+        let device = &context.device;
+        for precision in [FftPrecision::F64, FftPrecision::Df64] {
+            if precision == FftPrecision::F64
+                && !device.features().contains(wgpu::Features::SHADER_F64)
+            {
+                continue;
+            }
+            for eps in [1.0e-6, 1.0e-8, 1.0e-10, 1.0e-12] {
+                let kernel = EsKernel::for_tolerance(eps, 2.0).unwrap();
+                let table = kernel.horner_table();
+                let width = kernel.width();
+                let half = kernel.half_width();
+                // Offsets `start - position` across [-w/2, -w/2 + 1).
+                let count = 1000usize;
+                let offsets: Vec<f64> = (0..count)
+                    .map(|index| -half + (index as f64 + 0.37) / count as f64)
+                    .collect();
+                let types = NdWgsl::new(precision);
+                let (offset_type, weight_store) = match precision {
+                    FftPrecision::F64 => ("f64", "weights[index] = vec2<f64>(weight, 0.0lf);"),
+                    _ => (
+                        "vec2<f32>",
+                        "weights[index] = vec2<f64>(f64(weight.hi) + f64(weight.lo), 0.0lf);",
+                    ),
+                };
+                // Df64 results go through f64 only in this test shader, which
+                // needs SHADER_F64; convert on the CPU otherwise.
+                let (weight_type, weight_store) =
+                    if device.features().contains(wgpu::Features::SHADER_F64) {
+                        ("vec2<f64>", weight_store.to_owned())
+                    } else {
+                        (
+                            "vec2<f32>",
+                            match precision {
+                                FftPrecision::F64 => unreachable!(),
+                                _ => "weights[index] = vec2<f32>(weight.hi, weight.lo);".to_owned(),
+                            },
+                        )
+                    };
+                let source = types.with_library(&format!(
+                    "{}\n{}\n@group(0) @binding(0) var<storage, read> offsets: array<{offset_type}>;
+@group(0) @binding(1) var<storage, read_write> weights: array<{weight_type}>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) id: vec3<u32>) {{
+    let index = id.x;
+    if (index >= arrayLength(&offsets) * WIDTH) {{ return; }}
+    let weight = support_weight(offsets[index / WIDTH], index % WIDTH);
+    {weight_store}
+}}
+",
+                    position_wgsl(&[64], kernel, precision),
+                    weight_wgsl(kernel, precision),
+                ));
+                let input: Vec<u8> = match precision {
+                    FftPrecision::F64 => bytemuck::cast_slice(&offsets).to_vec(),
+                    _ => {
+                        let pairs: Vec<f32> = offsets
+                            .iter()
+                            .flat_map(|&value| {
+                                let hi = value as f32;
+                                [hi, (value - f64::from(hi)) as f32]
+                            })
+                            .collect();
+                        bytemuck::cast_slice(&pairs).to_vec()
+                    }
+                };
+                let offsets_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("offsets"),
+                    contents: &input,
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+                let output_bytes = (count * width * 16) as u64;
+                let weights_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("weights"),
+                    size: output_bytes,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("readback"),
+                    size: output_bytes,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                let pipeline = crate::gpu_type1_3d::create_compute_pipeline(
+                    device,
+                    "support_weight_test",
+                    &source,
+                );
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &pipeline.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: offsets_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: weights_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+                let mut encoder = device.create_command_encoder(&Default::default());
+                {
+                    let mut pass = encoder.begin_compute_pass(&Default::default());
+                    pass.set_pipeline(&pipeline);
+                    pass.set_bind_group(0, &bind_group, &[]);
+                    pass.dispatch_workgroups(((count * width) as u32).div_ceil(64), 1, 1);
+                }
+                encoder.copy_buffer_to_buffer(&weights_buffer, 0, &readback, 0, output_bytes);
+                context.queue.submit([encoder.finish()]);
+                let slice = readback.slice(..);
+                slice.map_async(wgpu::MapMode::Read, |result| result.unwrap());
+                device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+                let bytes = slice.get_mapped_range().unwrap().to_vec();
+                readback.unmap();
+                let values: Vec<f64> = if weight_type == "vec2<f64>" {
+                    bytemuck::cast_slice::<u8, f64>(&bytes)
+                        .chunks(2)
+                        .map(|pair| pair[0])
+                        .collect()
+                } else {
+                    bytemuck::cast_slice::<u8, f32>(&bytes)
+                        .chunks(2)
+                        .map(|pair| f64::from(pair[0]) + f64::from(pair[1]))
+                        .collect()
+                };
+                let mut worst = 0.0f64;
+                for (point, &offset) in offsets.iter().enumerate() {
+                    for j in 0..width {
+                        let expected = table.evaluate(j as f64 + offset);
+                        worst = worst.max((values[point * width + j] - expected).abs());
+                    }
+                }
+                eprintln!("SUPPORT_WEIGHT precision={precision:?} eps={eps:e} worst_abs_error={worst:.2e}");
+                assert!(worst <= 0.05 * eps, "{precision:?} eps={eps}: {worst}");
+            }
+        }
+        std::mem::forget(context);
     }
 }

@@ -61,6 +61,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   of 64, finds every slot's bin once instead of in every stage, and skips
   the stages whose runs already hold the largest bin, which the binning
   pass now bounds; clustered points prepare several times faster.
+- The rank-generic `F64` and `Df64` spreaders evaluate each kernel weight
+  at the local coordinate its support cell shares with the others, instead
+  of locating the panel again, and `F64` plans evaluate the tiny leading
+  Horner terms in `f32`, within a hundredth of the tolerance; `F64` type-1
+  plans spread markedly faster.
 - `NufftPlan::set_points_gpu` now prepares 4D and higher point sets once,
   so later executions skip the binning, as they do in 1D to 3D.
 - Large executions of the rank-generic paths are recorded as several
