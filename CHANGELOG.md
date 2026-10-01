@@ -6,6 +6,14 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `WgpuNufft`, a Julia package in `julia/WgpuNufft` over the C interface:
+  one-call transforms `nufft1d1` to `nufft3d3` and a `Plan` with `setpts!`
+  and `execute`, on `Float64` and `Float32` arrays, with the backend,
+  precision, mode-order, thread, and upsampling options as keywords. CI
+  tests it on the CPU backend.
+
 ## [0.3.1] - 2026-10-01
 
 C, Fortran, and MATLAB interfaces, and a first transform of a session as

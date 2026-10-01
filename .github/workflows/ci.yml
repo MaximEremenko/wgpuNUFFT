@@ -58,6 +58,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: python3 fortran/build.py --compiler gfortran --run cpu
 
+  # The Julia package over the C interface, on the CPU backend.
+  julia:
+    name: Julia
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: "1"
+      - run: cargo build --release --locked -p wgpu-nufft-c
+      - run: julia --project=julia/WgpuNufft -e 'using Pkg; Pkg.test()'
+
   msrv:
     name: Minimum Rust version
     runs-on: ubuntu-latest

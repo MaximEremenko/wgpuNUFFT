@@ -10,3 +10,4 @@ __pycache__/
 /fortran/build/
 /matlab/build/
 /matlab/private/*.mex*
+/julia/WgpuNufft/Manifest.toml

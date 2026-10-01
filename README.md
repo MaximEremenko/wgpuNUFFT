@@ -38,9 +38,9 @@ from [wgpu-fft](https://github.com/MaximEremenko/wgpuFFT), pinned here as the
   prepare point sets once for repeated transforms.
 - **Python and JavaScript**: a PyO3 + NumPy binding with the GPU and CPU
   plans, and a `wasm-bindgen` browser package.
-- **C, Fortran, and MATLAB**: a C library with plans and one-call
-  transforms on host arrays, and a Fortran module and MATLAB functions
-  over it.
+- **C, Fortran, MATLAB, and Julia**: a C library with plans and one-call
+  transforms on host arrays, and a Fortran module, MATLAB functions, and a
+  Julia package over it.
 
 ## Installation
 
@@ -242,7 +242,7 @@ converts between C order and the dimension-zero-fast storage of the Rust
 core. See [python/README.md](python/README.md) for building, array shapes, and
 batches.
 
-## C, Fortran, and MATLAB
+## C, Fortran, MATLAB, and Julia
 
 [`capi/`](capi/README.md) builds `wgpu-nufft-c`, a C library (`cdylib` and
 `staticlib`) declared by [`capi/include/wgpu_nufft.h`](capi/include/wgpu_nufft.h).
@@ -267,6 +267,8 @@ if (ier) fprintf(stderr, "%s
   `iso_c_binding`), tested with gfortran and Intel ifx.
 - [`matlab/`](matlab/README.md): `wgpunufft1d1` to `wgpunufft3d3`, the
   `wgpunufft_plan` class, and a MEX gateway for MATLAB R2018a or later.
+- [`julia/WgpuNufft`](julia/WgpuNufft/README.md): `nufft1d1` to `nufft3d3`
+  and a `Plan` with `setpts!` and `execute`, through `ccall`.
 
 ## Browser
 
@@ -540,6 +542,7 @@ wgpuNUFFT/
 |-- capi/                   C library and header
 |-- fortran/                Fortran module over the C library
 |-- matlab/                 MATLAB functions and MEX gateway
+|-- julia/WgpuNufft/        Julia package over the C library
 `-- web/                    browser test harness
 ```
 
