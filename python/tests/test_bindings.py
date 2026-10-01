@@ -16,7 +16,7 @@ def context():
 
 
 def test_package_metadata_and_exception_round_trip():
-    assert wgpu_nufft.__version__ == "0.3.0"
+    assert wgpu_nufft.__version__ == "0.3.1"
     assert wgpu_nufft.WgpuNufftError.__module__ == "wgpu_nufft"
     error = pickle.loads(pickle.dumps(wgpu_nufft.WgpuNufftError("test error")))
     assert isinstance(error, wgpu_nufft.WgpuNufftError)

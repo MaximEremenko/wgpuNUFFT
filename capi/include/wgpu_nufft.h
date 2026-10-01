@@ -82,7 +82,7 @@ void wgpu_nufft_default_opts(wgpu_nufft_opts *opts);
 /* The message of the last error on this thread; valid until the next call. */
 const char *wgpu_nufft_last_error(void);
 
-/* The library version, such as "0.3.0". */
+/* The library version, such as "0.3.1". */
 const char *wgpu_nufft_version(void);
 
 /* The GPU that plans run on, such as "<adapter name> (Vulkan)", or an empty

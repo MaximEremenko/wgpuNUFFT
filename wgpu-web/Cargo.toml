@@ -1,7 +1,7 @@
 [package]
 publish = false
 name = "wgpu-web"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.92"
 license = "Apache-2.0"
@@ -21,7 +21,7 @@ wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4.79"
 wgpu = "30.0.1"
 wgpu-fft = { path = "../wgpuFFT", version = "0.1.0", features = ["serde"] }
-wgpu-nufft = { path = "..", version = "0.3.0" }
+wgpu-nufft = { path = "..", version = "0.3.1" }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "=0.3.79"
