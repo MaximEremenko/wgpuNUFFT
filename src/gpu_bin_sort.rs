@@ -189,9 +189,10 @@ impl LargeBinSort {
 
     /// Records the sort of the first `point_count` entries of
     /// `sorted_indices`. The first `bin_offset_bytes` of `bin_offsets` hold
-    /// every bin's first slot and a terminal total. The last word of
-    /// `large_bin_flag` is zero when no bin exceeds [`SMALL_BIN`] points, and
-    /// otherwise at least half the size of the largest bin.
+    /// every bin's first slot and a terminal total. The last word of the
+    /// first `flag_bytes` of `large_bin_flag` is zero when no bin exceeds
+    /// [`SMALL_BIN`] points, and otherwise at least half the size of the
+    /// largest bin.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode(
         &self,
@@ -200,6 +201,7 @@ impl LargeBinSort {
         bin_offsets: &wgpu::Buffer,
         bin_offset_bytes: u64,
         large_bin_flag: &wgpu::Buffer,
+        flag_bytes: u64,
         sorted_indices: &wgpu::Buffer,
         point_count: usize,
     ) -> Result<()> {
@@ -225,7 +227,7 @@ impl LargeBinSort {
                 layout: &self.layout,
                 entries: &[
                     sized_binding(0, bin_offsets, bin_offset_bytes),
-                    whole_binding(1, large_bin_flag),
+                    sized_binding(1, large_bin_flag, flag_bytes),
                     sized_binding(2, source, index_bytes),
                     sized_binding(3, destination, index_bytes),
                     sized_binding(4, &slot_bins, index_bytes),
@@ -296,13 +298,6 @@ fn merge_stages(point_count: usize) -> u32 {
         sorted_run *= u64::from(FAN_IN);
     }
     stages
-}
-
-fn whole_binding(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
-    wgpu::BindGroupEntry {
-        binding,
-        resource: buffer.as_entire_binding(),
-    }
 }
 
 fn sized_binding(binding: u32, buffer: &wgpu::Buffer, bytes: u64) -> wgpu::BindGroupEntry<'_> {
@@ -651,6 +646,7 @@ mod tests {
                     &bin_offsets,
                     bin_offsets.size(),
                     &large_bin_flag,
+                    large_bin_flag.size(),
                     &sorted,
                     indices.len(),
                 )

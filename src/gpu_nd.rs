@@ -197,12 +197,11 @@ impl Type2GpuPlanNd {
             }
         })?;
 
-        let bin_shape = type2_bin_shape(fine_shape);
         let bins = NdPointBins::new(
             device,
             kernel,
             fine_shape,
-            &bin_shape,
+            &[type2_bin_shape(fine_shape)],
             NdBinOrder::Grouped,
             precision,
         )?;
@@ -319,6 +318,7 @@ impl Type2GpuPlanNd {
             point_count,
             points,
             point_bytes,
+            TYPE2_BIN_GEOMETRY,
             #[cfg(feature = "gpu-profiling")]
             GpuProfileQueryWriter::disabled(),
         )
@@ -479,6 +479,7 @@ impl Type2GpuPlanNd {
                 point_count,
                 points,
                 point_bytes,
+                TYPE2_BIN_GEOMETRY,
                 #[cfg(feature = "gpu-profiling")]
                 profile,
             )?;
@@ -560,6 +561,9 @@ impl Type2GpuPlanNd {
 
 /// Interpolation bins: small enough that consecutive points share cached
 /// grid rows, and few enough that binning stays cheap.
+/// Interpolation bins points in a single geometry.
+const TYPE2_BIN_GEOMETRY: usize = 0;
+
 fn type2_bin_shape(fine_shape: &[usize]) -> Vec<usize> {
     let mut sides = vec![TYPE2_BIN_SIDE; fine_shape.len()];
     let bin_count = |sides: &[usize]| {

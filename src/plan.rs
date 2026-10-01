@@ -875,9 +875,9 @@ impl NufftPlan {
     /// [`Self::execute_type1_gpu`] or [`Self::execute_type2_gpu`].
     ///
     /// Records any point-dependent GPU work into `encoder` (for example, the
-    /// 3D single-precision plans sort the points into coarse bins once here
-    /// instead of on every execution) and remembers `points` and `point_count` for
-    /// later `execute_*` calls. `points` uses the same layout and contract as
+    /// plans sort the points into bins once here instead of on every
+    /// execution) and remembers `points` and `point_count` for later
+    /// `execute_*` calls. `points` uses the same layout and contract as
     /// in [`Self::encode_type1_gpu`] or [`Self::encode_type2_gpu`].
     ///
     /// The contents of `points` must not change while executions use them;

@@ -14,6 +14,15 @@
 //! contributions in a fixed order and is written exactly once: no float
 //! atomics, no read-modify-write, and no clearing pass.
 //!
+//! The plan offers several bin geometries, from single cells above axis zero
+//! to coarser bins, and every execution picks the one a cost model favors
+//! for its point density: fine bins stage no record outside a block's reach,
+//! while coarse bins cost fewer row lookups and fewer bins to count and scan,
+//! which pays for sparse points. The spreading shaders read the geometry from
+//! a uniform, except for a second pair specialized to the finest geometry,
+//! which dense points use: with every bin constant known, the compiler keeps
+//! their spreading loop as lean as a single-geometry spreader's.
+//!
 //! A classify pass first counts the records in every block's reach. Empty
 //! blocks write zeros at once. Blocks above a per-plan record limit, which
 //! keeps every light workgroup short, are listed instead. A plan pass gives
@@ -40,6 +49,7 @@ use crate::gpu_profile::GpuProfileQueryWriter;
 use crate::gpu_recorder::GpuRecorder;
 use crate::gpu_type1_3d::{binding_entry, create_compute_pipeline, encode_pass};
 use crate::kernel::EsKernel;
+use wgpu::util::DeviceExt;
 
 /// Largest block edge along an axis other than zero.
 const MAX_BLOCK_EDGE: usize = 16;
@@ -55,6 +65,37 @@ const TARGET_REACH_ROWS: f64 = 1024.0;
 /// Bins a grid holds before the bins coarsen: every bin costs a count and a
 /// scan entry per point set.
 const MAX_BINS: usize = 1 << 23;
+/// Doublings of the bin sides past the finest geometry that an execution
+/// may choose.
+const MAX_COARSENING: u32 = 3;
+/// Modeled costs of one batch of bin rows, whose lengths a workgroup scans,
+/// of one bin row, and of one bin, relative to one record staged by a
+/// 64-invocation three-dimensional workgroup; the choice of geometry trades
+/// them against the records that coarser bins stage outside a block's
+/// reach. Fitted to timings over one to six dimensions, 10^4 to 10^7 points
+/// and every precision, where the choice stays within a few percent of the
+/// best geometry and never falls far behind the finest one.
+const BATCH_COST: f64 = 100.0;
+const ROW_COST: f64 = 1.0;
+const BIN_COST: f64 = 0.1;
+/// Geometries within this share of the least modeled cost count as equally
+/// fast, and the one among them that stages the fewest records is chosen:
+/// the model assumes evenly spread points, and clustered points, denser
+/// where they lie, favor the finer bins.
+const COST_TOLERANCE: f64 = 0.1;
+/// One `vec4<u32>` per axis and one for the whole geometry in the spreader's
+/// bin uniform.
+const SPREAD_BINS_VEC_BYTES: u64 = 16;
+/// The bin geometry of the classify and spreading shaders.
+const SPREAD_BINS_WGSL: &str = "
+// Per axis: x = cells per bin, y = bins, z = the bin index stride, w = whether
+// a block's reach covers the whole axis. Then x = the blocks whose reach can
+// include one bin.
+struct SpreadBins {
+    axes: array<vec4<u32>, DIMS>,
+    totals: vec4<u32>,
+}
+";
 /// Invocation steps a light workgroup may spend, which bounds its records.
 const LIGHT_WORK_BUDGET: u64 = 1 << 29;
 /// Bounds of the per-plan record limit of a light block.
@@ -104,14 +145,8 @@ pub(crate) struct NdSpreadLayout {
     block: Vec<usize>,
     /// Blocks per axis.
     blocks: Vec<usize>,
-    /// Cells per bin along each axis.
-    bin_side: Vec<usize>,
-    /// Bins per axis.
-    bins: Vec<usize>,
-    /// Whether a block's reach covers the whole axis.
-    full: Vec<bool>,
-    /// Most bins a block's reach spans along each axis.
-    reach_bins: Vec<usize>,
+    /// The bin geometries an execution chooses from, finest first.
+    geometries: Vec<BinGeometry>,
     workgroup_size: usize,
     row_batch: usize,
     chunk: usize,
@@ -125,6 +160,32 @@ pub(crate) struct NdSpreadLayout {
     fine_shape: Vec<usize>,
     /// Invocation steps a workgroup spends on one staged record.
     record_steps: u64,
+}
+
+/// One way to bin the points for the spreader.
+#[derive(Debug, Clone, PartialEq)]
+struct BinGeometry {
+    /// Cells per bin along each axis, powers of two.
+    side: Vec<usize>,
+    /// Bins per axis.
+    bins: Vec<usize>,
+    /// Whether a block's reach covers the whole axis.
+    full: Vec<bool>,
+    /// Most bins a block's reach spans along each axis.
+    reach_bins: Vec<usize>,
+    /// Bins a block's reach spans on average along each axis.
+    mean_reach_bins: Vec<f64>,
+}
+
+impl BinGeometry {
+    fn bin_count(&self) -> usize {
+        self.bins.iter().product()
+    }
+
+    /// Most bin rows, runs of bins along axis zero, a reach spans.
+    fn rows(&self) -> usize {
+        self.reach_bins[1..].iter().product::<usize>().max(1)
+    }
 }
 
 impl NdSpreadLayout {
@@ -217,40 +278,67 @@ impl NdSpreadLayout {
             };
             bin_side[axis] *= 2;
         }
-        let reach_geometry = |bin_side: &[usize]| {
+        let reach_geometry = |side: Vec<usize>| {
             let mut bins = Vec::with_capacity(dimensions);
             let mut full = Vec::with_capacity(dimensions);
             let mut reach_bins = Vec::with_capacity(dimensions);
+            let mut mean = Vec::with_capacity(dimensions);
             for axis in 0..dimensions {
-                let count = fine_shape[axis].div_ceil(bin_side[axis]);
-                let whole = reach_cells(axis) + bin_side[axis] > fine_shape[axis];
+                let count = fine_shape[axis].div_ceil(side[axis]);
+                let whole = reach_cells(axis) + side[axis] > fine_shape[axis];
                 bins.push(count);
                 full.push(whole);
                 reach_bins.push(if whole {
                     count
                 } else {
-                    count.min(reach_cells(axis).div_ceil(bin_side[axis]) + 2)
+                    count.min(reach_cells(axis).div_ceil(side[axis]) + 2)
                 });
+                mean.push(mean_reach_bins(&side, axis));
             }
-            (bins, full, reach_bins)
+            BinGeometry {
+                side,
+                bins,
+                full,
+                reach_bins,
+                mean_reach_bins: mean,
+            }
         };
-        let (mut bins, mut full, mut reach_bins) = reach_geometry(&bin_side);
+        let mut finest = reach_geometry(bin_side.clone());
         // Coarser bins along the widest reaches keep the row count bounded.
-        while reach_bins[1..]
+        while finest.reach_bins[1..]
             .iter()
             .try_fold(1usize, |rows, &n| rows.checked_mul(n))
             .is_none_or(|rows| rows > MAX_ROWS)
         {
             let Some(axis) = (1..dimensions)
-                .filter(|&axis| reach_bins[axis] > 1)
-                .max_by_key(|&axis| reach_bins[axis])
+                .filter(|&axis| finest.reach_bins[axis] > 1)
+                .max_by_key(|&axis| finest.reach_bins[axis])
             else {
                 break;
             };
             bin_side[axis] *= 2;
-            (bins, full, reach_bins) = reach_geometry(&bin_side);
+            finest = reach_geometry(bin_side.clone());
         }
-        let rows = reach_bins[1..].iter().product::<usize>().max(1);
+        // Sparse points favor coarser bins: `2^i` times the finest sides
+        // along axis zero and `2^j` times along the others, `i <= j`, up to
+        // the axis lengths.
+        let mut geometries = vec![finest];
+        for others in 1..=MAX_COARSENING {
+            for first in 0..=others {
+                let side = bin_side
+                    .iter()
+                    .enumerate()
+                    .map(|(axis, &side)| {
+                        let doublings = if axis == 0 { first } else { others };
+                        (side << doublings).min(fine_shape[axis].next_power_of_two())
+                    })
+                    .collect::<Vec<_>>();
+                if geometries.iter().all(|geometry| geometry.side != side) {
+                    geometries.push(reach_geometry(side));
+                }
+            }
+        }
+        let rows = geometries[0].rows();
         let row_batch = MAX_ROW_BATCH
             .min(workgroup_size)
             .min(rows.next_power_of_two())
@@ -294,10 +382,7 @@ impl NdSpreadLayout {
             groups_0,
             block,
             blocks,
-            bin_side,
-            bins,
-            full,
-            reach_bins,
+            geometries,
             workgroup_size,
             row_batch,
             chunk,
@@ -320,9 +405,56 @@ impl NdSpreadLayout {
         Ok(layout)
     }
 
-    /// Cells per bin along each axis, for the point binning.
-    pub(crate) fn bin_side(&self) -> &[usize] {
-        &self.bin_side
+    /// Cells per bin along each axis of every bin geometry, for the point
+    /// binning.
+    pub(crate) fn bin_shapes(&self) -> Vec<Vec<usize>> {
+        self.geometries
+            .iter()
+            .map(|geometry| geometry.side.clone())
+            .collect()
+    }
+
+    /// The bin geometry for `point_count` points: of the geometries whose
+    /// modeled cost for points spread over the grid is within
+    /// [`COST_TOLERANCE`] of the least, the one that stages the fewest
+    /// records. A light workgroup looks up every bin row of its block's
+    /// reach, a batch at a time, and stages every record of those rows, and
+    /// every bin costs a count and a scan entry.
+    pub(crate) fn choose_geometry(&self, point_count: usize) -> usize {
+        let density = point_count as f64 / self.fine_shape.iter().product::<usize>() as f64;
+        let blocks = self.block_count() as f64;
+        // Every invocation compares every staged record with its cells along
+        // every axis: a record costs in proportion to the workgroup size and,
+        // as measured, to the square of the rank plus one.
+        let dimensions = self.fine_shape.len() as f64;
+        let record_cost = self.workgroup_size as f64 * (dimensions + 1.0).powi(2) / 1024.0;
+        // Cells a block's reach stages, and the modeled cost.
+        let estimates = self
+            .geometries
+            .iter()
+            .map(|geometry| {
+                let rows = geometry.mean_reach_bins[1..].iter().product::<f64>();
+                let batches = (rows / self.row_batch as f64).ceil();
+                let staged = (0..self.fine_shape.len())
+                    .map(|axis| {
+                        (geometry.mean_reach_bins[axis] * geometry.side[axis] as f64)
+                            .min(self.fine_shape[axis] as f64)
+                    })
+                    .product::<f64>();
+                let cost = blocks
+                    * (BATCH_COST * batches + ROW_COST * rows + record_cost * density * staged)
+                    + BIN_COST * geometry.bin_count() as f64;
+                (staged, cost)
+            })
+            .collect::<Vec<_>>();
+        let least = estimates
+            .iter()
+            .map(|&(_, cost)| cost)
+            .fold(f64::INFINITY, f64::min);
+        (0..estimates.len())
+            .filter(|&index| estimates[index].1 <= least * (1.0 + COST_TOLERANCE))
+            .min_by(|&a, &b| estimates[a].0.total_cmp(&estimates[b].0))
+            .unwrap_or(0)
     }
 
     fn block_count(&self) -> usize {
@@ -352,15 +484,15 @@ impl NdSpreadLayout {
         }
     }
 
-    /// Light workgroups per dispatch for `point_count` evenly spread points:
-    /// each block's reach then holds its share of the grid volume, and never
-    /// more than the heavy limit.
-    fn light_workgroups_per_dispatch(&self, point_count: usize) -> u64 {
+    /// Light workgroups per dispatch for `point_count` evenly spread points
+    /// in the bins of `geometry`: each block's reach then holds its share of
+    /// the grid volume, and never more than the heavy limit.
+    fn light_workgroups_per_dispatch(&self, point_count: usize, geometry: usize) -> u64 {
         let records = self
             .block_records(point_count)
             .min(self.light_limit(point_count))
             .max(1);
-        let rows = self.reach_bins[1..].iter().product::<usize>().max(1) as u64;
+        let rows = self.geometries[geometry].rows() as u64;
         let steps = records * self.record_steps + rows * self.workgroup_size as u64;
         (DISPATCH_WORK_BUDGET / steps).max(MIN_WORKGROUPS_PER_DISPATCH)
     }
@@ -376,20 +508,48 @@ impl NdSpreadLayout {
         self.workgroup_size * self.run
     }
 
-    /// Blocks whose reach can include one bin, bounding how often a record is
-    /// counted over all reaches.
-    fn blocks_per_bin(&self) -> u64 {
+    /// Blocks whose reach can include one bin of `geometry`, bounding how
+    /// often a record is counted over all reaches.
+    fn blocks_per_bin(&self, geometry: usize) -> u64 {
+        let geometry = &self.geometries[geometry];
         (0..self.block.len())
             .map(|axis| {
-                if self.full[axis] {
+                if geometry.full[axis] {
                     self.blocks[axis] as u64
                 } else {
                     let edge = self.block[axis];
-                    let span = self.bin_side[axis] + edge + self.width + 2;
+                    let span = geometry.side[axis] + edge + self.width + 2;
                     (span.div_ceil(edge) + 1).min(self.blocks[axis]) as u64
                 }
             })
             .product()
+    }
+
+    /// The [`SPREAD_BINS_WGSL`] uniform of every geometry, `stride` bytes
+    /// apart.
+    fn geometry_uniforms(&self, stride: u64) -> Vec<u8> {
+        let dimensions = self.block.len();
+        let mut contents = vec![0u8; self.geometries.len() * stride as usize];
+        for (index, geometry) in self.geometries.iter().enumerate() {
+            let mut words = Vec::with_capacity(4 * (dimensions + 1));
+            let mut bin_stride = 1usize;
+            for axis in 0..dimensions {
+                words.extend([
+                    geometry.side[axis],
+                    geometry.bins[axis],
+                    bin_stride,
+                    usize::from(geometry.full[axis]),
+                ]);
+                bin_stride *= geometry.bins[axis];
+            }
+            words.extend([self.blocks_per_bin(index) as usize, 0, 0, 0]);
+            let at = index * stride as usize;
+            for (word, value) in words.into_iter().enumerate() {
+                let value = u32::try_from(value).unwrap_or(u32::MAX);
+                contents[at + 4 * word..at + 4 * word + 4].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        contents
     }
 }
 
@@ -467,12 +627,13 @@ impl HeavyGeometry {
     /// scratch holds.
     fn new(
         layout: &NdSpreadLayout,
+        geometry: usize,
         point_count: usize,
         active_batch: usize,
         complex_bytes: u64,
         max_scratch_bytes: u64,
     ) -> Self {
-        let blocks_per_bin = layout.blocks_per_bin();
+        let blocks_per_bin = layout.blocks_per_bin(geometry);
         let bound = blocks_per_bin.saturating_mul(point_count as u64);
         let per_block = active_batch as u64 * layout.block_cells() as u64 * complex_bytes;
         let capacity = (bound / (layout.light_limit(point_count) + 1))
@@ -515,13 +676,48 @@ fn part_records(point_count: u64, spare: u64, blocks_per_bin: u64) -> u64 {
     (blocks_per_bin * per + extra).clamp(MIN_PART_RECORDS, unlimited)
 }
 
+/// The light and heavy-part spreading pipelines of one [`BinSource`].
+struct SpreadPipelines {
+    light: wgpu::ComputePipeline,
+    light_layout: wgpu::BindGroupLayout,
+    part: wgpu::ComputePipeline,
+    part_layout: wgpu::BindGroupLayout,
+}
+
+impl SpreadPipelines {
+    fn new(
+        device: &wgpu::Device,
+        shaders: &ShaderSource<'_>,
+        bins: BinSource<'_>,
+        label: &str,
+    ) -> Self {
+        let light = create_compute_pipeline(
+            device,
+            &format!("wgpu_nufft.nd_spread.light{label}"),
+            &shaders.spread(SpreadMode::Light, bins),
+        );
+        let part = create_compute_pipeline(
+            device,
+            &format!("wgpu_nufft.nd_spread.heavy_part{label}"),
+            &shaders.spread(SpreadMode::HeavyPart, bins),
+        );
+        Self {
+            light_layout: light.get_bind_group_layout(0),
+            light,
+            part_layout: part.get_bind_group_layout(0),
+            part,
+        }
+    }
+}
+
 pub(crate) struct NdBlockSpread {
     layout: NdSpreadLayout,
     complex_bytes: u64,
-    spread_pipeline: wgpu::ComputePipeline,
-    spread_layout: wgpu::BindGroupLayout,
-    part_pipeline: wgpu::ComputePipeline,
-    part_layout: wgpu::BindGroupLayout,
+    /// Spreading pipelines for the finest geometry, whose constants they
+    /// know, and for any geometry, which they read from the uniform; the
+    /// latter only when the layout offers more than one geometry.
+    finest: SpreadPipelines,
+    any_geometry: Option<SpreadPipelines>,
     classify_pipeline: wgpu::ComputePipeline,
     classify_layout: wgpu::BindGroupLayout,
     segment_pipeline: wgpu::ComputePipeline,
@@ -541,6 +737,10 @@ pub(crate) struct NdBlockSpread {
     part_offsets: GrowOnlyBuffer,
     /// Partial sums of the heavy parts.
     partials: Mutex<Option<wgpu::Buffer>>,
+    /// One [`SPREAD_BINS_WGSL`] uniform per bin geometry, `geometry_stride`
+    /// bytes apart.
+    geometry: wgpu::Buffer,
+    geometry_stride: u64,
     ranged: RangedDispatch,
     device: wgpu::Device,
     max_workgroups_per_dimension: u32,
@@ -561,16 +761,14 @@ impl NdBlockSpread {
             fine_shape,
             layout: &layout,
         };
-        let spread_pipeline = create_compute_pipeline(
+        let finest = SpreadPipelines::new(
             device,
-            "wgpu_nufft.nd_spread.light",
-            &shaders.spread(SpreadMode::Light),
+            &shaders,
+            BinSource::Constants(&layout.geometries[0]),
+            ".finest",
         );
-        let part_pipeline = create_compute_pipeline(
-            device,
-            "wgpu_nufft.nd_spread.heavy_part",
-            &shaders.spread(SpreadMode::HeavyPart),
-        );
+        let any_geometry = (layout.geometries.len() > 1)
+            .then(|| SpreadPipelines::new(device, &shaders, BinSource::Uniform, ""));
         let classify_pipeline =
             create_compute_pipeline(device, "wgpu_nufft.nd_spread.classify", &shaders.classify());
         let segment_pipeline = create_compute_pipeline(
@@ -593,12 +791,19 @@ impl NdBlockSpread {
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        let geometry_bytes = (fine_shape.len() as u64 + 1) * SPREAD_BINS_VEC_BYTES;
+        let geometry_stride = geometry_bytes.next_multiple_of(u64::from(
+            device.limits().min_uniform_buffer_offset_alignment,
+        ));
+        let geometry = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("wgpu_nufft.nd_spread.bin_geometry"),
+            contents: &layout.geometry_uniforms(geometry_stride),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
         Ok(Self {
             complex_bytes: types.complex_bytes() as u64,
-            spread_layout: spread_pipeline.get_bind_group_layout(0),
-            spread_pipeline,
-            part_layout: part_pipeline.get_bind_group_layout(0),
-            part_pipeline,
+            finest,
+            any_geometry,
             classify_layout: classify_pipeline.get_bind_group_layout(0),
             classify_pipeline,
             segment_layout: segment_pipeline.get_bind_group_layout(0),
@@ -613,6 +818,8 @@ impl NdBlockSpread {
             heavy_list: GrowOnlyBuffer::new(device, "wgpu_nufft.nd_spread.heavy_list"),
             part_offsets: GrowOnlyBuffer::new(device, "wgpu_nufft.nd_spread.part_offsets"),
             partials: Mutex::new(None),
+            geometry,
+            geometry_stride,
             ranged: RangedDispatch::new(device),
             device: device.clone(),
             max_workgroups_per_dimension: device.limits().max_compute_workgroups_per_dimension,
@@ -620,10 +827,17 @@ impl NdBlockSpread {
         })
     }
 
+    /// The bin geometry [`Self::encode_spread`] should get the points of
+    /// `point_count` binned in, an index into the layout's bin shapes.
+    pub(crate) fn choose_geometry(&self, point_count: usize) -> usize {
+        self.layout.choose_geometry(point_count)
+    }
+
     /// Spreads `active_batch` transform-major strength vectors of the
-    /// `point_count > 0` points prepared in `prepared` and `bin_offsets` into
-    /// `fine_grid`, overwriting every active cell. With profiling, the end of
-    /// the spread is written at offset 5 of the type-1 layout.
+    /// `point_count > 0` points prepared in `prepared` and `bin_offsets`, in
+    /// the bins of `geometry`, into `fine_grid`, overwriting every active
+    /// cell. With profiling, the end of the spread is written at offset 5 of
+    /// the type-1 layout.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_spread(
         &self,
@@ -633,6 +847,7 @@ impl NdBlockSpread {
         point_count: usize,
         prepared: &NdPreparedPoints,
         bin_offsets: &wgpu::Buffer,
+        geometry: usize,
         strengths: &wgpu::Buffer,
         strength_bytes: u64,
         fine_grid: &wgpu::Buffer,
@@ -646,6 +861,7 @@ impl NdBlockSpread {
             point_count,
             prepared,
             bin_offsets,
+            geometry,
             strengths,
             strength_bytes,
             fine_grid,
@@ -665,6 +881,7 @@ impl NdBlockSpread {
         point_count: usize,
         prepared: &NdPreparedPoints,
         bin_offsets: &wgpu::Buffer,
+        geometry: usize,
         strengths: &wgpu::Buffer,
         strength_bytes: u64,
         fine_grid: &wgpu::Buffer,
@@ -672,8 +889,25 @@ impl NdBlockSpread {
     ) -> Result<()> {
         debug_assert!(point_count > 0);
         let limits = self.device.limits();
+        // The offsets of this geometry's bins and the total behind them.
+        let offset_bytes = (self.layout.geometries[geometry].bin_count() as u64 + 1) * 4;
+        let geometry_entry = |binding: u32| wgpu::BindGroupEntry {
+            binding,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &self.geometry,
+                offset: geometry as u64 * self.geometry_stride,
+                size: std::num::NonZeroU64::new(
+                    (self.layout.block.len() as u64 + 1) * SPREAD_BINS_VEC_BYTES,
+                ),
+            }),
+        };
+        let pipelines = match &self.any_geometry {
+            Some(pipelines) if geometry != 0 => pipelines,
+            _ => &self.finest,
+        };
         let heavy = HeavyGeometry::new(
             &self.layout,
+            geometry,
             point_count,
             active_batch,
             self.complex_bytes,
@@ -698,9 +932,10 @@ impl NdBlockSpread {
             label: Some("wgpu_nufft.nd_spread.classify.bind_group"),
             layout: &self.classify_layout,
             entries: &[
-                binding_entry(0, bin_offsets, bin_offsets.size()),
+                binding_entry(0, bin_offsets, offset_bytes),
                 binding_entry(1, &heavy_list, heavy_bytes),
                 binding_entry(2, &self.block_state, self.block_state.size()),
+                geometry_entry(3),
             ],
         });
         let classify_workgroups =
@@ -718,14 +953,15 @@ impl NdBlockSpread {
 
         let spread_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.nd_spread.light.bind_group"),
-            layout: &self.spread_layout,
+            layout: &pipelines.light_layout,
             entries: &[
                 binding_entry(0, &prepared.starts, prepared.start_bytes),
                 binding_entry(1, &prepared.offsets, prepared.offset_bytes),
                 binding_entry(2, strengths, strength_bytes),
-                binding_entry(3, bin_offsets, bin_offsets.size()),
+                binding_entry(3, bin_offsets, offset_bytes),
                 binding_entry(4, fine_grid, active_fine_bytes),
                 binding_entry(5, &self.block_state, self.block_state.size()),
+                geometry_entry(6),
             ],
         });
         let light_workgroups = block_count
@@ -735,10 +971,11 @@ impl NdBlockSpread {
         self.ranged.encode(
             device,
             recorder,
-            &self.spread_pipeline,
+            &pipelines.light,
             &spread_bind_group,
             u64::from(light_workgroups),
-            self.layout.light_workgroups_per_dispatch(point_count),
+            self.layout
+                .light_workgroups_per_dispatch(point_count, geometry),
         )?;
         if heavy.capacity == 0 {
             // No block can exceed the limit.
@@ -767,14 +1004,14 @@ impl NdBlockSpread {
                 }
             }
         };
-        let offset_bytes = (heavy.capacity + 1) * 4;
-        let part_offsets = self.part_offsets.get(offset_bytes);
+        let part_offset_bytes = (heavy.capacity + 1) * 4;
+        let part_offsets = self.part_offsets.get(part_offset_bytes);
         let plan_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.nd_spread.heavy_plan.bind_group"),
             layout: &self.plan_layout,
             entries: &[
                 binding_entry(0, &heavy_list, heavy_bytes),
-                binding_entry(1, &part_offsets, offset_bytes),
+                binding_entry(1, &part_offsets, part_offset_bytes),
                 binding_entry(2, &partials, partial_bytes),
                 binding_entry(3, fine_grid, active_fine_bytes),
             ],
@@ -782,16 +1019,17 @@ impl NdBlockSpread {
         recorder.dispatch(&self.plan_pipeline, &plan_bind_group, (1, 1, 1));
         let part_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.nd_spread.heavy_part.bind_group"),
-            layout: &self.part_layout,
+            layout: &pipelines.part_layout,
             entries: &[
                 binding_entry(0, &prepared.starts, prepared.start_bytes),
                 binding_entry(1, &prepared.offsets, prepared.offset_bytes),
                 binding_entry(2, strengths, strength_bytes),
-                binding_entry(3, bin_offsets, bin_offsets.size()),
+                binding_entry(3, bin_offsets, offset_bytes),
                 binding_entry(4, fine_grid, active_fine_bytes),
                 binding_entry(5, &heavy_list, heavy_bytes),
                 binding_entry(6, &partials, partial_bytes),
-                binding_entry(7, &part_offsets, offset_bytes),
+                binding_entry(7, &part_offsets, part_offset_bytes),
+                geometry_entry(8),
             ],
         });
         let segment_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -801,7 +1039,7 @@ impl NdBlockSpread {
                 binding_entry(0, fine_grid, active_fine_bytes),
                 binding_entry(1, &heavy_list, heavy_bytes),
                 binding_entry(2, &partials, partial_bytes),
-                binding_entry(3, &part_offsets, offset_bytes),
+                binding_entry(3, &part_offsets, part_offset_bytes),
             ],
         });
         let reduce_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -811,7 +1049,7 @@ impl NdBlockSpread {
                 binding_entry(0, fine_grid, active_fine_bytes),
                 binding_entry(1, &heavy_list, heavy_bytes),
                 binding_entry(2, &partials, partial_bytes),
-                binding_entry(3, &part_offsets, offset_bytes),
+                binding_entry(3, &part_offsets, part_offset_bytes),
             ],
         });
         let part_workgroups = heavy.max_parts * active_batch as u64;
@@ -828,7 +1066,7 @@ impl NdBlockSpread {
         self.ranged.encode(
             device,
             recorder,
-            &self.part_pipeline,
+            &pipelines.part,
             &part_bind_group,
             u64::from(workgroup_count(part_workgroups)?),
             self.layout.part_workgroups_per_dispatch(heavy.part_records),
@@ -914,6 +1152,16 @@ fn bin_range_item(ranges: BinRanges, item: i32) -> i32 {
 }
 "#;
 
+/// Where the spreading shaders take the bin geometry from.
+#[derive(Debug, Clone, Copy)]
+enum BinSource<'a> {
+    /// The execution's geometry, from the [`SPREAD_BINS_WGSL`] uniform.
+    Uniform,
+    /// Constants of one geometry. The uniform stays bound, so both kinds of
+    /// pipeline take the same bindings.
+    Constants(&'a BinGeometry),
+}
+
 struct ShaderSource<'a> {
     types: NdWgsl,
     kernel: EsKernel,
@@ -952,24 +1200,15 @@ const HEAVY_STATE: u32 = {HEAVY_STATE}u;
             reach_below = width - 1,
             reach_above = 0,
         );
-        let mut bin_stride = 1usize;
         for axis in 0..self.dimensions() {
             let _ = write!(
                 source,
                 "const BLOCK_{axis}: i32 = {block}i;
 const BLOCKS_{axis}: u32 = {blocks}u;
-const BIN_SIDE_{axis}: i32 = {side}i;
-const BINS_{axis}: i32 = {bins}i;
-const BIN_STRIDE_{axis}: u32 = {bin_stride}u;
-const FULL_{axis}: bool = {full};
 ",
                 block = layout.block[axis],
                 blocks = layout.blocks[axis],
-                side = layout.bin_side[axis],
-                bins = layout.bins[axis],
-                full = layout.full[axis],
             );
-            bin_stride *= layout.bins[axis];
         }
         source
     }
@@ -1017,12 +1256,24 @@ const FULL_{axis}: bool = {full};
 
     /// Statements computing `ranges_{a}` for every axis, `row_count_{a}` for
     /// the axes above zero, and `rows`.
-    fn reach_statements(&self) -> String {
+    fn reach_statements(&self, bins: BinSource<'_>) -> String {
         let mut source = String::new();
         for axis in 0..self.dimensions() {
+            let (side, count, full) = match bins {
+                BinSource::Uniform => (
+                    format!("i32(spread_bins.axes[{axis}].x)"),
+                    format!("i32(spread_bins.axes[{axis}].y)"),
+                    format!("spread_bins.axes[{axis}].w != 0u"),
+                ),
+                BinSource::Constants(geometry) => (
+                    format!("{}i", geometry.side[axis]),
+                    format!("{}i", geometry.bins[axis]),
+                    geometry.full[axis].to_string(),
+                ),
+            };
             let _ = writeln!(
                 source,
-                "    let ranges_{axis} = bin_ranges(origin_{axis} - REACH_BELOW, origin_{axis} + BLOCK_{axis} - 1 + REACH_ABOVE, FINE_{axis}_I32, BIN_SIDE_{axis}, BINS_{axis}, FULL_{axis});"
+                "    let ranges_{axis} = bin_ranges(origin_{axis} - REACH_BELOW, origin_{axis} + BLOCK_{axis} - 1 + REACH_ABOVE, FINE_{axis}_I32, {side}, {count}, {full});"
             );
         }
         let mut rows = Vec::new();
@@ -1045,7 +1296,7 @@ const FULL_{axis}: bool = {full};
     /// Statements deriving `row_bin`, the first bin of row `row` of the
     /// reach, and loading its axis-zero segments into `start_a`, `length_a`,
     /// `start_b` and `length_b`.
-    fn row_statements(&self, indent: &str) -> String {
+    fn row_statements(&self, indent: &str, bins: BinSource<'_>) -> String {
         let last = self.dimensions() - 1;
         let mut source = format!("{indent}var row_rest = i32(row);\n");
         let mut terms = Vec::new();
@@ -1061,7 +1312,13 @@ const FULL_{axis}: bool = {full};
                     "{indent}let bin_{axis} = bin_range_item(ranges_{axis}, row_rest % row_count_{axis});\n{indent}row_rest = row_rest / row_count_{axis};"
                 );
             }
-            terms.push(format!("u32(bin_{axis}) * BIN_STRIDE_{axis}"));
+            terms.push(match bins {
+                BinSource::Uniform => format!("u32(bin_{axis}) * spread_bins.axes[{axis}].z"),
+                BinSource::Constants(geometry) => format!(
+                    "u32(bin_{axis}) * {}u",
+                    geometry.bins[..axis].iter().product::<usize>()
+                ),
+            });
         }
         let row_bin = if terms.is_empty() {
             "0u".to_owned()
@@ -1082,7 +1339,7 @@ const FULL_{axis}: bool = {full};
         source
     }
 
-    fn spread(&self, mode: SpreadMode) -> String {
+    fn spread(&self, mode: SpreadMode, bins: BinSource<'_>) -> String {
         let types = self.types;
         let layout = self.layout;
         let dimensions = self.dimensions();
@@ -1211,8 +1468,10 @@ const FULL_{axis}: bool = {full};
                     })
                     .collect();
                 (
-                    "@group(0) @binding(5) var<storage, read> block_state: array<u32>;\n"
-                        .to_owned(),
+                    "@group(0) @binding(5) var<storage, read> block_state: array<u32>;
+@group(0) @binding(6) var<uniform> spread_bins: SpreadBins;
+"
+                    .to_owned(),
                     "    if (wg_flat >= BLOCK_COUNT * total_vectors) { return; }
     let vector_index = wg_flat / BLOCK_COUNT;
     let block = wg_flat - vector_index * BLOCK_COUNT;
@@ -1240,6 +1499,7 @@ const FULL_{axis}: bool = {full};
                         "@group(0) @binding(5) var<storage, read> heavy_list: array<u32>;
 @group(0) @binding(6) var<storage, read_write> partials: array<{complex}>;
 @group(0) @binding(7) var<storage, read> part_offsets: array<u32>;
+@group(0) @binding(8) var<uniform> spread_bins: SpreadBins;
 "
                     ),
                     "    // Workgroups enumerate (vector, part slot); slots past the planned parts
@@ -1285,7 +1545,7 @@ const CHUNK: u32 = {chunk}u;
 const RECORD_LANES: u32 = {record_lanes}u;
 // The relative start of a staged record whose support misses the block.
 const SKIPPED: i32 = 0x3fffffff;
-{geometry}
+{geometry}{SPREAD_BINS_WGSL}
 @group(0) @binding(0) var<storage, read> prepared_starts: array<i32>;
 @group(0) @binding(1) var<storage, read> prepared_offsets: array<{offset_type}>;
 @group(0) @binding(2) var<storage, read> strengths: array<{complex}>;
@@ -1318,7 +1578,7 @@ fn main(
     @builtin(num_workgroups) nwg: vec3<u32>,
 ) {{
     let wg_flat = dispatch_range.first + (wid.z * nwg.y + wid.y) * nwg.x + wid.x;
-    let total_vectors = arrayLength(&fine_grid) / FINE_COUNT;
+{bound_uniform}    let total_vectors = arrayLength(&fine_grid) / FINE_COUNT;
     let point_count = arrayLength(&prepared_starts) / STRIDE;
     // DIMS * WIDTH, but not a constant the compiler can unroll loops by:
     // point counts stay below 2^31.
@@ -1329,7 +1589,7 @@ fn main(
     var consumed = 0u;
     for (var batch_first = 0u; batch_first < rows; batch_first = batch_first + ROW_BATCH) {{
         if (consumed >= records_end) {{ break; }}
-        if (invocation < ROW_BATCH) {{
+{batch_rows}        if (invocation < ROW_BATCH) {{
             let row = batch_first + invocation;
             var start_a = 0u;
             var length_a = 0u;
@@ -1344,7 +1604,7 @@ fn main(
         }}
         workgroupBarrier();
         // Inclusive scan of the row lengths.
-        for (var offset = 1u; offset < ROW_BATCH; offset = offset * 2u) {{
+        for (var offset = 1u; offset < {batch_rows_bound}; offset = offset * 2u) {{
             var addend = 0u;
             if (invocation < ROW_BATCH && invocation >= offset) {{
                 addend = row_prefix[invocation - offset];
@@ -1355,7 +1615,7 @@ fn main(
             }}
             workgroupBarrier();
         }}
-        let batch_records = workgroupUniformLoad(&row_prefix[ROW_BATCH - 1u]);
+        let batch_records = workgroupUniformLoad(&row_prefix[{batch_rows_bound} - 1u]);
         let batch_end = consumed + batch_records;
         var local_first = 0u;
         var local_last = 0u;
@@ -1375,7 +1635,7 @@ fn main(
                 let record = chunk_first + slot;
                 // First row whose inclusive prefix exceeds `record`.
                 var low = 0u;
-                var high = ROW_BATCH - 1u;
+                var high = {batch_rows_bound} - 1u;
                 loop {{
                     if (low >= high) {{ break; }}
                     let middle = (low + high) / 2u;
@@ -1426,8 +1686,23 @@ fn main(
             chunk_weights = layout.chunk * dimensions * layout.width,
             origins = self.origin_statements(),
             locals = self.local_statements(),
-            reach = self.reach_statements(),
-            row = self.row_statements("                "),
+            reach = self.reach_statements(bins),
+            row = self.row_statements("                ", bins),
+            batch_rows = match bins {
+                BinSource::Uniform =>
+                    "        // Rows of this batch: fewer than ROW_BATCH only in the last.
+        let batch_rows = min(ROW_BATCH, rows - batch_first);
+",
+                BinSource::Constants(_) => "",
+            },
+            batch_rows_bound = match bins {
+                BinSource::Uniform => "batch_rows",
+                BinSource::Constants(_) => "ROW_BATCH",
+            },
+            bound_uniform = match bins {
+                BinSource::Uniform => "",
+                BinSource::Constants(_) => "    _ = spread_bins.totals;\n",
+            },
         );
         types.with_library(&format!(
             "{}\n{}\n{entry}",
@@ -1439,7 +1714,7 @@ fn main(
     /// Counts the records in every block's reach, flags the blocks above the
     /// light limit and lists them, one invocation per block.
     ///
-    /// All reaches hold at most `BLOCKS_PER_BIN * point_count` records, so at
+    /// All reaches hold at most `blocks_per_bin * point_count` records, so at
     /// most `capacity` blocks exceed `floor(that / (capacity + 1))`: raising
     /// the limit to it keeps the list within its binding and depends only on
     /// the point count and the binding.
@@ -1449,11 +1724,11 @@ fn main(
 const HEAVY_RECORDS: u32 = {heavy_records}u;
 const MIN_PART_RECORDS: u32 = {MIN_PART_RECORDS}u;
 const DENSE_DIVISOR: u32 = {dense_divisor}u;
-const BLOCKS_PER_BIN: u32 = {blocks_per_bin}u;
-{geometry}
+{geometry}{SPREAD_BINS_WGSL}
 @group(0) @binding(0) var<storage, read> bin_offsets: array<u32>;
 @group(0) @binding(1) var<storage, read_write> heavy_list: array<atomic<u32>>;
 @group(0) @binding(2) var<storage, read_write> block_state: array<u32>;
+@group(0) @binding(3) var<uniform> spread_bins: SpreadBins;
 {BIN_RANGES_WGSL}
 @compute @workgroup_size({CLASSIFY_WORKGROUP_SIZE})
 fn main(
@@ -1478,14 +1753,15 @@ fn main(
     // The same limit as the host's: lower on grids with few blocks. A list
     // with room for every block needs no raise.
     let base_limit = clamp(point_count / DENSE_DIVISOR, MIN_PART_RECORDS, HEAVY_RECORDS);
+    let blocks_per_bin = spread_bins.totals.x;
     var limit = HEAVY_STATE;
     if (capacity >= BLOCK_COUNT) {{
         limit = base_limit;
     }} else {{
         let per_entry = point_count / (capacity + 1u);
-        if (capacity > 0u && per_entry < 0xffffffffu / BLOCKS_PER_BIN) {{
-            limit = max(base_limit, BLOCKS_PER_BIN * per_entry
-                + BLOCKS_PER_BIN * (point_count % (capacity + 1u)) / (capacity + 1u));
+        if (capacity > 0u && per_entry < 0xffffffffu / blocks_per_bin) {{
+            limit = max(base_limit, blocks_per_bin * per_entry
+                + blocks_per_bin * (point_count % (capacity + 1u)) / (capacity + 1u));
         }}
     }}
     var state = min(total, HEAVY_STATE - 1u);
@@ -1502,11 +1778,10 @@ fn main(
 "#,
             heavy_records = self.layout.heavy_records,
             dense_divisor = self.layout.dense_divisor,
-            blocks_per_bin = u32::try_from(self.layout.blocks_per_bin()).unwrap_or(u32::MAX),
             geometry = self.geometry_constants(),
             origins = self.origin_statements(),
-            reach = self.reach_statements(),
-            row = self.row_statements("        "),
+            reach = self.reach_statements(BinSource::Uniform),
+            row = self.row_statements("        ", BinSource::Uniform),
         );
         let position = position_wgsl(self.fine_shape, self.kernel, self.types.precision());
         self.types.with_library(&format!("{position}\n{entry}"))
@@ -1814,13 +2089,16 @@ mod tests {
             fine_shape,
             layout: &layout,
         };
+        let finest = BinSource::Constants(&layout.geometries[0]);
         vec![
-            source.spread(SpreadMode::Light),
-            source.spread(SpreadMode::HeavyPart),
+            source.spread(SpreadMode::Light, BinSource::Uniform),
+            source.spread(SpreadMode::HeavyPart, BinSource::Uniform),
             source.classify(),
             source.segment(),
             source.reduce(),
             source.plan(),
+            source.spread(SpreadMode::Light, finest),
+            source.spread(SpreadMode::HeavyPart, finest),
         ]
     }
 
@@ -1922,6 +2200,44 @@ mod tests {
     }
 
     #[test]
+    fn bin_geometry_follows_the_point_density() {
+        let limits = wgpu::Limits::default();
+        let kernel = EsKernel::for_tolerance(1.0e-6, 2.0).unwrap();
+        let layout =
+            NdSpreadLayout::for_grid(kernel, &[200, 200, 200], FftPrecision::F32, &limits).unwrap();
+        let chosen = |points: usize| {
+            layout.geometries[layout.choose_geometry(points)]
+                .side
+                .clone()
+        };
+        // Dense points keep fine bins, which stage few records outside a
+        // block's reach; sparse points get coarser bins above axis zero, and
+        // sparser points never finer ones.
+        let dense = chosen(10_000_000);
+        assert!(dense[1..].iter().all(|&side| side <= 2), "{dense:?}");
+        let sparse = chosen(100_000);
+        assert!(sparse[1..].iter().all(|&side| side >= 4), "{sparse:?}");
+        let sparsest = chosen(1_000);
+        assert!(
+            sparsest.iter().zip(&sparse).all(|(a, b)| a >= b),
+            "{sparsest:?}"
+        );
+        // Five and six dimensions with many points keep the finest bins, whose
+        // coarser neighbours stage far more records.
+        let coarse_kernel = EsKernel::for_tolerance(1.0e-3, 2.0).unwrap();
+        for rank in [5, 6] {
+            let layout = NdSpreadLayout::for_grid(
+                coarse_kernel,
+                &vec![16; rank],
+                FftPrecision::F32,
+                &limits,
+            )
+            .unwrap();
+            assert_eq!(layout.choose_geometry(1_000_000), 0, "{rank}D");
+        }
+    }
+
+    #[test]
     fn segments_hold_about_the_square_root_of_the_part_slots() {
         for (max_parts, expected) in [
             (1, 1),
@@ -1946,15 +2262,31 @@ mod tests {
         let layout = |shape: &[usize]| {
             NdSpreadLayout::for_grid(kernel, shape, FftPrecision::F32, &limits).unwrap()
         };
+        let finest = |shape: &[usize]| layout(shape).geometries[0].side.clone();
         // Single cells above axis zero while a reach spans few bin rows.
-        assert_eq!(layout(&[2000, 2000]).bin_side, vec![1, 1]);
-        assert_eq!(layout(&[200, 200, 200]).bin_side, vec![2, 1, 1]);
-        assert_eq!(layout(&[32; 4]).bin_side, vec![2, 1, 1, 1]);
+        assert_eq!(finest(&[2000, 2000]), vec![1, 1]);
+        assert_eq!(finest(&[200, 200, 200]), vec![2, 1, 1]);
+        assert_eq!(finest(&[32; 4]), vec![2, 1, 1, 1]);
         // More than `MAX_BINS` bins coarsen along the widest reaches.
-        assert_eq!(layout(&[400, 400, 400]).bin_side, vec![2, 2, 2]);
+        assert_eq!(finest(&[400, 400, 400]), vec![2, 2, 2]);
         // Single cells along four axes would span 6400 rows per reach.
         let five = layout(&[24; 5]);
         assert_eq!(five.block, vec![16, 4, 4, 2, 2]);
-        assert_eq!(five.bin_side, vec![2, 2, 2, 2, 2]);
+        assert_eq!(five.geometries[0].side, vec![2, 2, 2, 2, 2]);
+        // Coarser geometries double the sides, never past an axis.
+        let three = layout(&[200, 200, 200]);
+        assert!(three.geometries.contains(&three.geometries[0]));
+        let sides = three
+            .geometries
+            .iter()
+            .map(|geometry| geometry.side.clone())
+            .collect::<Vec<_>>();
+        assert!(sides.contains(&vec![2, 2, 2]));
+        assert!(sides.contains(&vec![4, 4, 4]));
+        assert!(sides.contains(&vec![16, 8, 8]));
+        assert!(layout(&[24; 5])
+            .geometries
+            .iter()
+            .all(|geometry| geometry.side.iter().all(|&side| side <= 32)));
     }
 }

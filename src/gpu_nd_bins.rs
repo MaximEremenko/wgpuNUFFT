@@ -15,6 +15,11 @@
 //! exactly those of the bins that hold the kernel width of starts below the
 //! block, and the type-1 spreader stages no others.
 //!
+//! A plan offers several bin geometries, and every execution picks one: the
+//! shaders read the bin sides and counts from a uniform, and the bin arrays,
+//! sized for the geometry with the most bins, are bound at the length the
+//! chosen one needs.
+//!
 //! [`NdBinOrder::Stable`] restores original point order inside every bin, as
 //! the type-1 spreader needs for deterministic sums: [`LargeBinSort`] sorts
 //! bins above [`SMALL_BIN`] points, and preparation ranks the points of the
@@ -41,12 +46,24 @@ use crate::gpu_type1_3d::{
     validate_binding_limit, validate_buffer_limit,
 };
 use crate::kernel::EsKernel;
+use wgpu::util::DeviceExt;
 use wgpu_fft::FftPrecision;
 
 const WORKGROUP_SIZE: u32 = 64;
 const U32_BYTES: u64 = 4;
 /// `vec2<u32>`: a point's bin and its rank among the points of that bin.
 const POINT_SLOT_BYTES: u64 = 8;
+/// One `vec4<u32>` of bin geometry per axis: the cells per bin, the bins, and
+/// the cells per bin as a shift.
+const GEOMETRY_AXIS_BYTES: u64 = 16;
+
+/// The bin-geometry uniform of the binning shaders.
+const BIN_GEOMETRY_WGSL: &str = "
+// Per axis: x = cells per bin, y = bins, z = log2(cells per bin).
+struct BinGeometry {
+    axes: array<vec4<u32>, DIMS>,
+}
+";
 
 /// How [`NdPointBins::encode`] orders the points inside each bin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +88,12 @@ pub(crate) struct NdPreparedPoints {
 pub(crate) struct NdPointBins {
     dimensions: usize,
     types: NdWgsl,
+    /// Bins of every geometry an execution can choose.
+    bin_counts_per_geometry: Vec<usize>,
+    /// One [`BIN_GEOMETRY_WGSL`] uniform per geometry, `geometry_stride`
+    /// bytes apart.
+    geometry: wgpu::Buffer,
+    geometry_stride: u64,
     /// One count per bin plus a trailing zero, so the scan also yields the
     /// total, and behind them the flag stable counting sets when a bin holds
     /// more than [`SMALL_BIN`] points.
@@ -94,37 +117,63 @@ pub(crate) struct NdPointBins {
 }
 
 impl NdPointBins {
-    /// Bins the points of a `fine_shape` grid into `bin_shape`-cell bins,
-    /// axis zero fastest.
+    /// Bins the points of a `fine_shape` grid, axis zero fastest, into bins
+    /// of any of the `bin_shapes`, whose sides are powers of two; each
+    /// [`Self::encode`] names the one it uses.
     pub(crate) fn new(
         device: &wgpu::Device,
         kernel: EsKernel,
         fine_shape: &[usize],
-        bin_shape: &[usize],
+        bin_shapes: &[Vec<usize>],
         order: NdBinOrder,
         precision: FftPrecision,
     ) -> Result<Self> {
         let dimensions = fine_shape.len();
         assert!(
-            dimensions >= 1 && bin_shape.len() == dimensions,
-            "one bin side per axis"
+            dimensions >= 1
+                && !bin_shapes.is_empty()
+                && bin_shapes.iter().all(|shape| shape.len() == dimensions
+                    && shape.iter().all(|side| side.is_power_of_two())),
+            "one power-of-two bin side per axis"
         );
         let limits = device.limits();
-        let bins = fine_shape
-            .iter()
-            .zip(bin_shape)
-            .map(|(&length, &side)| length.div_ceil(side))
-            .collect::<Vec<_>>();
-        let bin_count = bins
-            .iter()
-            .try_fold(1usize, |count, &n| count.checked_mul(n))
-            .ok_or(NufftError::LengthOverflow {
-                context: "rank-generic point-bin count",
-            })?;
+        let mut bin_counts_per_geometry = Vec::with_capacity(bin_shapes.len());
+        let geometry_bytes = dimensions as u64 * GEOMETRY_AXIS_BYTES;
+        let geometry_stride =
+            geometry_bytes.next_multiple_of(u64::from(limits.min_uniform_buffer_offset_alignment));
+        let mut geometry_contents = vec![0u8; bin_shapes.len() * geometry_stride as usize];
+        for (index, bin_shape) in bin_shapes.iter().enumerate() {
+            let mut bin_count = 1usize;
+            for (axis, (&length, &side)) in fine_shape.iter().zip(bin_shape).enumerate() {
+                let bins = length.div_ceil(side);
+                bin_count = bin_count
+                    .checked_mul(bins)
+                    .ok_or(NufftError::LengthOverflow {
+                        context: "rank-generic point-bin count",
+                    })?;
+                let words = [side, bins, side.trailing_zeros() as usize, 0].map(|value| {
+                    u32::try_from(value).map_err(|_| NufftError::LengthOverflow {
+                        context: "rank-generic point-bin geometry",
+                    })
+                });
+                let at = index * geometry_stride as usize + axis * GEOMETRY_AXIS_BYTES as usize;
+                for (word, value) in words.into_iter().enumerate() {
+                    geometry_contents[at + 4 * word..at + 4 * word + 4]
+                        .copy_from_slice(&value?.to_le_bytes());
+                }
+            }
+            bin_counts_per_geometry.push(bin_count);
+        }
+        let geometry = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("wgpu_nufft.nd_bins.geometry"),
+            contents: &geometry_contents,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bin_count = bin_counts_per_geometry.iter().copied().max().unwrap_or(1);
         let entry_count = bin_count.checked_add(1).ok_or(NufftError::LengthOverflow {
             context: "rank-generic point-bin offset count",
         })?;
-        u32::try_from(entry_count).map_err(|_| NufftError::LengthOverflow {
+        u32::try_from(entry_count + 1).map_err(|_| NufftError::LengthOverflow {
             context: "rank-generic point-bin shader index space",
         })?;
         let entry_bytes = checked_buffer_size(
@@ -162,7 +211,7 @@ impl NdPointBins {
         let count_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.nd_bins.count",
-            &generate_count_wgsl(types, bin_shape, &bins, stable, &position),
+            &generate_count_wgsl(types, dimensions, stable, &position),
         );
         let scatter_pipeline = create_compute_pipeline(
             device,
@@ -172,11 +221,14 @@ impl NdPointBins {
         let prepare_pipeline = create_compute_pipeline(
             device,
             "wgpu_nufft.nd_bins.prepare",
-            &generate_prepare_wgsl(types, bin_shape, &bins, stable, &position),
+            &generate_prepare_wgsl(types, dimensions, stable, &position),
         );
         Ok(Self {
             dimensions,
             types,
+            bin_counts_per_geometry,
+            geometry,
+            geometry_stride,
             bin_counts,
             bin_offsets,
             point_slots: GrowOnlyBuffer::new(device, "wgpu_nufft.nd_bins.point_slots"),
@@ -198,9 +250,26 @@ impl NdPointBins {
     }
 
     /// Bin offsets of the last [`Self::encode`], one entry per bin plus a
-    /// terminal total, in axis-zero-fastest bin order.
+    /// terminal total, in axis-zero-fastest bin order, in the first
+    /// [`Self::bin_offset_bytes`] of the buffer.
     pub(crate) fn bin_offsets(&self) -> &wgpu::Buffer {
         &self.bin_offsets
+    }
+
+    /// Bytes of the bin offsets of `geometry`: one word per bin and the total.
+    pub(crate) fn bin_offset_bytes(&self, geometry: usize) -> u64 {
+        (self.bin_counts_per_geometry[geometry] as u64 + 1) * U32_BYTES
+    }
+
+    fn geometry_entry(&self, binding: u32, geometry: usize) -> wgpu::BindGroupEntry<'_> {
+        wgpu::BindGroupEntry {
+            binding,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &self.geometry,
+                offset: geometry as u64 * self.geometry_stride,
+                size: std::num::NonZeroU64::new(self.dimensions as u64 * GEOMETRY_AXIS_BYTES),
+            }),
+        }
     }
 
     fn scratch(
@@ -254,14 +323,16 @@ impl NdPointBins {
         })
     }
 
-    /// Records the bin order and prepared data of `point_count > 0` points.
-    /// Both stay valid for consumers until the next call; executions must
-    /// keep queue order.
+    /// Records the bin order and prepared data of `point_count > 0` points in
+    /// the bins of `geometry`, an index into the plan's bin shapes. Both stay
+    /// valid for consumers until the next call; executions must keep queue
+    /// order.
     ///
     /// With profiling, stable mode writes the start marker and the ends of
     /// the count, scan, scatter, and sort-and-prepare stages at offsets 0-4
     /// of the type-1 layout. Grouped mode writes the start marker at offset 0
     /// and the end of the last pass at offset 1.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode(
         &self,
         device: &wgpu::Device,
@@ -269,11 +340,15 @@ impl NdPointBins {
         point_count: usize,
         points: &wgpu::Buffer,
         point_bytes: u64,
+        geometry: usize,
         #[cfg(feature = "gpu-profiling")] profile: GpuProfileQueryWriter<'_>,
     ) -> Result<()> {
         #[cfg(feature = "gpu-profiling")]
         let stable = self.sort.is_some();
         debug_assert!(point_count > 0);
+        // The counts of the chosen bins, their trailing zero and the flag.
+        let offset_bytes = self.bin_offset_bytes(geometry);
+        let count_bytes = offset_bytes + U32_BYTES;
         let point_count_u32 =
             u32::try_from(point_count).map_err(|_| NufftError::LengthOverflow {
                 context: "rank-generic binned point count",
@@ -295,20 +370,20 @@ impl NdPointBins {
             U32_BYTES,
         )?;
         let prepared = self.prepared(point_count)?;
-        let offset_bytes = self.bin_offsets.size();
 
         let count_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.nd_bins.count.bind_group"),
             layout: &self.count_layout,
             entries: &[
                 binding_entry(0, points, point_bytes),
-                binding_entry(1, &self.bin_counts, self.bin_counts.size()),
+                binding_entry(1, &self.bin_counts, count_bytes),
                 binding_entry(2, &point_slots, slot_bytes),
+                self.geometry_entry(3, geometry),
             ],
         });
         #[cfg(feature = "gpu-profiling")]
         profile.encode_start_marker(recorder);
-        recorder.clear_buffer(&self.bin_counts, 0, None);
+        recorder.clear_buffer(&self.bin_counts, 0, Some(count_bytes));
         encode_pass(
             recorder,
             "wgpu_nufft.nd_bins.count.pass",
@@ -320,8 +395,13 @@ impl NdPointBins {
                 .then(|| profile.timestamp_writes(None, Some(1)))
                 .flatten(),
         );
-        self.prefix_scan
-            .encode(device, recorder, &self.bin_counts, &self.bin_offsets)?;
+        self.prefix_scan.encode_prefix(
+            device,
+            recorder,
+            &self.bin_counts,
+            &self.bin_offsets,
+            self.bin_counts_per_geometry[geometry] + 1,
+        )?;
         #[cfg(feature = "gpu-profiling")]
         if stable {
             profile.encode_marker(recorder, None, Some(2));
@@ -355,6 +435,7 @@ impl NdPointBins {
                 &self.bin_offsets,
                 offset_bytes,
                 &self.bin_counts,
+                count_bytes,
                 &sorted_indices,
                 point_count,
             )?;
@@ -366,9 +447,11 @@ impl NdPointBins {
             binding_entry(3, &prepared.offsets, prepared.offset_bytes),
         ];
         if self.sort.is_some() {
-            // Stable mode ranks the points of small bins while preparing.
+            // Stable mode ranks the points of small bins, and keeps every
+            // start inside its bin, while preparing.
             prepare_entries.push(binding_entry(4, &point_slots, slot_bytes));
             prepare_entries.push(binding_entry(5, &self.bin_offsets, offset_bytes));
+            prepare_entries.push(self.geometry_entry(6, geometry));
         }
         let prepare_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("wgpu_nufft.nd_bins.prepare.bind_group"),
@@ -388,21 +471,14 @@ impl NdPointBins {
     }
 }
 
-fn generate_count_wgsl(
-    types: NdWgsl,
-    bin_shape: &[usize],
-    bins: &[usize],
-    stable: bool,
-    position: &str,
-) -> String {
-    let dimensions = bin_shape.len();
-    let mut constants = String::new();
-    for (axis, side) in bin_shape.iter().enumerate() {
-        constants.push_str(&format!("const BIN_SIDE_{axis}: u32 = {side}u;\n"));
-    }
-    for (axis, count) in bins.iter().enumerate() {
-        constants.push_str(&format!("const BINS_{axis}: u32 = {count}u;\n"));
-    }
+fn generate_count_wgsl(types: NdWgsl, dimensions: usize, stable: bool, position: &str) -> String {
+    let geometry: String = (0..dimensions)
+        .map(|axis| {
+            format!(
+                "    let shift_{axis} = bin_geometry.axes[{axis}].z;\n    let bins_{axis} = bin_geometry.axes[{axis}].y;\n"
+            )
+        })
+        .collect();
     let loads: String = (0..dimensions)
         .map(|axis| format!("    let coordinate_{axis} = points[point_base + {axis}u];\n"))
         .collect();
@@ -420,10 +496,10 @@ fn generate_count_wgsl(
         })
         .collect();
     let terms = (0..dimensions)
-        .map(|axis| format!("start_{axis} / BIN_SIDE_{axis}"))
+        .map(|axis| format!("(start_{axis} >> shift_{axis})"))
         .collect::<Vec<_>>();
     let lengths = (0..dimensions)
-        .map(|axis| format!("BINS_{axis}"))
+        .map(|axis| format!("bins_{axis}"))
         .collect::<Vec<_>>();
     let bin = linear_index(&terms, &lengths);
     let record = if stable {
@@ -443,10 +519,11 @@ fn generate_count_wgsl(
         r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
 const DIMS: u32 = {dimensions}u;
 const SMALL_BIN: u32 = {SMALL_BIN}u;
-{constants}
+{BIN_GEOMETRY_WGSL}
 @group(0) @binding(0) var<storage, read> points: array<{coordinate}>;
 @group(0) @binding(1) var<storage, read_write> bin_counts: array<atomic<u32>>;
 @group(0) @binding(2) var<storage, read_write> point_slots: array<vec2<u32>>;
+@group(0) @binding(3) var<uniform> bin_geometry: BinGeometry;
 
 // A support start wrapped onto the grid, clamped so that even a coordinate
 // outside the contract lands in a bin.
@@ -468,7 +545,7 @@ fn main(
 
     let point_base = point_index * DIMS;
 {loads}    let in_reach = {in_reach};
-{starts}    let bin = {bin};
+{starts}{geometry}    let bin = {bin};
 {record}}}
 "#,
         coordinate = types.coordinate_type(),
@@ -510,22 +587,18 @@ fn main(
 ///
 /// Every coordinate is loaded once, before any store, and the fallback for a
 /// coordinate out of the fold's reach is selected without branches.
-fn generate_prepare_wgsl(
-    types: NdWgsl,
-    bin_shape: &[usize],
-    bins: &[usize],
-    stable: bool,
-    position: &str,
-) -> String {
-    let dimensions = bin_shape.len();
+fn generate_prepare_wgsl(types: NdWgsl, dimensions: usize, stable: bool, position: &str) -> String {
     let last = dimensions - 1;
     let bin_axes: String = (0..dimensions)
         .map(|axis| {
+            let side = format!(
+                "    let bin_side_{axis} = i32(bin_geometry.axes[{axis}].x);\n"
+            );
             if axis == last {
-                format!("    let bin_{axis} = i32(bin_rest);\n")
+                format!("{side}    let bin_{axis} = i32(bin_rest);\n")
             } else {
                 format!(
-                    "    let bin_{axis} = i32(bin_rest % BINS_{axis});\n    bin_rest = bin_rest / BINS_{axis};\n"
+                    "{side}    let bins_{axis} = bin_geometry.axes[{axis}].y;\n    let bin_{axis} = i32(bin_rest % bins_{axis});\n    bin_rest = bin_rest / bins_{axis};\n"
                 )
             }
         })
@@ -534,6 +607,7 @@ fn generate_prepare_wgsl(
         (
             "@group(0) @binding(4) var<storage, read> point_slots: array<vec2<u32>>;
 @group(0) @binding(5) var<storage, read> bin_offsets: array<u32>;
+@group(0) @binding(6) var<uniform> bin_geometry: BinGeometry;
 ",
             format!(
                 "    var slot = record;
@@ -569,7 +643,7 @@ fn generate_prepare_wgsl(
                 types.start(&format!("position_{axis}"))
             );
             let start = if stable {
-                format!("start_in_bin({start}, bin_{axis} * BIN_SIDE_{axis}, BIN_SIDE_{axis}, FINE_{axis}_I32)")
+                format!("start_in_bin({start}, bin_{axis} * bin_side_{axis}, bin_side_{axis}, FINE_{axis}_I32)")
             } else {
                 start
             };
@@ -584,25 +658,12 @@ fn generate_prepare_wgsl(
             )
         })
         .collect();
-    let bin_constants: String = if stable {
-        bin_shape
-            .iter()
-            .zip(bins)
-            .enumerate()
-            .map(|(axis, (side, count))| {
-                format!(
-                    "const BIN_SIDE_{axis}: i32 = {side}i;\nconst BINS_{axis}: u32 = {count}u;\n"
-                )
-            })
-            .collect()
-    } else {
-        String::new()
-    };
+    let bin_geometry = if stable { BIN_GEOMETRY_WGSL } else { "" };
     let entry = format!(
         r#"const WORKGROUP_SIZE: u32 = {WORKGROUP_SIZE}u;
 const DIMS: u32 = {dimensions}u;
 const STRIDE: u32 = {stride}u;
-{bin_constants}
+{bin_geometry}
 @group(0) @binding(0) var<storage, read> points: array<{coordinate}>;
 @group(0) @binding(1) var<storage, read> sorted_indices: array<u32>;
 @group(0) @binding(2) var<storage, read_write> prepared_starts: array<i32>;
@@ -612,12 +673,14 @@ const STRIDE: u32 = {stride}u;
 // have carried it one cell across the edge of the bin. The nearest start of
 // the bin keeps the point in reach of every block it touches; the cell it
 // trades lies at the edge of the support, whose weight is about exp(-beta).
+// A start past the bin's last cell is taken below its first instead when
+// that is nearer around the periodic axis; a bin may span most of the axis.
 fn start_in_bin(start: i32, low: i32, side: i32, fine_length: i32) -> i32 {{
-    let high = min(low + side, fine_length) - 1;
+    let span = min(low + side, fine_length) - 1 - low;
     var delta = select(start, start + fine_length, start < 0) - low;
-    if (delta > fine_length / 2) {{ delta = delta - fine_length; }}
-    if (delta < -(fine_length / 2)) {{ delta = delta + fine_length; }}
-    return start + clamp(delta, 0, high - low) - delta;
+    if (delta < 0) {{ delta = delta + fine_length; }}
+    if (delta > span && fine_length - delta < delta - span) {{ delta = delta - fine_length; }}
+    return start + clamp(delta, 0, span) - delta;
 }}
 
 @compute @workgroup_size({WORKGROUP_SIZE})
@@ -657,13 +720,11 @@ mod tests {
             let types = NdWgsl::new(precision);
             for dimensions in [1usize, 4, 6, 8] {
                 let shape = vec![14usize; dimensions];
-                let sides = vec![2usize; dimensions];
-                let bins = vec![7usize; dimensions];
                 let position = position_wgsl(&shape, kernel, precision);
                 for stable in [false, true] {
-                    let count = generate_count_wgsl(types, &sides, &bins, stable, &position);
+                    let count = generate_count_wgsl(types, dimensions, stable, &position);
                     assert_valid_nd_wgsl(precision, &count);
-                    let prepare = generate_prepare_wgsl(types, &sides, &bins, stable, &position);
+                    let prepare = generate_prepare_wgsl(types, dimensions, stable, &position);
                     assert_valid_nd_wgsl(precision, &prepare);
                     assert_eq!(prepare.contains("rank = rank + 1u"), stable);
                     assert_eq!(prepare.contains("let start_0 = start_in_bin("), stable);
@@ -677,15 +738,9 @@ mod tests {
     fn count_shader_bins_axis_zero_fastest() {
         let kernel = EsKernel::for_tolerance(1.0e-3, 2.0).unwrap();
         let position = position_wgsl(&[16, 12, 10, 8], kernel, FftPrecision::F32);
-        let source = generate_count_wgsl(
-            NdWgsl::new(FftPrecision::F32),
-            &[4, 4, 2, 2],
-            &[4, 3, 5, 4],
-            true,
-            &position,
-        );
+        let source = generate_count_wgsl(NdWgsl::new(FftPrecision::F32), 4, true, &position);
         assert!(source.contains(
-            "let bin = start_0 / BIN_SIDE_0 + BINS_0 * (start_1 / BIN_SIDE_1 + BINS_1 * (start_2 / BIN_SIDE_2 + BINS_2 * (start_3 / BIN_SIDE_3)));"
+            "let bin = (start_0 >> shift_0) + bins_0 * ((start_1 >> shift_1) + bins_1 * ((start_2 >> shift_2) + bins_2 * ((start_3 >> shift_3))));"
         ));
         assert!(source.contains("atomicMax(&bin_counts[arrayLength(&bin_counts) - 1u], rank);"));
     }

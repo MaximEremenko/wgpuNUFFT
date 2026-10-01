@@ -148,7 +148,7 @@ impl Type1GpuPlanNd {
             device,
             kernel,
             fine_shape,
-            layout.bin_side(),
+            &layout.bin_shapes(),
             NdBinOrder::Stable,
             precision,
         )?;
@@ -301,6 +301,7 @@ impl Type1GpuPlanNd {
             point_count,
             points,
             point_bytes,
+            self.spread.choose_geometry(point_count),
             #[cfg(feature = "gpu-profiling")]
             GpuProfileQueryWriter::disabled(),
         )
@@ -548,6 +549,9 @@ impl Type1GpuPlanNd {
             )?,
             self.precision.complex_size_bytes(),
         )?;
+        // The geometry depends on the point count alone, so recorded points
+        // were binned in the one chosen here.
+        let geometry = self.spread.choose_geometry(point_count);
         if record_points {
             self.bins.encode(
                 device,
@@ -555,6 +559,7 @@ impl Type1GpuPlanNd {
                 point_count,
                 points,
                 point_bytes,
+                geometry,
                 #[cfg(feature = "gpu-profiling")]
                 profile,
             )?;
@@ -567,6 +572,7 @@ impl Type1GpuPlanNd {
             point_count,
             &prepared,
             self.bins.bin_offsets(),
+            geometry,
             strengths,
             strength_bytes,
             &self.fine_input,

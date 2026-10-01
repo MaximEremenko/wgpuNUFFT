@@ -52,6 +52,10 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bins as fine as single cells where a block's reach spans few bin rows.
   Type-1 plans spread faster in every rank, most in three to six
   dimensions.
+- Every type-1 execution now chooses its bins from the density of its
+  points: fine bins for dense point sets, coarser ones for sparse sets,
+  which then look up fewer bin rows per block and count and scan fewer
+  bins. Sparse point sets no longer pay for bins sized for dense ones.
 - Crowded blocks of the rank-generic spreader add the partial sums of
   their parts in two parallel passes, over fixed segments of parts and then
   over the segments in order, instead of one pass that walks every part of

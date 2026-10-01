@@ -20,7 +20,8 @@ struct ScanLevel {
     fixup_dispatch: (u32, u32, u32),
 }
 
-/// Fixed-length, reusable, out-of-place exclusive scan over `u32` values.
+/// Reusable, out-of-place exclusive scan over up to a planned count of `u32`
+/// values.
 ///
 /// Arithmetic follows WGSL `u32` wrapping semantics. Each workgroup scans
 /// 2,048 values in an 8.25 KiB bank-padded shared array, block sums are scanned
@@ -35,6 +36,7 @@ pub(crate) struct GpuExclusiveScanU32 {
     fixup_pipeline: wgpu::ComputePipeline,
     fixup_layout: wgpu::BindGroupLayout,
     max_storage_binding_bytes: u64,
+    max_workgroups_per_dimension: u32,
 }
 
 impl GpuExclusiveScanU32 {
@@ -74,39 +76,7 @@ impl GpuExclusiveScanU32 {
             create_compute_pipeline(device, "wgpu_nufft.scan.fixup", &generate_fixup_wgsl());
         let fixup_layout = fixup_pipeline.get_bind_group_layout(0);
 
-        let mut levels = Vec::new();
-        if length > 0 {
-            let mut level_length = length;
-            loop {
-                let block_count = level_length.div_ceil(BLOCK_ELEMENTS);
-                let block_workgroups =
-                    u32::try_from(block_count).map_err(|_| NufftError::LengthOverflow {
-                        context: "GPU exclusive scan block count",
-                    })?;
-                let fixup_workgroups = u32::try_from(
-                    level_length.div_ceil(WORKGROUP_SIZE as usize),
-                )
-                .map_err(|_| NufftError::LengthOverflow {
-                    context: "GPU exclusive scan fixup workgroup count",
-                })?;
-                levels.push(ScanLevel {
-                    length: level_length,
-                    block_count,
-                    block_dispatch: split_workgroups(
-                        block_workgroups,
-                        limits.max_compute_workgroups_per_dimension,
-                    )?,
-                    fixup_dispatch: split_workgroups(
-                        fixup_workgroups,
-                        limits.max_compute_workgroups_per_dimension,
-                    )?,
-                });
-                if block_count == 1 {
-                    break;
-                }
-                level_length = block_count;
-            }
-        }
+        let levels = scan_levels(length, limits.max_compute_workgroups_per_dimension)?;
 
         let mut block_sums = Vec::with_capacity(levels.len());
         for (index, level) in levels.iter().enumerate() {
@@ -154,10 +124,11 @@ impl GpuExclusiveScanU32 {
             fixup_pipeline,
             fixup_layout,
             max_storage_binding_bytes: limits.max_storage_buffer_binding_size,
+            max_workgroups_per_dimension: limits.max_compute_workgroups_per_dimension,
         })
     }
 
-    /// Encodes `output[i] = sum(input[0..i])` for the plan's fixed length.
+    /// Encodes `output[i] = sum(input[0..i])` for the plan's full length.
     pub(crate) fn encode(
         &self,
         device: &wgpu::Device,
@@ -165,10 +136,35 @@ impl GpuExclusiveScanU32 {
         input: &wgpu::Buffer,
         output: &wgpu::Buffer,
     ) -> Result<()> {
-        if self.length == 0 {
+        self.encode_prefix(device, recorder, input, output, self.length)
+    }
+
+    /// Encodes `output[i] = sum(input[0..i])` for the first `length` values,
+    /// at most the plan's length: every level of a shorter scan fits the
+    /// planned scratch.
+    pub(crate) fn encode_prefix(
+        &self,
+        device: &wgpu::Device,
+        recorder: &mut GpuRecorder<'_>,
+        input: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        length: usize,
+    ) -> Result<()> {
+        assert!(
+            length <= self.length,
+            "scan prefix beyond the planned length"
+        );
+        if length == 0 {
             return Ok(());
         }
-        let value_bytes = checked_bytes("GPU exclusive scan values", self.length)?;
+        let planned;
+        let levels = if length == self.length {
+            &self.levels
+        } else {
+            planned = scan_levels(length, self.max_workgroups_per_dimension)?;
+            &planned
+        };
+        let value_bytes = checked_bytes("GPU exclusive scan values", length)?;
         validate_storage_buffer(
             "exclusive scan input",
             input,
@@ -188,7 +184,7 @@ impl GpuExclusiveScanU32 {
             });
         }
 
-        for (level_index, level) in self.levels.iter().enumerate() {
+        for (level_index, level) in levels.iter().enumerate() {
             let level_input = if level_index == 0 {
                 input
             } else {
@@ -214,8 +210,8 @@ impl GpuExclusiveScanU32 {
             recorder.dispatch(&self.block_pipeline, &bind_group, level.block_dispatch);
         }
 
-        for level_index in (0..self.levels.len().saturating_sub(1)).rev() {
-            let level = &self.levels[level_index];
+        for level_index in (0..levels.len().saturating_sub(1)).rev() {
+            let level = &levels[level_index];
             let values = if level_index == 0 {
                 output
             } else {
@@ -242,6 +238,38 @@ impl GpuExclusiveScanU32 {
     fn level_lengths(&self) -> Vec<usize> {
         self.levels.iter().map(|level| level.length).collect()
     }
+}
+
+/// The levels of a scan of `length` values: every level scans the block sums
+/// of the one before, down to a single block.
+fn scan_levels(length: usize, max_workgroups_per_dimension: u32) -> Result<Vec<ScanLevel>> {
+    let mut levels = Vec::new();
+    if length == 0 {
+        return Ok(levels);
+    }
+    let mut level_length = length;
+    loop {
+        let block_count = level_length.div_ceil(BLOCK_ELEMENTS);
+        let block_workgroups =
+            u32::try_from(block_count).map_err(|_| NufftError::LengthOverflow {
+                context: "GPU exclusive scan block count",
+            })?;
+        let fixup_workgroups = u32::try_from(level_length.div_ceil(WORKGROUP_SIZE as usize))
+            .map_err(|_| NufftError::LengthOverflow {
+                context: "GPU exclusive scan fixup workgroup count",
+            })?;
+        levels.push(ScanLevel {
+            length: level_length,
+            block_count,
+            block_dispatch: split_workgroups(block_workgroups, max_workgroups_per_dimension)?,
+            fixup_dispatch: split_workgroups(fixup_workgroups, max_workgroups_per_dimension)?,
+        });
+        if block_count == 1 {
+            break;
+        }
+        level_length = block_count;
+    }
+    Ok(levels)
 }
 
 fn create_compute_pipeline(
@@ -640,13 +668,25 @@ mod tests {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let scan = GpuExclusiveScanU32::new(device, length).unwrap();
-        assert_eq!(scan.level_lengths(), level_lengths_for(length));
+        // Every other case scans a prefix of a longer plan.
+        let planned = if label.len().is_multiple_of(2) {
+            length
+        } else {
+            length * 3 + BLOCK_ELEMENTS
+        };
+        let scan = GpuExclusiveScanU32::new(device, planned).unwrap();
+        assert_eq!(scan.level_lengths(), level_lengths_for(planned));
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("wgpu_nufft.scan.test.encoder"),
         });
-        scan.encode(device, &mut GpuRecorder::new(&mut encoder), &input, &output)
-            .unwrap();
+        scan.encode_prefix(
+            device,
+            &mut GpuRecorder::new(&mut encoder),
+            &input,
+            &output,
+            length,
+        )
+        .unwrap();
         encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output_bytes);
         let submission = queue.submit([encoder.finish()]);
         let slice = readback.slice(..);
@@ -675,6 +715,6 @@ mod tests {
             let expected = exclusive_reference(input_values);
             assert_eq!(actual, expected, "{label}: exact exclusive scan mismatch");
         }
-        eprintln!("GPU_SCAN_EXACT label={label} length={length} ok");
+        eprintln!("GPU_SCAN_EXACT label={label} length={length} planned={planned} ok");
     }
 }

@@ -951,6 +951,7 @@ impl PerCellSpread2d {
             &self.scratch.bin_offsets,
             self.scratch.bin_offsets.size(),
             &self.scratch.large_bin_flag,
+            self.scratch.large_bin_flag.size(),
             &sorted_indices,
             point_count,
         )?;
