@@ -101,6 +101,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The checkout holds the tag without its annotation, whose message
+          # --notes-from-tag reads; fetch the annotated tag itself.
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
           gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --verify-tag --notes-from-tag --title "$GITHUB_REF_NAME"
           gh release upload "$GITHUB_REF_NAME" wgpu-web/dist/wgpu_web.js --clobber
