@@ -1,6 +1,6 @@
 [package]
 name = "wgpu-nufft-c"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 rust-version = "1.92"
 publish = false
@@ -14,4 +14,4 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 bytemuck = "1.22"
 pollster = "0.4"
-wgpu-nufft = { path = "..", version = "0.3.1" }
+wgpu-nufft = { path = "..", version = "0.3.2" }

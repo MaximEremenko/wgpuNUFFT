@@ -48,7 +48,7 @@ from [wgpu-fft](https://github.com/MaximEremenko/wgpuFFT), pinned here as the
 
 ```toml
 [dependencies]
-wgpu-nufft = { git = "https://github.com/MaximEremenko/wgpuNUFFT", tag = "v0.3.1" }
+wgpu-nufft = { git = "https://github.com/MaximEremenko/wgpuNUFFT", tag = "v0.3.2" }
 ```
 
 Cargo checks out the `wgpuFFT` submodule automatically. The default `cpu`

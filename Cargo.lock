@@ -1414,7 +1414,7 @@ dependencies = [
 
 [[package]]
 name = "wgpu-nufft"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bytemuck",
  "futures-channel",
@@ -1426,7 +1426,7 @@ dependencies = [
 
 [[package]]
 name = "wgpu-nufft-c"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bytemuck",
  "pollster",
@@ -1435,7 +1435,7 @@ dependencies = [
 
 [[package]]
 name = "wgpu-nufft-python"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bytemuck",
  "num-complex",
@@ -1465,7 +1465,7 @@ dependencies = [
 
 [[package]]
 name = "wgpu-web"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "bytemuck",
  "futures-channel",
