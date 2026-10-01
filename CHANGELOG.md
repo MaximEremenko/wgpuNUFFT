@@ -6,6 +6,23 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `wgpu-nufft-c` in `capi/`: a C interface declared by
+  `capi/include/wgpu_nufft.h`. Plans of type 1, 2, and 3 in one to eight
+  dimensions take host arrays, set their points once, and run batches of
+  transforms; one-call functions (`wgpu_nufft1d1` to `wgpu_nufft3d3`) keep
+  their plans for reuse. Double-precision arrays run in native `f64` where
+  the GPU supports it and in `Df64` elsewhere, single-precision arrays in
+  `f32`, and plans fall back to the CPU backend without a usable GPU. Type-3
+  plans take their bounds from the points.
+- A Fortran module, `fortran/wgpu_nufft.f90`, over the C interface: the
+  same plans and one-call routines on Fortran arrays, with
+  `fortran/build.py` to build and test it with gfortran or Intel ifx.
+- A MATLAB interface in `matlab/`: one-call functions `wgpunufft1d1` to
+  `wgpunufft3d3`, the `wgpunufft_plan` class, and a MEX gateway that
+  `build_wgpu_nufft` compiles for MATLAB R2018a or later.
+
 ### Fixed
 
 - Type-1 plans, and the outer spread of type-3 plans, compile their

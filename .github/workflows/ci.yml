@@ -45,6 +45,19 @@ jobs:
       - run: cargo test --locked --all-features
       - run: cargo test --locked --manifest-path wgpuFFT/Cargo.toml
 
+  # The Fortran interface over the C interface, with gfortran; hosted
+  # runners have no GPU, so plans run on the CPU backend.
+  fortran:
+    name: Fortran
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 fortran/build.py --compiler gfortran --run cpu
+
   msrv:
     name: Minimum Rust version
     runs-on: ubuntu-latest

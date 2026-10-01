@@ -1425,6 +1425,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpu-nufft-c"
+version = "0.3.0"
+dependencies = [
+ "bytemuck",
+ "pollster",
+ "wgpu-nufft",
+]
+
+[[package]]
 name = "wgpu-nufft-python"
 version = "0.3.0"
 dependencies = [

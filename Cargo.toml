@@ -1,6 +1,6 @@
 [workspace]
-members = ["wgpu-web", "python"]
-default-members = [".", "wgpu-web"]
+members = ["wgpu-web", "python", "capi"]
+default-members = [".", "wgpu-web", "capi"]
 exclude = ["wgpuFFT"]
 resolver = "2"
 

@@ -38,6 +38,9 @@ from [wgpu-fft](https://github.com/MaximEremenko/wgpuFFT), pinned here as the
   prepare point sets once for repeated transforms.
 - **Python and JavaScript**: a PyO3 + NumPy binding with the GPU and CPU
   plans, and a `wasm-bindgen` browser package.
+- **C, Fortran, and MATLAB**: a C library with plans and one-call
+  transforms on host arrays, and a Fortran module and MATLAB functions
+  over it.
 
 ## Installation
 
@@ -238,6 +241,32 @@ Multidimensional modes keep the NumPy shape `(*n_modes)`; the binding
 converts between C order and the dimension-zero-fast storage of the Rust
 core. See [python/README.md](python/README.md) for building, array shapes, and
 batches.
+
+## C, Fortran, and MATLAB
+
+[`capi/`](capi/README.md) builds `wgpu-nufft-c`, a C library (`cdylib` and
+`staticlib`) declared by [`capi/include/wgpu_nufft.h`](capi/include/wgpu_nufft.h).
+It takes host arrays: plans of type 1, 2, or 3 that set their points once
+and run batches of transforms, and one-call functions such as
+`wgpu_nufft2d1` that keep their plans for reuse. Double-precision arrays
+run in native `f64` on GPUs that have it and in `Df64` on others; single-
+precision arrays run in `f32`; the CPU backend serves machines without a
+usable GPU. Fourier modes are stored dimension one fastest, the column-major
+order of Fortran and MATLAB arrays, so they pass through unchanged.
+
+```c
+#include "wgpu_nufft.h"
+
+double f[2 * 32 * 32]; /* 32-by-32 complex modes, interleaved */
+int ier = wgpu_nufft2d1(M, x, y, c, +1, 1e-9, 32, 32, f, NULL);
+if (ier) fprintf(stderr, "%s
+", wgpu_nufft_last_error());
+```
+
+- [`fortran/`](fortran/README.md): the `wgpu_nufft` module (Fortran 2008,
+  `iso_c_binding`), tested with gfortran and Intel ifx.
+- [`matlab/`](matlab/README.md): `wgpunufft1d1` to `wgpunufft3d3`, the
+  `wgpunufft_plan` class, and a MEX gateway for MATLAB R2018a or later.
 
 ## Browser
 
@@ -508,6 +537,9 @@ wgpuNUFFT/
 |-- wgpuFFT/                pinned wgpu-fft submodule
 |-- wgpu-web/               browser package (wasm-bindgen)
 |-- python/                 Python binding (PyO3 + NumPy)
+|-- capi/                   C library and header
+|-- fortran/                Fortran module over the C library
+|-- matlab/                 MATLAB functions and MEX gateway
 `-- web/                    browser test harness
 ```
 

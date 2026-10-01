@@ -7,3 +7,6 @@ __pycache__/
 /python/wgpu_nufft/_native*.pyd
 /python/wgpu_nufft/_native*.pdb
 /AGENTS.md
+/fortran/build/
+/matlab/build/
+/matlab/private/*.mex*
