@@ -45,7 +45,7 @@ from [wgpu-fft](https://github.com/MaximEremenko/wgpuFFT), pinned here as the
 
 ```toml
 [dependencies]
-wgpu-nufft = { git = "https://github.com/MaximEremenko/wgpuNUFFT", tag = "v0.2.0" }
+wgpu-nufft = { git = "https://github.com/MaximEremenko/wgpuNUFFT", tag = "v0.3.0" }
 ```
 
 Cargo checks out the `wgpuFFT` submodule automatically. The default `cpu`
@@ -283,6 +283,12 @@ canaries in `wgpu-fft` check each backend's arithmetic: Vulkan and DX12 are
 tested, while Metal, whose shader compiler enables fast math by default, is
 untested. In the browser, `wgpu-web` runs all 96 canary words at start-up and
 disables only `Df64` if one fails.
+
+Creating a `Df64` plan compiles many long shaders. Vulkan builds them in
+seconds, but on DX12 with FXC, the shader compiler wgpu falls back to when
+no recent DXC library is installed, a `Df64` plan takes minutes, most of
+them in the `Df64` FFT shaders. On Windows, prefer Vulkan for `Df64` plans,
+and create them once and reuse them.
 
 ## Higher dimensions
 

@@ -6,6 +6,11 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-30
+
+GPU plans in up to eight dimensions, and one deterministic spreader for
+every type-1 plan, faster in every rank and for sparse and clustered points.
+
 ### Added
 
 - GPU plans in six, seven, and eight dimensions: `MAX_GPU_NUFFT_DIMENSIONS`
@@ -191,6 +196,7 @@ These affect code written against earlier development snapshots.
   device once every object of its context is freed, and Rust panics are
   reported through `console.error`.
 
-[Unreleased]: https://github.com/MaximEremenko/wgpuNUFFT/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/MaximEremenko/wgpuNUFFT/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/MaximEremenko/wgpuNUFFT/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MaximEremenko/wgpuNUFFT/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/MaximEremenko/wgpuNUFFT/releases/tag/v0.1.0
