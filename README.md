@@ -354,7 +354,9 @@ hold exactly those points; they are single cells along the axes above
 zero unless a block's reach would span too many of them. Each execution
 picks its bins from the density of its points: sparse point sets get
 coarser bins, which cost fewer lookups per block and fewer bins to count,
-at the price of reading some points outside the reach. Blocks with too
+at the price of reading some points outside the reach. The spreading
+shaders are compiled for a bin geometry when an execution first uses it, so
+the first execution of a plan takes longer than the next. Blocks with too
 many points in reach are split into parts added in a fixed order: a plan pass sizes the parts from the points listed
 in every crowded block's reach, with an exact sum that does not depend on
 the order in which the blocks were listed. Workgroup sizes and run lengths

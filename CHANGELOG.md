@@ -6,6 +6,15 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Type-1 plans, and the outer spread of type-3 plans, compile their
+  spreading shaders when an execution first needs them, for the bin
+  geometry it uses, with that geometry's bins as constants. 0.3.0 compiled
+  two variants of these shaders whenever a plan was created, which made the
+  first transform of a session slower than in 0.2.0; executions with bins
+  coarser than the finest also run slightly faster.
+
 ## [0.3.0] - 2026-09-30
 
 GPU plans in up to eight dimensions, and one deterministic spreader for
