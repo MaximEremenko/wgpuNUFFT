@@ -24,9 +24,10 @@
  *   type 2: c(j) = sum_k f(k) exp(i * isign * k . x(j))
  *   type 3: f(k) = sum_j c(j) exp(i * isign * s(k) . x(j))
  *
- * GPU plans share one device per process, created on first use; set the
- * WGPU_BACKEND environment variable (vulkan, dx12, metal) to pick a backend.
- * A plan may be used from one thread at a time.
+ * GPU plans share one device per process, created on first use on the
+ * adapter the options select (see "Adapter selection"); set the WGPU_BACKEND
+ * environment variable (vulkan, dx12, metal) to pick a backend. A plan may be
+ * used from one thread at a time.
  */
 #ifndef WGPU_NUFFT_H
 #define WGPU_NUFFT_H
@@ -68,16 +69,70 @@ extern "C" {
 #define WGPU_NUFFT_MODE_ORDER_CENTERED 0
 #define WGPU_NUFFT_MODE_ORDER_FFT 1
 
+/* Sizes of the adapter strings, the terminating NUL included. */
+#define WGPU_NUFFT_ADAPTER_NAME_SIZE 256
+#define WGPU_NUFFT_PCI_BUS_ID_SIZE 32
+
 typedef struct wgpu_nufft_opts {
     int32_t backend;    /* WGPU_NUFFT_BACKEND_*, default AUTO */
     int32_t precision;  /* WGPU_NUFFT_PRECISION_*, default AUTO */
     int32_t mode_order; /* WGPU_NUFFT_MODE_ORDER_*, default CENTERED */
     int32_t threads;    /* CPU threads; 0 uses every available thread */
     double sigma;       /* upsampling factor; 0 selects the default, 2 */
+    /* The GPU adapter of GPU plans (see "Adapter selection"); unset, the
+     * default, wgpu picks it, preferring a discrete GPU. */
+    int32_t adapter_index; /* k: the k-th adapter that matches; 0: unset */
+    char adapter_name[WGPU_NUFFT_ADAPTER_NAME_SIZE];     /* "": any name */
+    char adapter_pci_bus_id[WGPU_NUFFT_PCI_BUS_ID_SIZE]; /* "": any address */
 } wgpu_nufft_opts;
 
-/* Fills *opts with the defaults. A null opts pointer elsewhere means them. */
+/* Fills *opts with the defaults, all zero. A null opts pointer elsewhere
+ * means them. */
 void wgpu_nufft_default_opts(wgpu_nufft_opts *opts);
+
+/*
+ * Adapter selection. The adapter fields of wgpu_nufft_opts choose among the
+ * adapters wgpu_nufft_list_adapters() lists; CPU plans ignore them.
+ * - adapter_name matches an adapter's whole name, regardless of case and of
+ *   surrounding spaces. NVIDIA's Vulkan and DX12 drivers report the name
+ *   CUDA does (cudaDeviceProp.name).
+ * - adapter_pci_bus_id matches an adapter's PCI address,
+ *   [domain:]bus:device[.function] in hexadecimal, as cudaDeviceGetPCIBusId()
+ *   and nvidia-smi write it. Vulkan reports the address of every adapter;
+ *   DX12 gives identical cards the address of the first, and Metal none.
+ * - adapter_index k takes the k-th adapter, in the order of the list, among
+ *   those the name and the address match, or among all of them.
+ * Without an index, the matches of the first backend that lists any count
+ * (Vulkan before Metal and DX12; Windows lists a GPU under both Vulkan and
+ * DX12), and must be a single adapter: identical cards need an index or an
+ * address. A selection that matches no adapter fails with
+ * WGPU_NUFFT_ERROR_GPU_UNAVAILABLE, with the automatic backend too: plans
+ * never fall back to the CPU for want of the selected adapter.
+ *
+ * The device is created on the adapter of the first GPU plan. Later plans
+ * without a selection share it; a plan that selects another adapter fails
+ * with WGPU_NUFFT_ERROR_INVALID_ARGUMENT until wgpu_nufft_shutdown().
+ */
+
+/* An adapter of wgpu_nufft_list_adapters(); strings are NUL-terminated. */
+typedef struct wgpu_nufft_adapter {
+    char name[WGPU_NUFFT_ADAPTER_NAME_SIZE]; /* such as "NVIDIA GeForce RTX 4090" */
+    char backend[16];                        /* "Vulkan", "Metal" or "Dx12" */
+    /* "DiscreteGpu", "IntegratedGpu", "VirtualGpu", "Cpu" or "Other" */
+    char device_type[16];
+    /* such as "0000:01:00.0", or "" where the backend does not report it */
+    char pci_bus_id[WGPU_NUFFT_PCI_BUS_ID_SIZE];
+    int32_t is_default; /* 1 for the adapter wgpu picks without a selection */
+} wgpu_nufft_adapter;
+
+/*
+ * Lists the GPU adapters, in the order adapter_index counts them: writes the
+ * first min(capacity, *count) to adapters and sets *count to the number of
+ * adapters. adapters may be null when capacity is 0, so that a first call can
+ * size the array. Each call enumerates the adapters anew without creating a
+ * device; a machine without any lists none.
+ */
+int wgpu_nufft_list_adapters(wgpu_nufft_adapter *adapters, int32_t capacity, int32_t *count);
 
 /* The message of the last error on this thread; valid until the next call. */
 const char *wgpu_nufft_last_error(void);
@@ -86,7 +141,7 @@ const char *wgpu_nufft_last_error(void);
 const char *wgpu_nufft_version(void);
 
 /* The GPU that plans run on, such as "<adapter name> (Vulkan)", or an empty
- * string without one. Creates the shared device on first use. */
+ * string without one. Without a device, creates one on the default adapter. */
 const char *wgpu_nufft_gpu_name(void);
 
 /* Releases the shared GPU device and the plans the one-call functions keep

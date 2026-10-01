@@ -38,16 +38,42 @@ module wgpu_nufft
     integer, parameter, public :: WGPU_NUFFT_MODE_ORDER_CENTERED = 0
     integer, parameter, public :: WGPU_NUFFT_MODE_ORDER_FFT = 1
 
+    ! Sizes of the adapter strings, the terminating NUL included.
+    integer, parameter, public :: WGPU_NUFFT_ADAPTER_NAME_SIZE = 256
+    integer, parameter, public :: WGPU_NUFFT_PCI_BUS_ID_SIZE = 32
+
     ! wgpu_nufft_opts of the C interface; the defaults select the GPU when
     ! there is one, its best double arithmetic, centered modes, every CPU
-    ! thread and an upsampling factor of 2.
+    ! thread and an upsampling factor of 2. wgpu_nufft_set_adapter() selects
+    ! the GPU adapter, which wgpu picks by default.
     type, bind(c), public :: wgpu_nufft_opts
         integer(c_int32_t) :: backend = 0
         integer(c_int32_t) :: precision = 0
         integer(c_int32_t) :: mode_order = 0
         integer(c_int32_t) :: threads = 0
         real(c_double) :: sigma = 0.0_c_double
+        integer(c_int32_t) :: adapter_index = 0
+        character(kind=c_char) :: adapter_name(WGPU_NUFFT_ADAPTER_NAME_SIZE) = c_null_char
+        character(kind=c_char) :: adapter_pci_bus_id(WGPU_NUFFT_PCI_BUS_ID_SIZE) = c_null_char
     end type wgpu_nufft_opts
+
+    ! A GPU adapter, as wgpu_nufft_adapters() lists it.
+    type, public :: wgpu_nufft_adapter
+        character(len=:), allocatable :: name        ! such as "NVIDIA GeForce RTX 4090"
+        character(len=:), allocatable :: backend     ! "Vulkan", "Metal" or "Dx12"
+        character(len=:), allocatable :: device_type ! "DiscreteGpu", "IntegratedGpu", ...
+        character(len=:), allocatable :: pci_bus_id  ! such as "0000:01:00.0", or ""
+        logical :: is_default = .false.              ! wgpu's pick without a selection
+    end type wgpu_nufft_adapter
+
+    ! wgpu_nufft_adapter of the C interface.
+    type, bind(c) :: c_adapter
+        character(kind=c_char) :: name(WGPU_NUFFT_ADAPTER_NAME_SIZE)
+        character(kind=c_char) :: backend(16)
+        character(kind=c_char) :: device_type(16)
+        character(kind=c_char) :: pci_bus_id(WGPU_NUFFT_PCI_BUS_ID_SIZE)
+        integer(c_int32_t) :: is_default
+    end type c_adapter
 
     ! Plans for double- and single-precision arrays.
     type, public :: wgpu_nufft_plan
@@ -59,7 +85,7 @@ module wgpu_nufft
     end type wgpu_nufftf_plan
 
     public :: wgpu_nufft_error_message, wgpu_nufft_version, wgpu_nufft_gpu_name
-    public :: wgpu_nufft_shutdown
+    public :: wgpu_nufft_shutdown, wgpu_nufft_adapters, wgpu_nufft_set_adapter
     public :: wgpu_nufft_makeplan, wgpu_nufft_setpts, wgpu_nufft_setpts_nd
     public :: wgpu_nufft_execute, wgpu_nufft_destroy
     public :: wgpu_nufft_plan_backend, wgpu_nufft_plan_precision
@@ -97,6 +123,15 @@ module wgpu_nufft
 
         subroutine c_shutdown() bind(c, name="wgpu_nufft_shutdown")
         end subroutine c_shutdown
+
+        function c_list_adapters(adapters, capacity, count) &
+                bind(c, name="wgpu_nufft_list_adapters") result(ier)
+            import :: c_ptr, c_int32_t, c_int
+            type(c_ptr), value :: adapters
+            integer(c_int32_t), value :: capacity
+            integer(c_int32_t) :: count
+            integer(c_int) :: ier
+        end function c_list_adapters
 
         ! Both families share these signatures; the pointers carry the type.
         function c_makeplan(kind, dim, n_modes, isign, ntrans, eps, plan, opts) &
@@ -229,6 +264,74 @@ contains
     subroutine wgpu_nufft_shutdown()
         call c_shutdown()
     end subroutine wgpu_nufft_shutdown
+
+    ! The GPU adapters, in the order adapter_index counts them; none without
+    ! a GPU.
+    subroutine wgpu_nufft_adapters(adapters, ier)
+        type(wgpu_nufft_adapter), allocatable, intent(out) :: adapters(:)
+        integer, intent(out) :: ier
+        type(c_adapter), allocatable, target :: listed(:)
+        integer(c_int32_t) :: count
+        integer :: i, total
+        total = 0
+        ier = c_list_adapters(c_null_ptr, 0_c_int32_t, count)
+        if (ier == WGPU_NUFFT_SUCCESS .and. count > 0) then
+            allocate (listed(count))
+            ier = c_list_adapters(c_loc(listed(1)), int(size(listed), c_int32_t), count)
+            if (ier == WGPU_NUFFT_SUCCESS) total = min(int(count), size(listed))
+        end if
+        allocate (adapters(total))
+        do i = 1, total
+            adapters(i)%name = chars_string(listed(i)%name)
+            adapters(i)%backend = chars_string(listed(i)%backend)
+            adapters(i)%device_type = chars_string(listed(i)%device_type)
+            adapters(i)%pci_bus_id = chars_string(listed(i)%pci_bus_id)
+            adapters(i)%is_default = listed(i)%is_default /= 0
+        end do
+    end subroutine wgpu_nufft_adapters
+
+    ! Selects the GPU adapter of GPU plans: by name, such as the name CUDA
+    ! reports for a device; by PCI address, such as "0000:01:00.0"; and index,
+    ! the index-th adapter that matches (0 for none). Arguments left out keep
+    ! their values; empty strings clear them. See wgpu_nufft.h for the rules.
+    subroutine wgpu_nufft_set_adapter(opts, name, pci_bus_id, index)
+        type(wgpu_nufft_opts), intent(inout) :: opts
+        character(len=*), intent(in), optional :: name, pci_bus_id
+        integer, intent(in), optional :: index
+        if (present(name)) call to_chars(trim(name), opts%adapter_name)
+        if (present(pci_bus_id)) call to_chars(trim(pci_bus_id), opts%adapter_pci_bus_id)
+        if (present(index)) opts%adapter_index = int(index, c_int32_t)
+    end subroutine wgpu_nufft_set_adapter
+
+    ! text with a terminating NUL; text too long for chars leaves none, which
+    ! the library rejects.
+    subroutine to_chars(text, chars)
+        character(len=*), intent(in) :: text
+        character(kind=c_char), intent(out) :: chars(:)
+        integer :: i
+        chars = c_null_char
+        do i = 1, min(len(text), size(chars))
+            chars(i) = text(i:i)
+        end do
+    end subroutine to_chars
+
+    ! The text of a NUL-terminated character array.
+    function chars_string(chars) result(string)
+        character(kind=c_char), intent(in) :: chars(:)
+        character(len=:), allocatable :: string
+        integer :: i, length
+        length = size(chars)
+        do i = 1, size(chars)
+            if (chars(i) == c_null_char) then
+                length = i - 1
+                exit
+            end if
+        end do
+        allocate (character(len=length) :: string)
+        do i = 1, length
+            string(i:i) = chars(i)
+        end do
+    end function chars_string
 
     function opts_pointer(opts) result(pointer)
         type(wgpu_nufft_opts), intent(in), optional, target :: opts

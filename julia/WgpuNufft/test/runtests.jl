@@ -110,5 +110,44 @@ direct3(c, coords, iflag, targets) =
         @test occursin("3*pi", error.message)
         @test_throws WgpuNufftError Plan(1, (0,), 1)
     end
+
+    @testset "adapters" begin
+        # The layouts of the C structures.
+        @test sizeof(WgpuNufft.Opts) == 320
+        @test sizeof(WgpuNufft.CAdapter) == 324
+        defaults = WgpuNufft.Opts()
+        @test defaults.adapter_index == 0 && all(iszero, defaults.adapter_name)
+
+        listed = WgpuNufft.adapters()
+        foreach(a -> @info("adapter", a), listed)
+        @test all(a -> !isempty(a.name) && !isempty(a.backend), listed)
+        @test count(a -> a.is_default, listed) == min(length(listed), 1)
+
+        # A missing adapter throws, with the automatic backend too; CPU plans
+        # ignore the selection.
+        missing_adapter = try
+            nufft1d1(x, c, 1, 1e-6, ms; backend = :auto, adapter_name = "No Such Adapter 7f3a")
+            nothing
+        catch e
+            e
+        end
+        @test missing_adapter isa WgpuNufftError
+        @test missing_adapter.code == 3
+        @test occursin("No Such Adapter 7f3a", missing_adapter.message)
+        f = nufft1d1(x, c, 1, TOL, ms; backend = :cpu, adapter_name = "No Such Adapter 7f3a")
+        @test relerr(f, direct1(c, (x,), 1, (ms,))) < 10TOL
+        @test_throws ArgumentError WgpuNufft.Opts(adapter_name = "a"^256)
+
+        if BACKEND == :gpu
+            # The default adapter by name; the index tells identical cards apart.
+            position = findfirst(a -> a.is_default, listed)
+            name = listed[position].name
+            index = count(a -> a.name == name, listed[1:position])
+            f = nufft1d1(x, c, 1, TOL, ms; backend = :gpu, adapter_name = name,
+                         adapter_index = index)
+            @test relerr(f, direct1(c, (x,), 1, (ms,))) < 10TOL
+            @test startswith(WgpuNufft.gpu_name(), name)
+        end
+    end
     WgpuNufft.shutdown()
 end

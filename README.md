@@ -252,7 +252,10 @@ and run batches of transforms, and one-call functions such as
 run in native `f64` on GPUs that have it and in `Df64` on others; single-
 precision arrays run in `f32`; the CPU backend serves machines without a
 usable GPU. Fourier modes are stored dimension one fastest, the column-major
-order of Fortran and MATLAB arrays, so they pass through unchanged.
+order of Fortran and MATLAB arrays, so they pass through unchanged. The
+options can select the GPU adapter by name, PCI address, or index, among
+those `wgpu_nufft_list_adapters()` lists, such as the GPU a CUDA program
+already uses.
 
 ```c
 #include "wgpu_nufft.h"

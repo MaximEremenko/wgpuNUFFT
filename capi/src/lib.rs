@@ -7,6 +7,7 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+mod adapter;
 mod cache;
 mod error;
 mod gpu;
@@ -15,14 +16,37 @@ mod plan;
 use std::ffi::{c_char, CString};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
+use adapter::AdapterSelection;
 use error::{call, invalid, Result};
 use plan::{Data, Kind, Plan, Spec};
 
-pub use plan::Opts;
+pub use plan::{Opts, ADAPTER_NAME_SIZE, PCI_BUS_ID_SIZE};
 
 /// A plan behind a C handle, for either array type.
 pub struct Handle {
     plan: Plan,
+}
+
+/// `wgpu_nufft_adapter`: the strings are NUL-terminated `char` arrays in C.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Adapter {
+    pub name: [u8; ADAPTER_NAME_SIZE],
+    pub backend: [u8; 16],
+    pub device_type: [u8; 16],
+    pub pci_bus_id: [u8; PCI_BUS_ID_SIZE],
+    pub is_default: i32,
+}
+
+/// `text` in a NUL-terminated array, cut at a character boundary to fit.
+fn c_text<const N: usize>(text: &str) -> [u8; N] {
+    let mut end = text.len().min(N - 1);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bytes = [0; N];
+    bytes[..end].copy_from_slice(&text.as_bytes()[..end]);
+    bytes
 }
 
 /// The element types of the two families of functions.
@@ -321,13 +345,48 @@ pub extern "C" fn wgpu_nufft_version() -> *const c_char {
 #[no_mangle]
 pub extern "C" fn wgpu_nufft_gpu_name() -> *const c_char {
     static NAME: Mutex<Option<CString>> = Mutex::new(None);
-    let name = std::panic::catch_unwind(|| gpu::context().map(|context| context.name.clone()))
-        .ok()
-        .and_then(|name| name.ok())
-        .unwrap_or_default();
+    let name = std::panic::catch_unwind(|| {
+        gpu::context(&AdapterSelection::default()).map(|context| context.name.clone())
+    })
+    .ok()
+    .and_then(|name| name.ok())
+    .unwrap_or_default();
     let mut slot = NAME.lock().unwrap_or_else(PoisonError::into_inner);
     let name = slot.insert(CString::new(name.replace('\0', " ")).unwrap_or_default());
     name.as_ptr()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn wgpu_nufft_list_adapters(
+    adapters: *mut Adapter,
+    capacity: i32,
+    count: *mut i32,
+) -> i32 {
+    call(|| {
+        let count = count
+            .as_mut()
+            .ok_or_else(|| invalid("the count pointer is null"))?;
+        *count = 0;
+        let capacity = usize::try_from(capacity)
+            .map_err(|_| invalid(format!("capacity must not be negative, not {capacity}")))?;
+        if capacity > 0 && adapters.is_null() {
+            return Err(invalid("adapters is null"));
+        }
+        let listed = adapter::listed();
+        for (position, (info, is_default)) in listed.iter().take(capacity).enumerate() {
+            // SAFETY: the caller provides `capacity` entries, which may be
+            // uninitialized, so they are written without being read.
+            adapters.add(position).write(Adapter {
+                name: c_text(&info.name),
+                backend: c_text(&format!("{:?}", info.backend)),
+                device_type: c_text(&format!("{:?}", info.device_type)),
+                pci_bus_id: c_text(&info.device_pci_bus_id),
+                is_default: i32::from(*is_default),
+            });
+        }
+        *count = i32::try_from(listed.len()).unwrap_or(i32::MAX);
+        Ok(())
+    })
 }
 
 #[no_mangle]

@@ -74,6 +74,35 @@ catch failure
     assert(contains(failure.message, '3*pi'), failure.message);
     fprintf('errors: ok, %s\n', failure.message);
 end
+
+% The adapters; a selection that matches none is an error, with the
+% automatic backend too, and CPU plans ignore it.
+adapters = wgpunufft_adapters();
+for k = 1:numel(adapters)
+    fprintf('adapter %d: %s (%s, %s) %s\n', k, adapters(k).name, adapters(k).backend, ...
+        adapters(k).device_type, adapters(k).pci_bus_id);
+end
+assert(sum([adapters.is_default]) == min(numel(adapters), 1));
+missing = struct('backend', 'auto', 'adapter_name', 'No Such Adapter 7f3a');
+try
+    wgpunufft1d1(x, c, 1, 1e-6, ms, missing);
+    error('wgpunufft:test', 'a missing adapter was accepted');
+catch failure
+    assert(contains(failure.message, 'No Such Adapter 7f3a'), failure.message);
+    fprintf('adapters: ok, %s\n', failure.message);
+end
+missing.backend = 'cpu';
+f = wgpunufft1d1(x, c, 1, 1e-12, ms, missing);
+check('1d1 on the CPU with a missing adapter', f, direct1(c, {x}, 1, ms), 1e-11);
+chosen = find([adapters.is_default]);
+if ~strcmp(backend, 'cpu') && ~isempty(chosen)
+    % The default adapter by name; the index tells identical cards apart.
+    named.backend = 'gpu';
+    named.adapter_name = adapters(chosen).name;
+    named.adapter_index = sum(strcmp({adapters(1:chosen).name}, named.adapter_name));
+    f = wgpunufft1d1(x, c, 1, tol, ms, named);
+    check('1d1 by adapter name', f, direct1(c, {x}, 1, ms), 10 * tol);
+end
 wgpunufft_shutdown();
 fprintf('all checks passed\n');
 end

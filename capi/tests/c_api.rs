@@ -4,9 +4,11 @@
 use std::f64::consts::PI;
 use std::ffi::CStr;
 use std::ptr;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use wgpu_nufft_c::*;
 
+const BACKEND_AUTO: i32 = 0;
 const BACKEND_GPU: i32 = 1;
 const BACKEND_CPU: i32 = 2;
 const PRECISION_F64: i32 = 1;
@@ -29,6 +31,93 @@ fn last_error() -> String {
 
 fn check(code: i32) {
     assert_eq!(code, 0, "call failed: {}", last_error());
+}
+
+/// Tests that create or select the process's GPU device take turns.
+fn device_lock() -> MutexGuard<'static, ()> {
+    static DEVICE: Mutex<()> = Mutex::new(());
+    DEVICE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn gpu_tests_enabled(name: &str) -> bool {
+    let enabled = std::env::var_os("WGPU_FFT_RUN_GPU_TESTS").is_some();
+    if !enabled {
+        eprintln!("skipping {name}; set WGPU_FFT_RUN_GPU_TESTS=1 to run it");
+    }
+    enabled
+}
+
+fn set_text(field: &mut [u8], text: &str) {
+    field.fill(0);
+    field[..text.len()].copy_from_slice(text.as_bytes());
+}
+
+fn text(field: &[u8]) -> String {
+    CStr::from_bytes_until_nul(field)
+        .expect("a NUL-terminated field")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn gpu_name() -> String {
+    unsafe { CStr::from_ptr(wgpu_nufft_gpu_name()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn list_adapters() -> Vec<Adapter> {
+    let mut count = 0;
+    check(unsafe { wgpu_nufft_list_adapters(ptr::null_mut(), 0, &mut count) });
+    // Uninitialized entries, which the library only writes.
+    let mut adapters = Vec::with_capacity(count as usize);
+    let mut listed = 0;
+    unsafe {
+        check(wgpu_nufft_list_adapters(
+            adapters.as_mut_ptr(),
+            count,
+            &mut listed,
+        ));
+        adapters.set_len(listed.min(count) as usize);
+    }
+    adapters
+}
+
+/// How `wgpu_nufft_gpu_name` names the device on `adapter`.
+fn label(adapter: &Adapter) -> String {
+    format!("{} ({})", text(&adapter.name), text(&adapter.backend))
+}
+
+/// A 1D type-1 transform with `options` against the direct sum, or the
+/// error code.
+fn type1_with(options: &Opts) -> Result<(), i32> {
+    let mut rng = Rng(0xada);
+    let x = rng.values(40, PI);
+    let c = rng.values(2 * 40, 1.0);
+    let mut f = vec![0.0; 2 * 16];
+    let code = unsafe {
+        wgpu_nufft1d1(
+            40,
+            x.as_ptr(),
+            c.as_ptr(),
+            1,
+            1e-6,
+            16,
+            f.as_mut_ptr(),
+            options,
+        )
+    };
+    if code != 0 {
+        return Err(code);
+    }
+    let error = relative_error(&f, &direct_type1(&[&x], &c, 1.0, &[16]));
+    assert!(error < 1e-5, "1d1 with a selected adapter: {error:e}");
+    Ok(())
+}
+
+/// The 1-based position of `adapters[position]` among the adapters for
+/// which `same` holds.
+fn index_among(adapters: &[Adapter], position: usize, same: impl Fn(&Adapter) -> bool) -> i32 {
+    adapters[..=position].iter().filter(|&a| same(a)).count() as i32
 }
 
 struct Rng(u64);
@@ -418,14 +507,184 @@ fn errors_are_reported_with_messages() {
 }
 
 #[test]
-fn gpu_backend_matches_direct_sums() {
-    if std::env::var_os("WGPU_FFT_RUN_GPU_TESTS").is_none() {
-        eprintln!("skipping the GPU C-interface test; set WGPU_FFT_RUN_GPU_TESTS=1 to run it");
+fn options_default_to_no_adapter() {
+    let mut options = Opts {
+        adapter_index: 5,
+        ..Opts::default()
+    };
+    set_text(&mut options.adapter_name, "NVIDIA GeForce RTX 4090");
+    unsafe { wgpu_nufft_default_opts(&mut options) };
+    assert_eq!(options, Opts::default());
+    assert_eq!(options.adapter_index, 0);
+    assert!(options.adapter_name.iter().all(|&byte| byte == 0));
+    assert!(options.adapter_pci_bus_id.iter().all(|&byte| byte == 0));
+    // The layouts the header, Fortran, MATLAB and Julia share.
+    assert_eq!(std::mem::size_of::<Opts>(), 320);
+    assert_eq!(std::mem::offset_of!(Opts, adapter_index), 24);
+    assert_eq!(std::mem::offset_of!(Opts, adapter_name), 28);
+    assert_eq!(std::mem::offset_of!(Opts, adapter_pci_bus_id), 284);
+    assert_eq!(std::mem::size_of::<Adapter>(), 324);
+}
+
+#[test]
+fn adapters_are_listed() {
+    let adapters = list_adapters();
+    for adapter in &adapters {
+        eprintln!(
+            "adapter: {} {} [{}]{}",
+            label(adapter),
+            text(&adapter.device_type),
+            text(&adapter.pci_bus_id),
+            if adapter.is_default == 1 {
+                ", default"
+            } else {
+                ""
+            }
+        );
+        assert!(!text(&adapter.name).is_empty());
+        assert!(!text(&adapter.backend).is_empty());
+        assert!(!text(&adapter.device_type).is_empty());
+    }
+    let defaults = adapters.iter().filter(|a| a.is_default == 1).count();
+    assert_eq!(defaults, usize::from(!adapters.is_empty()));
+    unsafe {
+        // A short array takes the first adapters and the full count.
+        if let Some(&first) = adapters.first() {
+            let mut one = [first];
+            one[0].name = [0; ADAPTER_NAME_SIZE];
+            let mut count = 0;
+            check(wgpu_nufft_list_adapters(one.as_mut_ptr(), 1, &mut count));
+            assert_eq!((one[0], count as usize), (first, adapters.len()));
+        }
+        let mut count = 0;
+        assert_eq!(
+            wgpu_nufft_list_adapters(ptr::null_mut(), 0, ptr::null_mut()),
+            1
+        );
+        assert_eq!(wgpu_nufft_list_adapters(ptr::null_mut(), 1, &mut count), 1);
+        assert_eq!(wgpu_nufft_list_adapters(ptr::null_mut(), -1, &mut count), 1);
+        assert!(last_error().contains("capacity"), "{}", last_error());
+    }
+}
+
+#[test]
+fn a_missing_adapter_is_an_error_without_a_cpu_fallback() {
+    let _device = device_lock();
+    let mut options = opts(BACKEND_AUTO, 0);
+    set_text(&mut options.adapter_name, "No Such Adapter 7f3a");
+    let makeplan = |options: &Opts| unsafe {
+        let mut plan = ptr::null_mut();
+        let code = wgpu_nufft_makeplan(1, 1, [8i64].as_ptr(), 1, 1, 1e-6, &mut plan, options);
+        let backend = wgpu_nufft_plan_backend(plan);
+        wgpu_nufft_destroy(plan);
+        (code, backend)
+    };
+    assert_eq!(makeplan(&options), (3, -1));
+    assert!(
+        last_error().contains("no GPU adapter matches name \"No Such Adapter 7f3a\""),
+        "{}",
+        last_error()
+    );
+    // The one-call functions, and asking again.
+    assert_eq!(type1_with(&options), Err(3));
+    assert_eq!(makeplan(&options), (3, -1));
+    assert!(last_error().contains("7f3a"), "{}", last_error());
+    let mut beyond = opts(BACKEND_GPU, 0);
+    beyond.adapter_index = 10_000;
+    assert_eq!(makeplan(&beyond).0, 3);
+    assert!(last_error().contains("index 10000"), "{}", last_error());
+
+    // CPU plans ignore the selection, but not a malformed one.
+    options.backend = BACKEND_CPU;
+    assert_eq!(makeplan(&options), (0, BACKEND_CPU));
+    let mut unterminated = options;
+    unterminated.adapter_name = [b'a'; ADAPTER_NAME_SIZE];
+    assert_eq!(makeplan(&unterminated).0, 1);
+    assert!(last_error().contains("adapter_name"), "{}", last_error());
+    let mut address = options;
+    set_text(&mut address.adapter_pci_bus_id, "slot 3");
+    assert_eq!(makeplan(&address).0, 1);
+    assert!(last_error().contains("PCI address"), "{}", last_error());
+    let mut negative = options;
+    negative.adapter_index = -1;
+    assert_eq!(makeplan(&negative).0, 1);
+    assert!(last_error().contains("adapter_index"), "{}", last_error());
+}
+
+#[test]
+fn adapters_are_selected_by_name_index_and_address() {
+    if !gpu_tests_enabled("the GPU adapter-selection test") {
         return;
     }
-    let name = unsafe { CStr::from_ptr(wgpu_nufft_gpu_name()) }
-        .to_string_lossy()
-        .into_owned();
+    let _device = device_lock();
+    wgpu_nufft_shutdown();
+    let adapters = list_adapters();
+    let default = adapters
+        .iter()
+        .position(|a| a.is_default == 1)
+        .expect("no GPU adapter");
+    let chosen = &adapters[default];
+    let name = text(&chosen.name);
+
+    // Without a selection, the device is on the adapter the list marks.
+    assert_eq!(gpu_name(), label(chosen));
+    type1_with(&opts(BACKEND_GPU, 0)).unwrap();
+    wgpu_nufft_shutdown();
+
+    // By name, regardless of case; an index tells identical cards apart.
+    let mut by_name = opts(BACKEND_AUTO, 0);
+    set_text(&mut by_name.adapter_name, &name.to_uppercase());
+    by_name.adapter_index = index_among(&adapters, default, |a| text(&a.name) == name);
+    type1_with(&by_name).unwrap();
+    assert_eq!(gpu_name(), label(chosen));
+    // The device serves plans without a selection, and other selections of
+    // its adapter: its position alone, and its address.
+    type1_with(&opts(BACKEND_GPU, 0)).unwrap();
+    let mut by_index = opts(BACKEND_GPU, 0);
+    by_index.adapter_index = default as i32 + 1;
+    type1_with(&by_index).unwrap();
+    let address = text(&chosen.pci_bus_id);
+    if !address.is_empty() {
+        let mut by_address = opts(BACKEND_GPU, 0);
+        set_text(&mut by_address.adapter_pci_bus_id, &address);
+        by_address.adapter_index =
+            index_among(&adapters, default, |a| text(&a.pci_bus_id) == address);
+        type1_with(&by_address).unwrap();
+    }
+
+    // Another adapter waits for the device to go.
+    if let Some(other) = (0..adapters.len()).find(|&position| position != default) {
+        let mut by_other = opts(BACKEND_GPU, 0);
+        by_other.adapter_index = other as i32 + 1;
+        assert_eq!(type1_with(&by_other), Err(1));
+        assert!(
+            last_error().contains("wgpu_nufft_shutdown"),
+            "{}",
+            last_error()
+        );
+        wgpu_nufft_shutdown();
+        match type1_with(&by_other) {
+            Ok(()) => assert_eq!(gpu_name(), label(&adapters[other])),
+            Err(code) => {
+                assert_ne!(code, 1, "{}", last_error());
+                eprintln!(
+                    "{} serves no plan: {}",
+                    label(&adapters[other]),
+                    last_error()
+                );
+            }
+        }
+    }
+    wgpu_nufft_shutdown();
+}
+
+#[test]
+fn gpu_backend_matches_direct_sums() {
+    if !gpu_tests_enabled("the GPU C-interface test") {
+        return;
+    }
+    let _device = device_lock();
+    let name = gpu_name();
     assert!(!name.is_empty(), "no GPU");
     eprintln!("GPU: {name}");
     // The best double arithmetic of this device, and Df64 in any case.

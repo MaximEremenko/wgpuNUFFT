@@ -1,6 +1,7 @@
 //! Plans over host memory, on the shared GPU device or on the CPU.
 
 use std::f64::consts::PI;
+use std::ffi::CStr;
 use std::sync::Arc;
 
 use wgpu_nufft::{
@@ -9,6 +10,7 @@ use wgpu_nufft::{
     MAX_NUFFT_DIMENSIONS,
 };
 
+use crate::adapter::{AdapterSelection, PciAddress};
 use crate::error::{invalid, Error, Result};
 use crate::gpu::{self, BufferSlot, GpuContext, OutputSlots};
 
@@ -21,18 +23,81 @@ pub(crate) const PRECISION_F64: i32 = 1;
 pub(crate) const PRECISION_DF64: i32 = 2;
 pub(crate) const PRECISION_F32: i32 = 3;
 
-/// `wgpu_nufft_opts`.
+/// Bytes of `wgpu_nufft_opts.adapter_name`, the terminating NUL included.
+pub const ADAPTER_NAME_SIZE: usize = 256;
+/// Bytes of `wgpu_nufft_opts.adapter_pci_bus_id`, the terminating NUL included.
+pub const PCI_BUS_ID_SIZE: usize = 32;
+
+/// `wgpu_nufft_opts`; the strings are NUL-terminated `char` arrays in C.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Opts {
     pub backend: i32,
     pub precision: i32,
     pub mode_order: i32,
     pub threads: i32,
     pub sigma: f64,
+    pub adapter_index: i32,
+    pub adapter_name: [u8; ADAPTER_NAME_SIZE],
+    pub adapter_pci_bus_id: [u8; PCI_BUS_ID_SIZE],
+}
+
+/// All zero, which C callers may rely on.
+impl Default for Opts {
+    fn default() -> Self {
+        Self {
+            backend: BACKEND_AUTO,
+            precision: PRECISION_AUTO,
+            mode_order: 0,
+            threads: 0,
+            sigma: 0.0,
+            adapter_index: 0,
+            adapter_name: [0; ADAPTER_NAME_SIZE],
+            adapter_pci_bus_id: [0; PCI_BUS_ID_SIZE],
+        }
+    }
+}
+
+/// The text of a NUL-terminated `char` array field.
+fn text_field<'a>(bytes: &'a [u8], name: &str) -> Result<&'a str> {
+    CStr::from_bytes_until_nul(bytes)
+        .map_err(|_| {
+            invalid(format!(
+                "{name} must end with a NUL within its {} bytes",
+                bytes.len()
+            ))
+        })?
+        .to_str()
+        .map_err(|_| invalid(format!("{name} must be UTF-8")))
 }
 
 impl Opts {
+    fn adapter_selection(&self) -> Result<AdapterSelection> {
+        let index = u32::try_from(self.adapter_index).map_err(|_| {
+            invalid(format!(
+                "adapter_index must not be negative, not {}",
+                self.adapter_index
+            ))
+        })?;
+        let address = text_field(&self.adapter_pci_bus_id, "adapter_pci_bus_id")?.trim();
+        let pci_bus_id = if address.is_empty() {
+            None
+        } else {
+            Some(PciAddress::parse(address).ok_or_else(|| {
+                invalid(format!(
+                    "adapter_pci_bus_id \"{address}\" is not a PCI address such as 0000:01:00.0"
+                ))
+            })?)
+        };
+        Ok(AdapterSelection {
+            name: text_field(&self.adapter_name, "adapter_name")?
+                .trim()
+                .to_owned(),
+            pci_bus_id,
+            index,
+        })
+    }
+
     fn validate(&self) -> Result<()> {
         if !(BACKEND_AUTO..=BACKEND_CPU).contains(&self.backend) {
             return Err(invalid(format!("unknown backend option {}", self.backend)));
@@ -96,7 +161,10 @@ pub(crate) struct Spec {
     pub(crate) ntrans: usize,
     pub(crate) eps: f64,
     pub(crate) data: Data,
+    /// The options, with the adapter fields cleared: they are in `adapter`,
+    /// where equal selections compare equal.
     pub(crate) opts: Opts,
+    pub(crate) adapter: AdapterSelection,
 }
 
 impl Spec {
@@ -112,6 +180,13 @@ impl Spec {
         opts: Opts,
     ) -> Result<Self> {
         opts.validate()?;
+        let adapter = opts.adapter_selection()?;
+        let opts = Opts {
+            adapter_index: 0,
+            adapter_name: [0; ADAPTER_NAME_SIZE],
+            adapter_pci_bus_id: [0; PCI_BUS_ID_SIZE],
+            ..opts
+        };
         let dimensions = usize::try_from(dimensions)
             .ok()
             .filter(|d| (1..=MAX_NUFFT_DIMENSIONS).contains(d))
@@ -154,6 +229,7 @@ impl Spec {
             eps,
             data,
             opts,
+            adapter,
         })
     }
 
@@ -329,13 +405,20 @@ fn on_gpu<T>(context: &GpuContext, work: impl FnOnce() -> Result<T>) -> Result<T
 impl Plan {
     pub(crate) fn new(spec: Spec) -> Result<Self> {
         let mode_count = spec.mode_count()?;
+        let selection = &spec.adapter;
         let engine = match spec.opts.backend {
             BACKEND_CPU => Engine::Cpu(Box::new(cpu_engine(&spec)?)),
-            BACKEND_GPU => Engine::Gpu(Box::new(gpu_engine(&spec, gpu::context()?)?)),
-            _ => match gpu::context().and_then(|context| gpu_engine(&spec, context)) {
-                Ok(engine) => Engine::Gpu(Box::new(engine)),
-                // The CPU backend serves what the GPU cannot.
-                Err(gpu_error) => Engine::Cpu(Box::new(cpu_engine(&spec).map_err(|_| gpu_error)?)),
+            BACKEND_GPU => Engine::Gpu(Box::new(gpu_engine(&spec, gpu::context(selection)?)?)),
+            _ => match gpu::context(selection) {
+                // A selected adapter is never traded for the CPU.
+                Err(error) if !selection.is_default() => return Err(error),
+                context => match context.and_then(|context| gpu_engine(&spec, context)) {
+                    Ok(engine) => Engine::Gpu(Box::new(engine)),
+                    // The CPU backend serves what the GPU cannot.
+                    Err(gpu_error) => {
+                        Engine::Cpu(Box::new(cpu_engine(&spec).map_err(|_| gpu_error)?))
+                    }
+                },
             },
         };
         Ok(Self {

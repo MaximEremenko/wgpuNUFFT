@@ -58,9 +58,79 @@ wgpu_nufft_destroy(plan);
   one-call functions keep.
 - A plan may be used from one thread at a time.
 
+## Selecting the GPU
+
+Unless the options select an adapter, wgpu picks it, preferring a discrete
+GPU. On a machine with several GPUs, three fields of `wgpu_nufft_opts`
+select one, for instance the GPU a CUDA program already uses:
+
+```c
+/* The GPU of CUDA device `device`: its name, and its PCI address, which tells
+ * identical cards apart. */
+struct cudaDeviceProp properties;
+cudaGetDeviceProperties(&properties, device);
+wgpu_nufft_opts opts;
+wgpu_nufft_default_opts(&opts);
+snprintf(opts.adapter_name, sizeof opts.adapter_name, "%s", properties.name);
+cudaDeviceGetPCIBusId(opts.adapter_pci_bus_id, sizeof opts.adapter_pci_bus_id, device);
+```
+
+- `adapter_name` matches an adapter's whole name, regardless of case and of
+  surrounding spaces. NVIDIA's Vulkan and DX12 drivers report the name CUDA
+  does.
+- `adapter_pci_bus_id` matches the PCI address, `[domain:]bus:device[.function]`
+  in hexadecimal, as `cudaDeviceGetPCIBusId()` and nvidia-smi write it.
+  Vulkan reports every adapter's address; DX12 gives identical cards the
+  address of the first, and Metal reports none, so an address selects
+  reliably on Vulkan, the backend wgpu tries first.
+- `adapter_index` = k takes the k-th adapter, in the order of
+  `wgpu_nufft_list_adapters()`, among those the name and the address match,
+  or among all of them; 0 leaves it unset, so a zero-filled `wgpu_nufft_opts`
+  still means the defaults.
+- Without an index, the matches of the first backend that lists any count:
+  Windows lists a GPU under Vulkan and under DX12, and Vulkan comes first.
+  They must be one adapter; identical cards need the address or an index.
+- A selection that matches no adapter fails with
+  `WGPU_NUFFT_ERROR_GPU_UNAVAILABLE`, whose message lists the adapters, also
+  with the automatic backend: plans never fall back to the CPU for want of
+  the selected adapter. CPU plans ignore the selection.
+- The device is created on the adapter of the first GPU plan. Plans without
+  a selection share it, and a plan that selects another adapter fails with
+  `WGPU_NUFFT_ERROR_INVALID_ARGUMENT` until `wgpu_nufft_shutdown()`.
+  `wgpu_nufft_gpu_name()` creates the device on the default adapter when
+  there is none, so call it after the first plan.
+
+`wgpu_nufft_list_adapters()` lists the adapters with their backend, device
+type, PCI address, and which one is the default:
+
+```c
+int32_t count = 0;
+wgpu_nufft_list_adapters(NULL, 0, &count);
+wgpu_nufft_adapter *adapters = calloc(count, sizeof *adapters);
+wgpu_nufft_list_adapters(adapters, count, &count);
+for (int32_t i = 0; i < count; i++)
+    printf("%d. %s (%s, %s) %s%s\n", i + 1, adapters[i].name, adapters[i].backend,
+           adapters[i].device_type, adapters[i].pci_bus_id,
+           adapters[i].is_default ? " default" : "");
+```
+
+On a workstation with one NVIDIA card and an Intel iGPU under Windows, that
+prints:
+
+```text
+1. NVIDIA RTX 5000 Ada Generation (Vulkan, DiscreteGpu) 0000:01:00.0 default
+2. Intel(R) UHD Graphics 770 (Vulkan, IntegratedGpu)
+3. NVIDIA RTX 5000 Ada Generation (Dx12, DiscreteGpu) 0000:01:00.0
+4. Intel(R) UHD Graphics 770 (Dx12, IntegratedGpu) 0000:00:02.0
+5. Microsoft Basic Render Driver (Dx12, Cpu)
+```
+
 ## Tests
 
 ```sh
 cargo test -p wgpu-nufft-c                       # CPU
 WGPU_FFT_RUN_GPU_TESTS=1 cargo test -p wgpu-nufft-c  # CPU and GPU
 ```
+
+The GPU tests include adapter selection by name, index, and address, and a
+selection of another adapter while the device exists.

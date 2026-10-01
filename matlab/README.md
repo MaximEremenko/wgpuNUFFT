@@ -38,3 +38,13 @@ F = plan.execute(C);   % C: M-by-ntrans, F: ms-by-mt-by-ntrans
 - The one-call functions keep their plans, so repeated calls with the same
   sizes are fast; `wgpunufft_shutdown` releases them and the GPU device.
 - `wgpunufft_info` names the GPU in use.
+- GPU plans run on the adapter wgpu picks unless `opts.adapter_name`,
+  `opts.adapter_pci_bus_id`, or `opts.adapter_index` select one;
+  `wgpunufft_adapters` lists them. A selection that matches no adapter is an
+  error, never a fallback to the CPU;
+  [`../capi/README.md`](../capi/README.md#selecting-the-gpu) has the rules.
+
+```matlab
+adapters = wgpunufft_adapters();   % name, backend, device_type, pci_bus_id, is_default
+f = wgpunufft2d1(x, y, c, +1, 1e-9, ms, mt, struct('adapter_name', 'NVIDIA GeForce RTX 4090'));
+```

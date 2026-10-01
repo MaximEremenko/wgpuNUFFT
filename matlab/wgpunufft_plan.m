@@ -29,6 +29,16 @@ classdef wgpunufft_plan < handle
 %   modeord    0 for centered modes (default), 1 for FFT order
 %   threads    CPU threads, 0 for all (default)
 %   sigma      upsampling factor, 0 for the default 2
+%   adapter_name        the GPU adapter by name, such as the name CUDA
+%                       reports for a device; unset, wgpu picks the adapter
+%   adapter_pci_bus_id  the GPU adapter by PCI address, such as '0000:01:00.0'
+%   adapter_index       the adapter_index-th adapter that matches, in the
+%                       order of wgpunufft_adapters; tells identical cards apart
+%
+% A selected adapter that does not exist is an error, with the automatic
+% backend too; CPU plans ignore the selection. The process has one GPU
+% device, on the adapter of its first GPU plan: selecting another adapter is
+% an error until wgpunufft_shutdown.
 %
 % plan.backend and plan.arithmetic report what the plan runs on.
 

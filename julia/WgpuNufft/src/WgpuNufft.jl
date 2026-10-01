@@ -95,6 +95,9 @@ shutdown() = (ccall(symbol(:wgpu_nufft_shutdown), Cvoid, ()); nothing)
 # --------------------------------------------------------------------------
 # Options
 
+const ADAPTER_NAME_SIZE = 256
+const PCI_BUS_ID_SIZE = 32
+
 """`wgpu_nufft_opts` of the C interface."""
 struct Opts
     backend::Int32
@@ -102,6 +105,9 @@ struct Opts
     mode_order::Int32
     threads::Int32
     sigma::Float64
+    adapter_index::Int32
+    adapter_name::NTuple{ADAPTER_NAME_SIZE,UInt8}
+    adapter_pci_bus_id::NTuple{PCI_BUS_ID_SIZE,UInt8}
 end
 
 const BACKENDS = (auto = 0, gpu = 1, cpu = 2)
@@ -117,13 +123,67 @@ Options, as keywords of every transform and of `Plan`:
 - `modeord`: 0 for centered modes (default), 1 for FFT order
 - `threads`: CPU threads, 0 for all (default)
 - `sigma`: upsampling factor, 0 for the default 2
+- `adapter_name`, `adapter_pci_bus_id`, `adapter_index`: the GPU adapter of
+  GPU plans, by name (such as the name CUDA reports for a device), by PCI
+  address (such as `"0000:01:00.0"`) and by index among the adapters that
+  match, as [`adapters`](@ref) lists them; unset, wgpu picks the adapter. A
+  selection that matches no adapter throws, with the automatic backend too.
 """
 function Opts(; backend::Symbol = :auto, precision::Symbol = :auto, modeord::Integer = 0,
-              threads::Integer = 0, sigma::Real = 0.0)
+              threads::Integer = 0, sigma::Real = 0.0, adapter_name::AbstractString = "",
+              adapter_pci_bus_id::AbstractString = "", adapter_index::Integer = 0)
     haskey(BACKENDS, backend) || throw(ArgumentError("backend must be one of $(keys(BACKENDS))"))
     haskey(PRECISIONS, precision) ||
         throw(ArgumentError("precision must be one of $(keys(PRECISIONS))"))
-    return Opts(BACKENDS[backend], PRECISIONS[precision], modeord, threads, sigma)
+    return Opts(BACKENDS[backend], PRECISIONS[precision], modeord, threads, sigma, adapter_index,
+                c_chars(adapter_name, ADAPTER_NAME_SIZE, "adapter_name"),
+                c_chars(adapter_pci_bus_id, PCI_BUS_ID_SIZE, "adapter_pci_bus_id"))
+end
+
+"""`text` as a NUL-terminated array of `size` bytes."""
+function c_chars(text::AbstractString, size::Int, name::String)
+    bytes = codeunits(String(text))
+    length(bytes) < size || throw(ArgumentError("$name must be shorter than $size bytes"))
+    0x00 in bytes && throw(ArgumentError("$name must not contain NUL"))
+    return ntuple(i -> i <= length(bytes) ? bytes[i] : 0x00, size)
+end
+
+"""The text of a NUL-terminated byte array."""
+function c_string(chars)
+    bytes = collect(UInt8, chars)
+    return String(bytes[1:something(findfirst(iszero, bytes), length(bytes) + 1)-1])
+end
+
+# --------------------------------------------------------------------------
+# Adapters
+
+"""`wgpu_nufft_adapter` of the C interface."""
+struct CAdapter
+    name::NTuple{ADAPTER_NAME_SIZE,UInt8}
+    backend::NTuple{16,UInt8}
+    device_type::NTuple{16,UInt8}
+    pci_bus_id::NTuple{PCI_BUS_ID_SIZE,UInt8}
+    is_default::Int32
+end
+
+"""
+    adapters()
+
+The GPU adapters, in the order the `adapter_index` option counts them, as
+named tuples: `name`, `backend` (`"Vulkan"`, `"Metal"` or `"Dx12"`),
+`device_type` (`"DiscreteGpu"`, `"IntegratedGpu"`, ...), `pci_bus_id` (`""`
+where the backend does not report it) and `is_default`, true for the adapter
+wgpu picks without a selection. Empty without a GPU.
+"""
+function adapters()
+    list = symbol(:wgpu_nufft_list_adapters)
+    count = Ref{Int32}(0)
+    check(ccall(list, Cint, (Ptr{CAdapter}, Int32, Ref{Int32}), C_NULL, 0, count))
+    listed = Vector{CAdapter}(undef, count[])
+    check(ccall(list, Cint, (Ptr{CAdapter}, Int32, Ref{Int32}), listed, length(listed), count))
+    return [(name = c_string(a.name), backend = c_string(a.backend),
+             device_type = c_string(a.device_type), pci_bus_id = c_string(a.pci_bus_id),
+             is_default = a.is_default != 0) for a in listed[1:min(Int(count[]), length(listed))]]
 end
 
 # --------------------------------------------------------------------------

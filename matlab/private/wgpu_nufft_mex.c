@@ -10,11 +10,13 @@
  *   [backend, precision] = wgpu_nufft_mex('planinfo', h)
  *   o = wgpu_nufft_mex('simple', type, X, in, isign, eps, modes_or_S, opts)
  *   [version, gpu] = wgpu_nufft_mex('info')
+ *   a = wgpu_nufft_mex('adapters')    the GPU adapters, a struct array
  *       wgpu_nufft_mex('shutdown')    releases the device and the kept plans
  *
- * opts is [backend precision mode_order threads sigma], or empty for the
- * defaults. Handles are uint64 values checked against the live plans, so a
- * stale handle raises an error instead of crashing MATLAB.
+ * opts is a struct with the fields of wgpu_nufft_opts, as wgpunufft_options
+ * makes it, or empty for the defaults. Handles are uint64 values checked
+ * against the live plans, so a stale handle raises an error instead of
+ * crashing MATLAB.
  */
 #include <stdint.h>
 #include <string.h>
@@ -64,22 +66,56 @@ static double scalar(const mxArray *array, const char *name) {
     return mxGetScalar(array);
 }
 
+static const mxArray *option(const mxArray *opts, const char *name) {
+    const mxArray *value = mxGetField(opts, 0, name);
+    if (value == NULL) {
+        mexErrMsgIdAndTxt("wgpunufft:input", "the options lack the field %s", name);
+    }
+    return value;
+}
+
+/* Copies a character-vector option into a NUL-terminated field of size
+ * bytes, in UTF-8. */
+static void text_option(const mxArray *opts, const char *name, char *field, size_t size) {
+    const mxArray *value = option(opts, name);
+    char *text;
+    field[0] = '\0';
+    if (mxIsEmpty(value)) {
+        return;
+    }
+    if (!mxIsChar(value)) {
+        mexErrMsgIdAndTxt("wgpunufft:input", "opts.%s must be a character vector", name);
+    }
+    text = mxArrayToUTF8String(value);
+    if (text == NULL || strlen(text) >= size) {
+        if (text != NULL) {
+            mxFree(text);
+        }
+        mexErrMsgIdAndTxt("wgpunufft:input", "opts.%s must be shorter than %d bytes", name,
+                          (int)size);
+    }
+    memcpy(field, text, strlen(text) + 1);
+    mxFree(text);
+}
+
 static wgpu_nufft_opts options(const mxArray *array) {
     wgpu_nufft_opts opts;
-    const double *values;
     wgpu_nufft_default_opts(&opts);
     if (array == NULL || mxIsEmpty(array)) {
         return opts;
     }
-    if (!mxIsDouble(array) || mxIsComplex(array) || mxGetNumberOfElements(array) != 5) {
-        mexErrMsgIdAndTxt("wgpunufft:input", "the options must be a double vector of 5 values");
+    if (!mxIsStruct(array) || mxGetNumberOfElements(array) != 1) {
+        mexErrMsgIdAndTxt("wgpunufft:input", "the options must be a struct");
     }
-    values = mxGetDoubles(array);
-    opts.backend = (int32_t)values[0];
-    opts.precision = (int32_t)values[1];
-    opts.mode_order = (int32_t)values[2];
-    opts.threads = (int32_t)values[3];
-    opts.sigma = values[4];
+    opts.backend = (int32_t)scalar(option(array, "backend"), "opts.backend");
+    opts.precision = (int32_t)scalar(option(array, "precision"), "opts.precision");
+    opts.mode_order = (int32_t)scalar(option(array, "mode_order"), "opts.mode_order");
+    opts.threads = (int32_t)scalar(option(array, "threads"), "opts.threads");
+    opts.sigma = scalar(option(array, "sigma"), "opts.sigma");
+    opts.adapter_index = (int32_t)scalar(option(array, "adapter_index"), "opts.adapter_index");
+    text_option(array, "adapter_name", opts.adapter_name, sizeof opts.adapter_name);
+    text_option(array, "adapter_pci_bus_id", opts.adapter_pci_bus_id,
+                sizeof opts.adapter_pci_bus_id);
     return opts;
 }
 
@@ -443,6 +479,35 @@ static void simple(mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
     check(code, "transform");
 }
 
+/* The GPU adapters as an n-by-1 struct array. */
+static void list_adapters(mxArray *plhs[]) {
+    static const char *fields[] = {"name", "backend", "device_type", "pci_bus_id", "is_default"};
+    wgpu_nufft_adapter *adapters = NULL;
+    int32_t count = 0, capacity, i;
+    check(wgpu_nufft_list_adapters(NULL, 0, &count), "list adapters");
+    capacity = count;
+    if (capacity > 0) {
+        adapters = (wgpu_nufft_adapter *)mxCalloc((mwSize)capacity, sizeof *adapters);
+        check(wgpu_nufft_list_adapters(adapters, capacity, &count), "list adapters");
+        if (count > capacity) {
+            count = capacity;
+        }
+    } else {
+        count = 0;
+    }
+    plhs[0] = mxCreateStructMatrix((mwSize)count, 1, 5, fields);
+    for (i = 0; i < count; i++) {
+        mxSetField(plhs[0], i, "name", mxCreateString(adapters[i].name));
+        mxSetField(plhs[0], i, "backend", mxCreateString(adapters[i].backend));
+        mxSetField(plhs[0], i, "device_type", mxCreateString(adapters[i].device_type));
+        mxSetField(plhs[0], i, "pci_bus_id", mxCreateString(adapters[i].pci_bus_id));
+        mxSetField(plhs[0], i, "is_default", mxCreateLogicalScalar(adapters[i].is_default != 0));
+    }
+    if (adapters != NULL) {
+        mxFree(adapters);
+    }
+}
+
 void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
     char command[16];
     if (!at_exit_registered) {
@@ -469,6 +534,8 @@ void mexFunction(int nlhs, mxArray *plhs[], int nrhs, const mxArray *prhs[]) {
         if (nlhs > 1) {
             plhs[1] = mxCreateString(wgpu_nufft_gpu_name());
         }
+    } else if (strcmp(command, "adapters") == 0) {
+        list_adapters(plhs);
     } else if (strcmp(command, "shutdown") == 0) {
         /* Live plans keep the device until they are deleted. */
         wgpu_nufft_shutdown();

@@ -6,6 +6,41 @@ project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+GPU adapter selection in the C, Fortran, MATLAB, and Julia interfaces. The
+size of `wgpu_nufft_opts` changes, which breaks the C ABI: the next release
+is 0.4.0.
+
+### Added
+
+- `wgpu_nufft_opts` selects the GPU adapter of GPU plans with
+  `adapter_name`, matched whole and regardless of case (the name CUDA
+  reports for a device, for one), `adapter_pci_bus_id`, a PCI address such
+  as `0000:01:00.0`, and `adapter_index`, the k-th of the adapters that
+  match, which tells identical cards apart. Left unset, as in a zero-filled
+  structure, wgpu picks the adapter as before. A selection that matches no
+  adapter fails with `WGPU_NUFFT_ERROR_GPU_UNAVAILABLE` and a list of the
+  adapters, also with the automatic backend, instead of falling back to the
+  CPU; one that matches several adapters of a backend is an invalid
+  argument.
+- `wgpu_nufft_list_adapters()` lists the adapters with their name, backend,
+  device type, PCI address, and whether wgpu picks it by default.
+- The Fortran module's `wgpu_nufft_set_adapter` and `wgpu_nufft_adapters`,
+  MATLAB's `opts.adapter_name`, `opts.adapter_pci_bus_id`,
+  `opts.adapter_index`, and `wgpunufft_adapters`, and the Julia package's
+  keywords of the same names and `WgpuNufft.adapters()` expose them.
+
+### Changed
+
+- **Breaking:** `wgpu_nufft_opts` grows from 24 to 320 bytes, so C and C++
+  code must be rebuilt against the new header, and other bindings that copy
+  the structure need its new fields.
+- The process's GPU device is created on the adapter of its first GPU plan.
+  A later plan that selects another adapter fails with
+  `WGPU_NUFFT_ERROR_INVALID_ARGUMENT` until `wgpu_nufft_shutdown()`; plans
+  without a selection share the device as before.
+- The MATLAB MEX gateway takes its options as a struct with the fields of
+  `wgpu_nufft_opts` rather than a vector of five numbers.
+
 ## [0.3.2] - 2026-10-01
 
 A Julia package.

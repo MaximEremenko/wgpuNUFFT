@@ -5,22 +5,60 @@ use std::sync::{mpsc, Arc, Mutex, PoisonError};
 
 use wgpu_nufft::{wgpu, DoubleFloat, FftPrecision};
 
-use crate::error::{Error, Result};
+use crate::adapter::{self, AdapterSelection};
+use crate::error::{invalid, Error, Result};
 
 pub(crate) struct GpuContext {
-    _instance: wgpu::Instance,
+    instance: wgpu::Instance,
     _adapter: wgpu::Adapter,
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     /// The first wgpu error raised outside an error scope, which the next
     /// guarded operation reports instead of wgpu's default panic.
     uncaptured_error: Arc<Mutex<Option<String>>>,
+    info: wgpu::AdapterInfo,
+    /// Selections known to name this device's adapter.
+    selections: Mutex<Vec<AdapterSelection>>,
     pub(crate) name: String,
 }
 
 impl GpuContext {
     pub(crate) fn supports_f64(&self) -> bool {
         self.device.features().contains(wgpu::Features::SHADER_F64)
+    }
+
+    /// Checks that `selection` names this device's adapter; no selection
+    /// takes the device there is.
+    fn check_selection(&self, selection: &AdapterSelection) -> Result<()> {
+        if selection.is_default() {
+            return Ok(());
+        }
+        let mut known = self
+            .selections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if known.contains(selection) {
+            return Ok(());
+        }
+        let infos = adapter::infos(&self.instance);
+        let chosen = &infos[adapter::resolve(&infos, selection)?];
+        if *chosen != self.info {
+            return Err(invalid(format!(
+                "the GPU device of this process runs on {}, but {selection} selects {}; \
+                 call wgpu_nufft_shutdown() before selecting another adapter",
+                self.name,
+                adapter::label(chosen)
+            )));
+        }
+        if infos.iter().filter(|&info| *info == self.info).count() > 1 {
+            return Err(invalid(format!(
+                "{selection} selects one of several identical adapters, and the GPU device of \
+                 this process may run on another; select the adapter in the options of the \
+                 first GPU plan, or call wgpu_nufft_shutdown() first"
+            )));
+        }
+        known.push(selection.clone());
+        Ok(())
     }
 }
 
@@ -32,41 +70,62 @@ impl Drop for GpuContext {
     }
 }
 
-/// The shared device, or why there is none. A failed request is remembered,
-/// so plans that fall back to the CPU do not ask for an adapter every time.
-static CONTEXT: Mutex<Option<std::result::Result<Arc<GpuContext>, String>>> = Mutex::new(None);
+/// The shared device, or why there is none.
+enum Slot {
+    Empty,
+    Ready(Arc<GpuContext>),
+    /// A failed request, remembered so that plans that fall back to the CPU
+    /// do not ask for an adapter every time; another selection asks again.
+    Failed(AdapterSelection, Error),
+}
 
-pub(crate) fn context() -> Result<Arc<GpuContext>> {
+static CONTEXT: Mutex<Slot> = Mutex::new(Slot::Empty);
+
+/// The shared device, created on the adapter `selection` names when there is
+/// none. A device on another adapter is an error, not a fallback.
+pub(crate) fn context(selection: &AdapterSelection) -> Result<Arc<GpuContext>> {
     let mut slot = CONTEXT.lock().unwrap_or_else(PoisonError::into_inner);
-    if slot.is_none() {
-        *slot = Some(create_context().map(Arc::new));
+    match &*slot {
+        Slot::Ready(context) => {
+            context.check_selection(selection)?;
+            return Ok(Arc::clone(context));
+        }
+        Slot::Failed(failed, error) if failed == selection => return Err(error.clone()),
+        _ => {}
     }
-    match slot.as_ref() {
-        Some(Ok(context)) => Ok(Arc::clone(context)),
-        Some(Err(reason)) => Err(Error::GpuUnavailable(reason.clone())),
-        None => Err(Error::Internal("GPU context slot is empty".to_owned())),
+    match create_context(selection) {
+        Ok(context) => {
+            let context = Arc::new(context);
+            *slot = Slot::Ready(Arc::clone(&context));
+            Ok(context)
+        }
+        Err(error) => {
+            *slot = Slot::Failed(selection.clone(), error.clone());
+            Err(error)
+        }
     }
 }
 
 /// Forgets the shared device; plans that hold it keep it alive.
 pub(crate) fn release_context() {
-    CONTEXT
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take();
+    *CONTEXT.lock().unwrap_or_else(PoisonError::into_inner) = Slot::Empty;
 }
 
-fn create_context() -> std::result::Result<GpuContext, String> {
-    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-    descriptor.backends = wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12;
-    let instance = wgpu::Instance::new(descriptor.with_env());
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        force_fallback_adapter: false,
-        apply_limit_buckets: false,
-        compatible_surface: None,
-    }))
-    .map_err(|error| format!("no GPU adapter: {error}"))?;
+fn create_context(selection: &AdapterSelection) -> Result<GpuContext> {
+    let instance = adapter::instance();
+    let adapter = if selection.is_default() {
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+            compatible_surface: None,
+        }))
+        .map_err(|error| Error::GpuUnavailable(format!("no GPU adapter: {error}")))?
+    } else {
+        let mut adapters = adapter::adapters(&instance);
+        let infos: Vec<_> = adapters.iter().map(wgpu::Adapter::get_info).collect();
+        adapters.swap_remove(adapter::resolve(&infos, selection)?)
+    };
     let required_features = adapter.features() & wgpu::Features::SHADER_F64;
     let descriptor = |limits: wgpu::Limits| wgpu::DeviceDescriptor {
         label: Some("wgpu_nufft.c.device"),
@@ -83,9 +142,9 @@ fn create_context() -> std::result::Result<GpuContext, String> {
                 adapter.request_device(&descriptor(wgpu::Limits::default())),
             )
             .map_err(|default_error| {
-                format!(
+                Error::GpuUnavailable(format!(
                     "GPU device request failed at the adapter's limits ({maximum_error}) and at the defaults ({default_error})"
-                )
+                ))
             })?,
         };
     // wgpu's default handler panics on errors outside an error scope.
@@ -98,12 +157,14 @@ fn create_context() -> std::result::Result<GpuContext, String> {
     }));
     let info = adapter.get_info();
     Ok(GpuContext {
-        _instance: instance,
+        instance,
         _adapter: adapter,
         device,
         queue,
         uncaptured_error,
-        name: format!("{} ({:?})", info.name, info.backend),
+        name: adapter::label(&info),
+        info,
+        selections: Mutex::new(vec![selection.clone()]),
     })
 }
 

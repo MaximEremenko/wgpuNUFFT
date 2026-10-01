@@ -36,6 +36,20 @@ call wgpu_nufft_destroy(plan)
 Plans of more than three dimensions take their points as an array
 `points(dim, M)` through `wgpu_nufft_setpts_nd`.
 
+GPU plans run on the adapter wgpu picks unless the options select one, by
+name (such as the name CUDA reports for a device), by PCI address, and by
+index among the matching adapters; `wgpu_nufft_adapters` lists them. A
+selection that matches no adapter is an error, never a fallback to the CPU;
+[`../capi/README.md`](../capi/README.md#selecting-the-gpu) has the rules.
+
+```fortran
+type(wgpu_nufft_adapter), allocatable :: adapters(:)
+type(wgpu_nufft_opts) :: opts
+call wgpu_nufft_adapters(adapters, ier)   ! name, backend, device_type, pci_bus_id, is_default
+call wgpu_nufft_set_adapter(opts, name="NVIDIA GeForce RTX 4090")
+call wgpu_nufft2d1(M, x, y, c, +1, 1d-9, ms, mt, f, ier, opts)
+```
+
 ## Building and testing
 
 ```sh

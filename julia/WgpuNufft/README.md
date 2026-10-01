@@ -37,7 +37,18 @@ F = execute(plan, C)    # C: M × ntrans, F: ms × mt × ntrans
   (about 44-48 bits) on others; `Float32` arrays run in f32.
 - Keywords of every transform and of `Plan`: `backend` (`:auto`, `:gpu`,
   `:cpu`), `precision` (`:auto`, `:f64`, `:df64`, `:f32`), `modeord`,
-  `threads`, `sigma`.
+  `threads`, `sigma`, and the GPU adapter: `adapter_name`,
+  `adapter_pci_bus_id`, `adapter_index`.
+- GPU plans run on the adapter wgpu picks unless the keywords select one, by
+  name (such as the name CUDA reports for a device), by PCI address, and by
+  index among the matching adapters; `WgpuNufft.adapters()` lists them. A
+  selection that matches no adapter throws, never falls back to the CPU;
+  [`capi/README.md`](../../capi/README.md#selecting-the-gpu) has the rules.
+
+```julia
+WgpuNufft.adapters()   # name, backend, device_type, pci_bus_id, is_default
+f = nufft2d1(x, y, c, 1, 1e-9, ms, mt; adapter_name = "NVIDIA GeForce RTX 4090")
+```
 - Plans of more than three dimensions take a `dim × M` matrix:
   `setpts!(plan, X)`.
 - The one-call functions keep their plans between calls with the same sizes;

@@ -60,6 +60,7 @@ program test_wgpu_nufft
     call plan_with_batch()
     call single_precision()
     call errors()
+    call adapter_selection()
 
     call wgpu_nufft_shutdown()
     if (failures > 0) then
@@ -243,5 +244,71 @@ contains
         end if
         call wgpu_nufft_destroy(plan)
     end subroutine errors
+
+    ! The adapter list; a selection that matches no adapter, an error even
+    ! with the automatic backend; and on the GPU, the default adapter by name.
+    subroutine adapter_selection()
+        type(wgpu_nufft_adapter), allocatable :: adapters(:)
+        type(wgpu_nufft_opts) :: selected
+        type(wgpu_nufft_plan) :: plan
+        integer :: i, j, same, defaults
+        call wgpu_nufft_adapters(adapters, ier)
+        call expect_success("adapters")
+        defaults = 0
+        do i = 1, size(adapters)
+            print "(a, i0, 8a)", "adapter ", i, ": ", adapters(i)%name, " (", &
+                adapters(i)%backend, ", ", adapters(i)%device_type, ") ", adapters(i)%pci_bus_id
+            if (adapters(i)%is_default) defaults = defaults + 1
+        end do
+        ! The defaults select no adapter, in the layout of the C structure.
+        if (defaults /= min(size(adapters), 1) .or. selected%adapter_index /= 0 &
+                .or. any(selected%adapter_name /= c_null_char) .or. c_sizeof(selected) /= 320) then
+            print "(a, i0, a, i0)", "adapters: default adapters ", defaults, &
+                ", options of bytes ", c_sizeof(selected)
+            failures = failures + 1
+        end if
+
+        call wgpu_nufft_set_adapter(selected, name="No Such Adapter 7f3a")
+        call wgpu_nufft_makeplan(1, 1, [8_c_int64_t], 1, 1, 1.0d-6, plan, ier, selected)
+        if (ier /= WGPU_NUFFT_ERROR_GPU_UNAVAILABLE &
+                .or. index(wgpu_nufft_error_message(), "No Such Adapter 7f3a") == 0) then
+            print "(a, i0, a, a)", "adapters: a missing adapter gave ", ier, ": ", &
+                wgpu_nufft_error_message()
+            failures = failures + 1
+        else
+            print "(a, a)", "adapters: ok, ", wgpu_nufft_error_message()
+        end if
+        ! CPU plans ignore the selection, but not a name too long for it.
+        selected%backend = WGPU_NUFFT_BACKEND_CPU
+        call wgpu_nufft_makeplan(1, 1, [8_c_int64_t], 1, 1, 1.0d-6, plan, ier, selected)
+        call expect_success("adapters on the CPU")
+        call wgpu_nufft_destroy(plan)
+        call wgpu_nufft_set_adapter(selected, name=repeat("a", WGPU_NUFFT_ADAPTER_NAME_SIZE))
+        call wgpu_nufft_makeplan(1, 1, [8_c_int64_t], 1, 1, 1.0d-6, plan, ier, selected)
+        if (ier /= WGPU_NUFFT_ERROR_INVALID_ARGUMENT) then
+            print "(a, i0)", "adapters: a long name gave ", ier
+            failures = failures + 1
+        end if
+
+        if (opts%backend /= WGPU_NUFFT_BACKEND_GPU) return
+        do i = 1, size(adapters)
+            if (.not. adapters(i)%is_default) cycle
+            ! The index tells identical cards apart.
+            same = 0
+            do j = 1, i
+                if (adapters(j)%name == adapters(i)%name) same = same + 1
+            end do
+            call wgpu_nufft_set_adapter(selected, name=adapters(i)%name, index=same)
+            selected%backend = WGPU_NUFFT_BACKEND_GPU
+            call wgpu_nufft1d1(M, x, c, -1, eps, 13_c_int64_t, f1, ier, selected)
+            call expect_success("1d1 by adapter name")
+            call direct1d1(-1, expected1)
+            call compare("1d1 by adapter name", f1, expected1, size(f1))
+            if (index(wgpu_nufft_gpu_name(), adapters(i)%name) /= 1) then
+                print "(a, a)", "adapters: the GPU is ", wgpu_nufft_gpu_name()
+                failures = failures + 1
+            end if
+        end do
+    end subroutine adapter_selection
 
 end program test_wgpu_nufft
